@@ -77,5 +77,5 @@ src/lib.rs/Config/main.rs — --alsa-device / --no-audio
 ## Provenance / deps
 
 New deps: `symphonia` (aac, MIT/pure-Rust) for AAC decode, `alsa` for output.
-The framing/crypto scheme is from shairport-sync (GPL) — interop, same footing
-as the rest of the project.
+The framing/crypto scheme is from shairport-sync (MIT) — interop, same footing
+as the rest of the project. See notes/licensing.md.

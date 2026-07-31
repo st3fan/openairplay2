@@ -16,8 +16,11 @@ milestone's secondary purpose is to let that real `SETUP` plist be captured.
 
 FairPlay's `fp-setup` here is a **canned handshake**, not live crypto — the
 receiver replies with fixed tables (this is the widely-used interop behaviour
-in shairport-sync and the openairplay Python receiver; the tables originate
-from those GPL projects, same interop footing as v1's embedded AirPort key).
+in shairport-sync and the openairplay Python receiver). The tables are
+Apple-derived reverse-engineered interop constants; shairport-sync is MIT and
+the Python receiver's FairPlay code is GPLv2, but the real caveat is Apple's
+copyright/DMCA, not the OSS license. Same interop footing as v1's embedded
+AirPort key. See notes/licensing.md.
 Requests are `application/octet-stream` beginning with `FPLY` (`46 50 4c 59`):
 
 - byte 4 = version (3), byte 5 = type (1), byte 6 = **sequence**, byte 14 =
@@ -87,8 +90,10 @@ gets past FairPlay and sends `SETUP`. That capture is milestone 4's input.
 
 ### Provenance note
 
-The four 142-byte tables and the 12-byte header are the well-known FairPlay
-interop constants shipped by shairport-sync and the openairplay Python
-receiver, copied verbatim for interoperability (receiving audio streamed to
-your own device) — the same footing as the embedded AirPort RSA key in the
-AirPlay 1 receiver.
+The four 142-byte tables and the 12-byte header are well-known reverse-
+engineered FairPlay interop constants (Apple-derived), copied verbatim for
+interoperability (receiving audio streamed to your own device) — the same
+footing as the embedded AirPort RSA key in the AirPlay 1 receiver. They
+circulate across receivers under differing licenses (shairport-sync is MIT; the
+Python receiver's FairPlay code is GPLv2); see notes/licensing.md for the
+licensing and DMCA caveats.
