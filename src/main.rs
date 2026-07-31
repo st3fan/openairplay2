@@ -20,6 +20,7 @@ const DEFAULT_SOURCE_VERSION: &str = "366.0";
 const DEFAULT_FEATURES: u64 = 0x0001_8340_405C_4A00;
 const DEFAULT_STATUS_FLAGS: u32 = 0x4;
 const FALLBACK_MAC: [u8; 6] = [0x02, 0x4f, 0x41, 0x50, 0x32, 0x00];
+const DEFAULT_ALSA_DEVICE: &str = "default";
 
 struct Args {
     name: String,
@@ -27,12 +28,14 @@ struct Args {
     mac: Option<[u8; 6]>,
     identity_file: Option<PathBuf>,
     avahi: bool,
+    /// ALSA device, or `None` for `--no-audio`.
+    alsa_device: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay2 [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--identity-file PATH] [--no-avahi]"
+         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio]"
     );
     std::process::exit(2);
 }
@@ -44,6 +47,7 @@ fn parse_args() -> Args {
         mac: None,
         identity_file: None,
         avahi: true,
+        alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -67,6 +71,8 @@ fn parse_args() -> Args {
                 args.identity_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())))
             }
             "--no-avahi" => args.avahi = false,
+            "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
+            "--no-audio" => args.alsa_device = None,
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -111,6 +117,7 @@ async fn main() -> ExitCode {
         source_version: DEFAULT_SOURCE_VERSION.to_string(),
         features: DEFAULT_FEATURES,
         status_flags: DEFAULT_STATUS_FLAGS,
+        alsa_device: args.alsa_device,
     };
     info!(
         "starting AirPlay 2 receiver \"{}\" (deviceid {}, port {}, pk {})",
@@ -119,6 +126,10 @@ async fn main() -> ExitCode {
         config.port,
         identity.public_key_hex()
     );
+    match &config.alsa_device {
+        Some(dev) => info!("audio output: ALSA \"{dev}\""),
+        None => info!("audio output: disabled (--no-audio)"),
+    }
 
     // Dual-stack if possible (IPv4 clients arrive v4-mapped), else IPv4.
     let listener = match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.port)))

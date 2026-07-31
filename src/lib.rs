@@ -1,12 +1,15 @@
 pub mod avahi;
+pub mod buffered;
 pub mod cipher;
 pub mod crypto_stream;
+pub mod decode;
 pub mod fairplay;
 pub mod http;
 pub mod identity;
 pub mod info;
 pub mod mac;
 pub mod pairing;
+pub mod player;
 pub mod server;
 pub mod session;
 pub mod srp;
@@ -26,6 +29,8 @@ pub struct Config {
     pub features: u64,
     /// AirPlay status flags.
     pub status_flags: u32,
+    /// ALSA device to play to, or `None` for decode-only (`--no-audio`).
+    pub alsa_device: Option<String>,
 }
 
 impl Config {

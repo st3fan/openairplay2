@@ -32,11 +32,17 @@ sender (it got past FairPlay and sent `SETUP`).
 
 **Milestone 4 (SETUP & receiving the stream) — complete.** Handles the
 two-phase `SETUP` — phase 1 binds the event channel and reports the
-event/timing ports; phase 2 binds the audio data/control UDP channels and
+event/timing ports; phase 2 binds the audio data/control channels and
 reports them, capturing the stream format and key. Acknowledges the session
-control methods (RECORD, SETRATEANCHORTIME, FLUSHBUFFERED, …) and receives the
-stream (logged, not yet decoded). Audio decode/playback and PTP timing are
-still to come.
+control methods (RECORD, SETRATEANCHORTIME, FLUSHBUFFERED, …).
+
+**Milestone 5 (decode & play buffered AAC) — implemented.** For buffered
+audio (`type 103`), the data channel is a **TCP** connection: it is framed
+into packets, each decrypted with ChaCha20-Poly1305 (key `shk`), decoded from
+raw AAC-LC via `symphonia`, and played to ALSA through a prebuffered output
+thread. `--alsa-device` selects the device, `--no-audio` decodes without
+playing. Playback uses a simple prebuffer; PTP-accurate timing and drift
+correction are milestone 6.
 
 ## Build & run
 
@@ -49,5 +55,6 @@ cargo build --release
 ```
 
 Options: `--name`, `--port` (default 7000), `--mac`, `--identity-file`
-(default `~/.config/openairplay2/identity`), `--no-avahi`. `RUST_LOG=debug`
+(default `~/.config/openairplay2/identity`), `--no-avahi`,
+`--alsa-device NAME` (default `default`), `--no-audio`. `RUST_LOG=debug`
 shows every request — useful for watching what a real sender sends.

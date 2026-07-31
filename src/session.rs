@@ -1,15 +1,20 @@
 //! Per-connection AirPlay 2 streaming session: the `SETUP` phases, the bound
 //! event/data/control sockets, and acknowledgement of the session control
-//! methods. Milestone 4 completes the negotiation and *receives* the stream
-//! (logging packets); decoding/playback is milestone 5.
+//! methods. For buffered audio (type 103) the TCP data channel is decrypted,
+//! decoded (AAC-LC) and played to ALSA.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 
 use log::{debug, info, warn};
 use plist::{Dictionary, Value};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
+
+use crate::buffered::{split_blocks, AudioDecryptor};
+use crate::decode::AacDecoder;
+use crate::player::{Player, PlayerSender};
 
 /// Stream type constants from the SETUP `streams` array.
 const TYPE_REALTIME: u64 = 96;
@@ -20,16 +25,20 @@ pub struct Session {
     /// report back so the sender can reach our channels.
     local_ip: IpAddr,
     tasks: Vec<JoinHandle<()>>,
-    /// Captured at SETUP phase 2, for milestone 5 (audio decrypt/decode).
+    /// Captured at SETUP phase 2, for audio decrypt/decode.
     stream_key: Option<Vec<u8>>,
     audio_format: Option<u64>,
     stream_type: Option<u64>,
     /// AirPlay volume in dB (0 = full, −30 ≈ min, −144 = mute).
     volume: f32,
+    /// ALSA device to play to, or `None` for decode-only.
+    alsa_device: Option<String>,
+    /// The playback thread, alive for the duration of a buffered stream.
+    player: Option<Player>,
 }
 
 impl Session {
-    pub fn new(local_ip: IpAddr) -> Session {
+    pub fn new(local_ip: IpAddr, alsa_device: Option<String>) -> Session {
         Session {
             local_ip,
             tasks: Vec::new(),
@@ -37,6 +46,8 @@ impl Session {
             audio_format: None,
             stream_type: None,
             volume: 0.0,
+            alsa_device,
+            player: None,
         }
     }
 
@@ -112,14 +123,22 @@ impl Session {
             self.stream_key.as_ref().map_or(0, Vec::len)
         );
 
-        let data = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let control = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let data_port = data.local_addr()?.port();
         let control_port = control.local_addr()?.port();
-        info!("SETUP phase 2: data port {data_port}, control port {control_port}");
-        self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
         self.tasks
             .push(tokio::spawn(audio_channel(control, "control")));
+
+        // Buffered audio (type 103) uses a TCP data channel we decrypt, decode
+        // and play. Realtime (type 96) is UDP, still just logged for now.
+        let data_port = if stream_type == Some(TYPE_BUFFERED) {
+            self.start_buffered_audio().await?
+        } else {
+            let data = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
+            let port = data.local_addr()?.port();
+            self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
+            port
+        };
+        info!("SETUP phase 2: data port {data_port}, control port {control_port}");
 
         let mut stream_response = Dictionary::new();
         stream_response.insert(
@@ -148,6 +167,36 @@ impl Session {
             Value::Array(vec![Value::Dictionary(stream_response)]),
         );
         encode_plist(&response)
+    }
+
+    /// Bind the buffered-audio TCP data channel and start the
+    /// receive → decrypt → decode → play pipeline. Returns the bound port.
+    async fn start_buffered_audio(&mut self) -> io::Result<u16> {
+        let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
+        let port = listener.local_addr()?.port();
+
+        let decryptor = self.stream_key.as_deref().and_then(AudioDecryptor::new);
+        let (rate, channels) = aac_params(self.audio_format);
+        match (decryptor, AacDecoder::new(rate, channels)) {
+            (Some(decryptor), Ok(decoder)) => {
+                let player = Player::spawn(rate, channels, self.alsa_device.clone());
+                let sender = player.sender();
+                self.player = Some(player);
+                self.tasks.push(tokio::spawn(buffered_audio(
+                    listener, decryptor, decoder, sender,
+                )));
+                info!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
+            }
+            (None, _) => {
+                warn!("buffered audio: missing/invalid shk; draining without decode");
+                self.tasks.push(tokio::spawn(drain_tcp(listener)));
+            }
+            (_, Err(e)) => {
+                warn!("buffered audio: decoder init failed ({e}); draining");
+                self.tasks.push(tokio::spawn(drain_tcp(listener)));
+            }
+        }
+        Ok(port)
     }
 
     /// Answer a `GET_PARAMETER` query. A sender asks `volume\r\n` during setup
@@ -214,8 +263,7 @@ async fn event_channel(listener: TcpListener) {
     }
 }
 
-/// Receive and log packets on an audio/control UDP socket. Milestone 5 will
-/// decrypt and decode these.
+/// Receive and log packets on a realtime/control UDP socket.
 async fn audio_channel(socket: UdpSocket, label: &'static str) {
     let mut buf = vec![0u8; 16 * 1024];
     let mut count: u64 = 0;
@@ -235,6 +283,76 @@ async fn audio_channel(socket: UdpSocket, label: &'static str) {
     }
 }
 
+/// Decode parameters for the buffered stream. AirPlay 2 buffered audio is
+/// AAC-LC 44.1 kHz stereo (audioFormat bit `0x400000`); other formats aren't
+/// negotiated yet, so default to that.
+fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
+    (44100, 2)
+}
+
+/// The buffered-audio pipeline: accept the sender's TCP connection, frame the
+/// stream into packets, decrypt each, decode the AAC, and hand PCM to the
+/// player.
+async fn buffered_audio(
+    listener: TcpListener,
+    decryptor: AudioDecryptor,
+    mut decoder: AacDecoder,
+    player: PlayerSender,
+) {
+    let Ok((mut stream, peer)) = listener.accept().await else {
+        return;
+    };
+    info!("buffered audio connected from {peer}");
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut decrypt_failures: u64 = 0;
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let (packets, used) = split_blocks(&buf);
+                let owned: Vec<Vec<u8>> = packets.iter().map(|p| p.to_vec()).collect();
+                buf.drain(..used);
+                for packet in owned {
+                    let Some(audio) = decryptor.decrypt(&packet) else {
+                        decrypt_failures += 1;
+                        if decrypt_failures <= 3 {
+                            debug!("buffered audio: packet decrypt failed");
+                        }
+                        continue;
+                    };
+                    match decoder.decode(&audio.payload) {
+                        Ok(pcm) if !pcm.is_empty() => player.play(pcm),
+                        Ok(_) => {}
+                        Err(e) => debug!("buffered audio: decode error: {e}"),
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("buffered audio read error: {e}");
+                break;
+            }
+        }
+    }
+    info!("buffered audio disconnected ({decrypt_failures} decrypt failures)");
+}
+
+/// Accept and drain a buffered-audio connection we can't decode (missing key
+/// or unsupported format), so the sender isn't left hanging.
+async fn drain_tcp(listener: TcpListener) {
+    let Ok((mut stream, _)) = listener.accept().await else {
+        return;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    while let Ok(n) = stream.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn phase1_response_has_event_and_timing_ports() {
-        let mut session = Session::new(local());
+        let mut session = Session::new(local(), None);
         // Minimal phase-1 plist: timingProtocol=PTP, no streams.
         let mut dict = Dictionary::new();
         dict.insert("timingProtocol".into(), Value::String("PTP".into()));
@@ -262,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn phase2_response_binds_ports_and_echoes_type() {
-        let mut session = Session::new(local());
+        let mut session = Session::new(local(), None);
         let mut stream = Dictionary::new();
         stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
         stream.insert("audioFormat".into(), Value::Integer(0x40000u64.into()));
@@ -297,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn phase_detection_uses_streams_presence() {
         // A dict with no streams is phase 1 (event port), with streams is phase 2.
-        let mut s1 = Session::new(local());
+        let mut s1 = Session::new(local(), None);
         let empty = encode_plist(&Dictionary::new()).unwrap();
         let r1 = s1.handle_setup(&empty).await.unwrap();
         assert!(Value::from_reader(io::Cursor::new(r1))
@@ -309,7 +427,7 @@ mod tests {
 
     #[test]
     fn volume_query_returns_current_volume() {
-        let mut session = Session::new(local());
+        let mut session = Session::new(local(), None);
         // A sender's exact query is "volume\r\n".
         assert_eq!(
             session.get_parameter(b"volume\r\n"),
