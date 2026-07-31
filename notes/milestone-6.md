@@ -29,18 +29,26 @@ clock discipline.** The Mac's buffer is the clock.
 
 In:
 
-- **Pause/resume** (`session.rs`, `player.rs`): parse `SETRATEANCHORTIME`'s
-  `rate` (0 = pause, 1 = play) and honor it — pause/unpause the ALSA device
-  immediately instead of just `ack`ing. Also capture the anchor `rtpTime` for
-  logging / future use.
-- **Seek / skip** (`FLUSHBUFFERED`): drop buffered audio and reset the ALSA
-  device so skipping a track is responsive instead of playing stale buffer.
+- **Pause / seek / skip via out-of-band flush** (`session.rs`, `player.rs`):
+  the Mac drives all of these with `FLUSHBUFFERED` (pause = `rate=0` + flush;
+  skip = flush + a new anchor; resume = fresh audio with a new `rtpTime`). The
+  hard part is that a flush must **preempt the ~2 s audio buffer** — an in-band
+  command sits behind it and only acts seconds later (the milestone-6 v1 bug).
+  Fix: a `flush_gen` atomic the control path bumps instantly; every queued
+  packet is stamped with its generation; on a flush the player drops all
+  stale-stamped packets (microseconds, not played) and `drop`+`prepare`s the
+  device. `SETRATEANCHORTIME rate=0` also flushes so audio stops even if no
+  `FLUSHBUFFERED` follows; `rate=1` needs nothing (fresh audio just plays).
 - **Bounded latency** (`player.rs` + the buffered reader): the player exposes
   how many frames are queued; the TCP reader backpressures (stops reading, so
   the Mac's send blocks) when the queue exceeds a target. This replaces the
   fixed 20-packet prebuffer with a frame-based cushion, caps latency/memory,
   and provides the underrun cushion. This *is* the soft-timing mechanism.
 - **Docs**: README + this note stating the single-stream, no-PTP design.
+
+Note: `snd_pcm_pause` is **not** used — it fails with EBADFD on real hardware
+devices like `front`. `drop` + `prepare` (discard buffered frames) is the
+portable way to stop output immediately.
 
 Out: PTP / 319-320, multi-room, grouped playback, AV lip-sync, resampling /
 sample-rate conversion, precise per-sample scheduling against network time.

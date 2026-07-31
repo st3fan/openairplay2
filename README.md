@@ -44,10 +44,13 @@ thread. `--alsa-device` selects the device, `--no-audio` decodes without
 playing. Validated against a real macOS sender (clean audio out).
 
 **Milestone 6 (soft timing: pause/resume, seek) — implemented.** Honors
-transport control for a single stream: `SETRATEANCHORTIME`'s rate pauses and
-resumes the ALSA device; `FLUSHBUFFERED` drops buffered audio so seeking is
-responsive. The TCP reader backpressures on the player's queue depth, so
-latency and memory stay bounded and the sound card's drain rate sets the pace.
+transport control for a single stream. The Mac drives pause and track-skip with
+`FLUSHBUFFERED` (pause is `rate=0` + flush; skip is flush + a new anchor), so
+the key is that a flush must **preempt** the ~2 s audio buffer rather than wait
+behind it: a generation counter set out-of-band lets the player drop already-
+buffered audio instantly and reset the device. The TCP reader backpressures on
+the player's queue depth, so latency and memory stay bounded and the sound
+card's drain rate sets the pace.
 
 By design this receiver targets **one Mac → one stream → one output** and does
 **not** implement PTP: it never binds UDP 319/320 and replies `timingPort: 0`.
