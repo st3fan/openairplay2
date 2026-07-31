@@ -24,6 +24,7 @@ use crate::Config;
 pub const SERVER_ID: &str = "AirTunes/366.0";
 pub const INFO_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
 pub const PAIRING_CONTENT_TYPE: &str = "application/octet-stream";
+pub const PARAMETERS_CONTENT_TYPE: &str = "text/parameters";
 
 pub struct Context {
     pub config: Config,
@@ -127,10 +128,19 @@ async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Re
                 Response::new(proto, 400, "Bad Request")
             }
         }),
-        // Session control verbs: acknowledge so the sender proceeds. Bodies
-        // (rate anchors, flush points, volume) are consumed in later milestones.
+        // A sender queries the current volume during setup and expects a
+        // `text/parameters` body back; an empty response makes it give up.
+        "GET_PARAMETER" => {
+            let body = session.get_parameter(&request.body);
+            Some(Response::ok(proto).body(PARAMETERS_CONTENT_TYPE, body))
+        }
+        "SET_PARAMETER" => {
+            session.set_parameter(&request.body);
+            Some(Response::ok(proto))
+        }
+        // Other session control verbs: acknowledge so the sender proceeds.
         "RECORD" | "SETRATEANCHORTIME" | "SETPEERS" | "SETPEERSX" | "FLUSHBUFFERED"
-        | "TEARDOWN" | "SET_PARAMETER" | "GET_PARAMETER" | "POST_FEEDBACK" => {
+        | "TEARDOWN" => {
             session.ack(&request.method);
             Some(Response::ok(proto))
         }

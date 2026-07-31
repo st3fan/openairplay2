@@ -24,6 +24,8 @@ pub struct Session {
     stream_key: Option<Vec<u8>>,
     audio_format: Option<u64>,
     stream_type: Option<u64>,
+    /// AirPlay volume in dB (0 = full, −30 ≈ min, −144 = mute).
+    volume: f32,
 }
 
 impl Session {
@@ -34,6 +36,7 @@ impl Session {
             stream_key: None,
             audio_format: None,
             stream_type: None,
+            volume: 0.0,
         }
     }
 
@@ -145,6 +148,31 @@ impl Session {
             Value::Array(vec![Value::Dictionary(stream_response)]),
         );
         encode_plist(&response)
+    }
+
+    /// Answer a `GET_PARAMETER` query. A sender asks `volume\r\n` during setup
+    /// and expects `volume: <dB>\r\n` back (an empty response makes it abort).
+    pub fn get_parameter(&self, body: &[u8]) -> Vec<u8> {
+        let query = String::from_utf8_lossy(body);
+        if query.trim() == "volume" {
+            format!("volume: {:.6}\r\n", self.volume).into_bytes()
+        } else {
+            debug!("GET_PARAMETER for unknown parameter: {query:?}");
+            Vec::new()
+        }
+    }
+
+    /// Apply a `SET_PARAMETER` body — currently just the volume line.
+    pub fn set_parameter(&mut self, body: &[u8]) {
+        let text = String::from_utf8_lossy(body);
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("volume:") {
+                if let Ok(db) = v.trim().parse::<f32>() {
+                    self.volume = db;
+                    debug!("SET_PARAMETER volume {db} dB");
+                }
+            }
+        }
     }
 
     /// Acknowledge a session control method that needs no body.
@@ -277,5 +305,22 @@ mod tests {
             .as_dictionary()
             .unwrap()
             .contains_key("eventPort"));
+    }
+
+    #[test]
+    fn volume_query_returns_current_volume() {
+        let mut session = Session::new(local());
+        // A sender's exact query is "volume\r\n".
+        assert_eq!(
+            session.get_parameter(b"volume\r\n"),
+            b"volume: 0.000000\r\n"
+        );
+        session.set_parameter(b"volume: -12.5\r\n");
+        assert_eq!(
+            session.get_parameter(b"volume\r\n"),
+            b"volume: -12.500000\r\n"
+        );
+        // Unknown parameters yield an empty body rather than a bad one.
+        assert!(session.get_parameter(b"progress\r\n").is_empty());
     }
 }
