@@ -15,7 +15,7 @@
 //!   with its generation, and the player drops stale-stamped packets. New audio
 //!   for the new position (a fresh generation) plays.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -33,6 +33,21 @@ fn start_samples(rate: u32, channels: u8) -> usize {
 /// backpressures so latency/memory stay bounded. ~2 s of audio.
 pub fn max_queued_samples(rate: u32, channels: u8) -> usize {
     rate as usize * channels as usize * 2
+}
+
+/// Scale interleaved samples by a linear gain in `[0, 1]`. Full gain is a
+/// no-op; zero is silence. Gain ≤ 1 so the product stays in range.
+fn apply_gain(samples: &mut [i16], gain: f32) {
+    if gain >= 0.999 {
+        return;
+    }
+    if gain <= 0.0 {
+        samples.fill(0);
+        return;
+    }
+    for s in samples.iter_mut() {
+        *s = (f32::from(*s) * gain) as i16;
+    }
 }
 
 enum Command {
@@ -55,6 +70,8 @@ pub struct PlayerSender {
     flush_gen: Arc<AtomicU64>,
     /// While true the player drops all audio and holds silence.
     paused: Arc<AtomicBool>,
+    /// Linear playback gain in `[0, 1]`, stored as `f32` bits.
+    volume: Arc<AtomicU32>,
 }
 
 impl PlayerSender {
@@ -75,6 +92,12 @@ impl PlayerSender {
     pub fn flush(&self) {
         self.flush_gen.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(Command::Wake);
+    }
+
+    /// Set the linear playback gain (`1.0` = full, `0.0` = mute). Applied live.
+    pub fn set_volume(&self, gain: f32) {
+        self.volume
+            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Interleaved samples currently queued — the backpressure signal.
@@ -101,6 +124,7 @@ pub struct Player {
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
 }
 
 impl Player {
@@ -113,11 +137,13 @@ impl Player {
         let pending = Arc::new(AtomicUsize::new(0));
         let flush_gen = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits())); // full volume
         let ctx = RunCtx {
             stop: stop.clone(),
             pending: pending.clone(),
             flush_gen: flush_gen.clone(),
             paused: paused.clone(),
+            volume: volume.clone(),
         };
         let handle = std::thread::Builder::new()
             .name("alsa-player".into())
@@ -130,6 +156,7 @@ impl Player {
             pending,
             flush_gen,
             paused,
+            volume,
         }
     }
 
@@ -139,6 +166,7 @@ impl Player {
             pending: self.pending.clone(),
             flush_gen: self.flush_gen.clone(),
             paused: self.paused.clone(),
+            volume: self.volume.clone(),
         }
     }
 }
@@ -162,6 +190,7 @@ struct RunCtx {
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
+    volume: Arc<AtomicU32>,
 }
 
 fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Command>, ctx: RunCtx) {
@@ -231,7 +260,7 @@ fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Comm
         match command {
             Command::Stop => break,
             Command::Wake => {}
-            Command::Pcm(stamp, pcm) => {
+            Command::Pcm(stamp, mut pcm) => {
                 ctx.pending.fetch_sub(pcm.len(), Ordering::Relaxed);
                 if paused || stamp != cur_gen {
                     continue; // paused, or produced before a flush → drop
@@ -243,6 +272,9 @@ fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Comm
                 let Some(out) = output.as_mut() else {
                     continue; // decode-only
                 };
+                // Apply the current volume (live) just before playback.
+                let gain = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
+                apply_gain(&mut pcm, gain);
                 if started {
                     out.write(&pcm);
                 } else {
@@ -325,6 +357,24 @@ mod tests {
     fn thresholds_for_44100_stereo() {
         assert_eq!(start_samples(44100, 2), 44100); // 0.5 s interleaved
         assert_eq!(max_queued_samples(44100, 2), 176_400); // 2 s interleaved
+    }
+
+    #[test]
+    fn apply_gain_scales_samples() {
+        // Half gain halves amplitude.
+        let mut s = [100i16, -100, 20000, -20000];
+        apply_gain(&mut s, 0.5);
+        assert_eq!(s, [50, -50, 10000, -10000]);
+
+        // Zero gain → silence.
+        let mut s = [1i16, -32768, 32767];
+        apply_gain(&mut s, 0.0);
+        assert_eq!(s, [0, 0, 0]);
+
+        // Full gain leaves samples untouched (and doesn't clip the extremes).
+        let mut s = [1i16, -32768, 32767];
+        apply_gain(&mut s, 1.0);
+        assert_eq!(s, [1, -32768, 32767]);
     }
 
     #[test]

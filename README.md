@@ -43,14 +43,21 @@ raw AAC-LC via `symphonia`, and played to ALSA through a prebuffered output
 thread. `--alsa-device` selects the device, `--no-audio` decodes without
 playing. Validated against a real macOS sender (clean audio out).
 
-**Milestone 6 (soft timing: pause/resume, seek) — implemented.** Honors
+**Milestone 6 (soft timing: pause/resume, seek) — complete.** Honors
 transport control for a single stream. The Mac drives pause and track-skip with
 `FLUSHBUFFERED` (pause is `rate=0` + flush; skip is flush + a new anchor), so
 the key is that a flush must **preempt** the ~2 s audio buffer rather than wait
 behind it: a generation counter set out-of-band lets the player drop already-
-buffered audio instantly and reset the device. The TCP reader backpressures on
-the player's queue depth, so latency and memory stay bounded and the sound
-card's drain rate sets the pace.
+buffered audio instantly, and `flushUntilSeq` discards the buffered-ahead audio
+still arriving over TCP. The TCP reader backpressures on the player's queue
+depth, so latency and memory stay bounded and the sound card's drain rate sets
+the pace. Validated on real hardware (pause/resume/skip).
+
+**Milestone 7 (volume control) — implemented.** The Mac's volume slider now
+changes playback volume. The volume it sends (`SET_PARAMETER volume: <dB>`) is
+converted to a linear gain (`10^(dB/20)`, `-144 dB` = mute) and applied to the
+PCM before the ALSA write, updated live via a shared atomic so slider moves take
+effect mid-stream.
 
 By design this receiver targets **one Mac → one stream → one output** and does
 **not** implement PTP: it never binds UDP 319/320 and replies `timingPort: 0`.

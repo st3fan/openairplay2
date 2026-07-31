@@ -191,7 +191,11 @@ impl Session {
             (Some(decryptor), Ok(decoder)) => {
                 let player = Player::spawn(rate, channels, self.alsa_device.clone());
                 let sender = player.sender();
-                self.player_control = Some(player.sender());
+                let control = player.sender();
+                // A volume SET_PARAMETER often arrives before the stream starts;
+                // apply the last-seen volume so we don't begin at full blast.
+                control.set_volume(volume_to_gain(self.volume));
+                self.player_control = Some(control);
                 self.player = Some(player);
                 let max_queued = crate::player::max_queued_samples(rate, channels);
                 self.tasks.push(tokio::spawn(buffered_audio(
@@ -262,14 +266,19 @@ impl Session {
         }
     }
 
-    /// Apply a `SET_PARAMETER` body — currently just the volume line.
+    /// Apply a `SET_PARAMETER` body — currently just the volume line. The
+    /// volume (dB) is converted to linear gain and pushed to the player, so
+    /// moving the slider changes playback volume live.
     pub fn set_parameter(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
             if let Some(v) = line.trim().strip_prefix("volume:") {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     self.volume = db;
-                    debug!("SET_PARAMETER volume {db} dB");
+                    debug!("SET_PARAMETER volume {db} dB (gain {:.4})", volume_to_gain(db));
+                    if let Some(ctrl) = &self.player_control {
+                        ctrl.set_volume(volume_to_gain(db));
+                    }
                 }
             }
         }
@@ -362,6 +371,15 @@ fn int_field(v: &Value) -> Option<u64> {
 fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
     let value = Value::from_reader(io::Cursor::new(body)).ok()?;
     value.as_dictionary()?.get("flushUntilSeq").and_then(int_field)
+}
+
+/// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
+/// volume, `-144 dB` (and below) is muted; we never amplify above unity.
+fn volume_to_gain(db: f32) -> f32 {
+    if db <= -144.0 {
+        return 0.0;
+    }
+    10f32.powf(db.min(0.0) / 20.0)
 }
 
 /// The buffered-audio pipeline: accept the sender's TCP connection, frame the
@@ -557,6 +575,16 @@ mod tests {
         let body = encode_plist(&dict).unwrap();
 
         assert_eq!(parse_rate_anchor(&body), Some((1, 3174381381)));
+    }
+
+    #[test]
+    fn volume_db_to_gain() {
+        assert!((volume_to_gain(0.0) - 1.0).abs() < 1e-6); // full
+        assert!((volume_to_gain(-6.0206) - 0.5).abs() < 1e-3); // −6 dB ≈ half
+        assert!((volume_to_gain(-20.0) - 0.1).abs() < 1e-4); // −20 dB = 0.1
+        assert_eq!(volume_to_gain(-144.0), 0.0); // muted
+        assert_eq!(volume_to_gain(-200.0), 0.0); // below sentinel = muted
+        assert!((volume_to_gain(6.0) - 1.0).abs() < 1e-6); // never amplify
     }
 
     #[test]
