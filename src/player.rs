@@ -5,13 +5,15 @@
 //! then blocking writes pace playback; the TCP reader backpressures on the
 //! queued-sample count so latency and memory stay bounded.
 //!
-//! Transport control (pause/seek) is **out-of-band** from the audio queue: a
-//! flush bumps a generation counter that the control path can set instantly,
-//! and every queued packet is stamped with the generation it was produced
-//! under. On a flush the player drops all stale-stamped packets (microseconds,
-//! not played) and resets the device — so control isn't stuck behind the ~2 s
-//! audio buffer. (An in-band command would sit behind that buffer and only act
-//! seconds later.)
+//! Transport control is **out-of-band** from the audio queue (an in-band
+//! command would sit behind the ~2 s buffer and only act seconds later):
+//!
+//! - **Pause** is a persistent `paused` flag. While set, the player drops all
+//!   audio and holds silence — the Mac keeps sending buffered-ahead audio, so a
+//!   one-shot flush wouldn't stop it; the gate must stay engaged until resume.
+//! - **Flush** (seek) bumps a generation counter; each queued packet is stamped
+//!   with its generation, and the player drops stale-stamped packets. New audio
+//!   for the new position (a fresh generation) plays.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,14 +38,14 @@ pub fn max_queued_samples(rate: u32, channels: u8) -> usize {
 enum Command {
     /// (flush generation the packet was produced under, interleaved samples).
     Pcm(u64, Vec<i16>),
-    /// Nudge the loop to re-check the flush generation (used when the queue is
-    /// idle, e.g. paused, so a flush is still noticed promptly).
+    /// Nudge the loop to re-check the paused flag / flush generation (used when
+    /// the queue is idle so control is still noticed promptly).
     Wake,
     Stop,
 }
 
 /// A cloneable handle for feeding decoded PCM to the playback thread and
-/// flushing it (pause/seek).
+/// controlling transport (pause/resume, flush).
 #[derive(Clone)]
 pub struct PlayerSender {
     tx: Sender<Command>,
@@ -51,6 +53,8 @@ pub struct PlayerSender {
     pending: Arc<AtomicUsize>,
     /// Bumped on every flush; stamps outgoing audio so stale audio is dropped.
     flush_gen: Arc<AtomicU64>,
+    /// While true the player drops all audio and holds silence.
+    paused: Arc<AtomicBool>,
 }
 
 impl PlayerSender {
@@ -60,9 +64,14 @@ impl PlayerSender {
         let _ = self.tx.send(Command::Pcm(gen, pcm));
     }
 
-    /// Drop all buffered audio immediately (pause/seek/skip). Bumps the
-    /// generation so already-queued audio is discarded, and wakes the thread
-    /// in case it is idle.
+    /// Engage/release the pause gate. While paused the player drops all audio.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+        let _ = self.tx.send(Command::Wake);
+    }
+
+    /// Drop currently-buffered audio (seek/skip). Bumps the generation so
+    /// already-queued audio is discarded; new audio still plays.
     pub fn flush(&self) {
         self.flush_gen.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(Command::Wake);
@@ -77,6 +86,11 @@ impl PlayerSender {
     pub fn generation(&self) -> u64 {
         self.flush_gen.load(Ordering::Relaxed)
     }
+
+    /// Whether the pause gate is engaged (for tests/inspection).
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
 }
 
 /// Owns the playback thread; dropping it stops the thread and closes the device.
@@ -86,6 +100,7 @@ pub struct Player {
     stop: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
+    paused: Arc<AtomicBool>,
 }
 
 impl Player {
@@ -97,22 +112,16 @@ impl Player {
         let stop = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicUsize::new(0));
         let flush_gen = Arc::new(AtomicU64::new(0));
-        let thread_stop = stop.clone();
-        let thread_pending = pending.clone();
-        let thread_gen = flush_gen.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let ctx = RunCtx {
+            stop: stop.clone(),
+            pending: pending.clone(),
+            flush_gen: flush_gen.clone(),
+            paused: paused.clone(),
+        };
         let handle = std::thread::Builder::new()
             .name("alsa-player".into())
-            .spawn(move || {
-                run(
-                    sample_rate,
-                    channels,
-                    device,
-                    rx,
-                    thread_stop,
-                    thread_pending,
-                    thread_gen,
-                )
-            })
+            .spawn(move || run(sample_rate, channels, device, rx, ctx))
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -120,6 +129,7 @@ impl Player {
             stop,
             pending,
             flush_gen,
+            paused,
         }
     }
 
@@ -128,6 +138,7 @@ impl Player {
             tx: self.tx.clone().expect("sender available before drop"),
             pending: self.pending.clone(),
             flush_gen: self.flush_gen.clone(),
+            paused: self.paused.clone(),
         }
     }
 }
@@ -145,15 +156,15 @@ impl Drop for Player {
     }
 }
 
-fn run(
-    sample_rate: u32,
-    channels: u8,
-    device: Option<String>,
-    rx: Receiver<Command>,
+/// Shared state the playback thread watches for out-of-band control.
+struct RunCtx {
     stop: Arc<AtomicBool>,
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
-) {
+    paused: Arc<AtomicBool>,
+}
+
+fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Command>, ctx: RunCtx) {
     let mut output = match device {
         Some(name) => match AlsaOutput::open(&name, sample_rate, channels) {
             Ok(out) => {
@@ -175,30 +186,55 @@ fn run(
     let mut prebuffer: Vec<i16> = Vec::new();
     let mut started = false;
     let mut cur_gen: u64 = 0;
+    let mut was_paused = false;
     let mut packets: u64 = 0;
-    while let Ok(command) = rx.recv() {
-        if stop.load(Ordering::Relaxed) {
+    'outer: while let Ok(command) = rx.recv() {
+        if ctx.stop.load(Ordering::Relaxed) {
             break;
         }
-        // React to any flush (set out-of-band by the control path) before
-        // touching audio, so control isn't stuck behind the buffer.
-        let gen = flush_gen.load(Ordering::Relaxed);
-        if gen != cur_gen {
+
+        // React to out-of-band control before touching audio, so it isn't
+        // stuck behind the buffer.
+        let gen = ctx.flush_gen.load(Ordering::Relaxed);
+        let paused = ctx.paused.load(Ordering::Relaxed);
+        let flushed = gen != cur_gen;
+        let just_paused = paused && !was_paused;
+        if flushed || just_paused {
             cur_gen = gen;
             prebuffer.clear();
             started = false;
             if let Some(out) = output.as_mut() {
-                out.reset();
+                out.reset(); // discard queued frames → immediate silence
             }
-            debug!("player: flushed (gen {gen})");
+            // Drop everything already queued (stale on flush; unwanted on pause).
+            loop {
+                match rx.try_recv() {
+                    Ok(Command::Pcm(_, p)) => {
+                        ctx.pending.fetch_sub(p.len(), Ordering::Relaxed);
+                    }
+                    Ok(Command::Wake) => {}
+                    Ok(Command::Stop) => break 'outer,
+                    Err(_) => break,
+                }
+            }
+            if flushed {
+                debug!("player: flushed (gen {gen})");
+            }
         }
+        if just_paused {
+            debug!("player: paused");
+        } else if !paused && was_paused {
+            debug!("player: resumed");
+        }
+        was_paused = paused;
+
         match command {
             Command::Stop => break,
             Command::Wake => {}
             Command::Pcm(stamp, pcm) => {
-                pending.fetch_sub(pcm.len(), Ordering::Relaxed);
-                if stamp != cur_gen {
-                    continue; // produced before a flush → stale, drop it
+                ctx.pending.fetch_sub(pcm.len(), Ordering::Relaxed);
+                if paused || stamp != cur_gen {
+                    continue; // paused, or produced before a flush → drop
                 }
                 packets += 1;
                 if packets <= 3 || packets.is_multiple_of(250) {
@@ -273,8 +309,8 @@ impl AlsaOutput {
     }
 
     /// Discard queued frames (immediate silence) and ready the device for new
-    /// audio. Used on flush (pause/seek). Unlike `snd_pcm_pause`, `drop` +
-    /// `prepare` are supported everywhere.
+    /// audio. Used on pause/flush. Unlike `snd_pcm_pause`, `drop` + `prepare`
+    /// are supported everywhere (`snd_pcm_pause` fails with EBADFD on `front`).
     fn reset(&mut self) {
         let _ = self.pcm.drop();
         let _ = self.pcm.prepare();
@@ -300,6 +336,17 @@ mod tests {
         assert_eq!(sender.generation(), 1);
         sender.flush();
         assert_eq!(sender.generation(), 2);
+    }
+
+    #[test]
+    fn set_paused_toggles_gate() {
+        let player = Player::spawn(44100, 2, None);
+        let sender = player.sender();
+        assert!(!sender.is_paused());
+        sender.set_paused(true);
+        assert!(sender.is_paused());
+        sender.set_paused(false);
+        assert!(!sender.is_paused());
     }
 
     #[test]

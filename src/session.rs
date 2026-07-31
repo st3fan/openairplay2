@@ -207,20 +207,18 @@ impl Session {
 
     /// Handle `SETRATEANCHORTIME`: the sender's play/pause rate (and the RTP
     /// anchor, which we log). The network-time fields matter only with a PTP
-    /// clock, so we ignore them (see notes/milestone-6.md). This Mac drives
-    /// pause by sending `rate=0` and a `FLUSHBUFFERED`; on `rate=0` we flush so
-    /// audio stops promptly even if the flush doesn't arrive. `rate=1` resumes
-    /// naturally as fresh audio arrives.
+    /// clock, so we ignore them (see notes/milestone-6.md). `rate=0` engages
+    /// the pause gate (the player drops all audio until resumed); `rate=1`
+    /// releases it. A persistent gate is required because the Mac keeps sending
+    /// buffered-ahead audio during a pause.
     pub fn set_rate_anchor(&mut self, body: &[u8]) {
         let Some((rate, rtp)) = parse_rate_anchor(body) else {
             warn!("SETRATEANCHORTIME: could not parse body");
             return;
         };
         debug!("SETRATEANCHORTIME rate={rate} rtpTime={rtp}");
-        if rate == 0 {
-            if let Some(ctrl) = &self.player_control {
-                ctrl.flush();
-            }
+        if let Some(ctrl) = &self.player_control {
+            ctrl.set_paused(rate == 0);
         }
     }
 

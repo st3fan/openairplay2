@@ -29,16 +29,19 @@ clock discipline.** The Mac's buffer is the clock.
 
 In:
 
-- **Pause / seek / skip via out-of-band flush** (`session.rs`, `player.rs`):
-  the Mac drives all of these with `FLUSHBUFFERED` (pause = `rate=0` + flush;
-  skip = flush + a new anchor; resume = fresh audio with a new `rtpTime`). The
-  hard part is that a flush must **preempt the ~2 s audio buffer** — an in-band
-  command sits behind it and only acts seconds later (the milestone-6 v1 bug).
-  Fix: a `flush_gen` atomic the control path bumps instantly; every queued
-  packet is stamped with its generation; on a flush the player drops all
-  stale-stamped packets (microseconds, not played) and `drop`+`prepare`s the
-  device. `SETRATEANCHORTIME rate=0` also flushes so audio stops even if no
-  `FLUSHBUFFERED` follows; `rate=1` needs nothing (fresh audio just plays).
+- **Pause/resume via a persistent gate** (`session.rs`, `player.rs`):
+  `SETRATEANCHORTIME rate=0` engages a `paused` flag; `rate=1` releases it.
+  While engaged the player drops **all** audio and holds silence. A gate (not a
+  one-shot flush) is required because in buffered mode the Mac keeps sending
+  audio ahead during a pause — a flush drops what's buffered, but the next
+  packets (a new generation) would just play. Two earlier attempts failed here:
+  v1 put pause in-band behind the ~2 s buffer (acted 3 s late); v2 used a flush,
+  which the incoming audio simply played past. The gate is set out-of-band and
+  the player drops the queue + `drop`+`prepare`s the device on engage.
+- **Seek/skip via out-of-band flush** (`FLUSHBUFFERED`): a `flush_gen` atomic
+  the control path bumps instantly; every queued packet is stamped with its
+  generation; on a flush the player drops all stale-stamped packets
+  (microseconds, not played). New audio for the new position plays.
 - **Bounded latency** (`player.rs` + the buffered reader): the player exposes
   how many frames are queued; the TCP reader backpressures (stops reading, so
   the Mac's send blocks) when the queue exceeds a target. This replaces the
