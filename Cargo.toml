@@ -1,0 +1,18 @@
+[package]
+name = "openairplay2"
+version = "0.1.0"
+edition = "2021"
+description = "AirPlay 2 receiver for Linux/ALSA"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+env_logger = "0.11"
+hex = "0.4"
+log = "0.4"
+plist = "1"
+rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }

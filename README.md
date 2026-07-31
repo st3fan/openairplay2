@@ -9,5 +9,26 @@ pairing (SRP + Curve25519 + Ed25519), a ChaCha20-Poly1305-encrypted control
 channel carrying binary plists, per-packet ChaCha20-Poly1305 audio, AAC as
 well as ALAC, and PTP timing.
 
-**Status: design phase.** See [`notes.md`](notes.md) for the protocol research
-and the milestone plan. Implementation has not started yet.
+See [`notes.md`](notes.md) for the protocol research and the milestone plan,
+and `notes/milestone-*.md` for each milestone.
+
+## Status
+
+**Milestone 1 (discovery & `/info`) — complete.** Advertises `_airplay._tcp`
+via Avahi with an AirPlay 2 `features` bitmask and an Ed25519 public key, runs
+the HTTP/RTSP control server on port 7000, and answers `GET /info` with the
+device plist. Pairing, SETUP, audio, and timing are still to come.
+
+## Build & run
+
+Building links against nothing exotic yet; a running `avahi-daemon` is needed
+for discovery.
+
+```sh
+cargo build --release
+./target/release/openairplay2 --name "Living Room"
+```
+
+Options: `--name`, `--port` (default 7000), `--mac`, `--identity-file`
+(default `~/.config/openairplay2/identity`), `--no-avahi`. `RUST_LOG=debug`
+shows every request — useful for watching what a real sender sends.
