@@ -34,15 +34,27 @@ sender (it got past FairPlay and sent `SETUP`).
 two-phase `SETUP` — phase 1 binds the event channel and reports the
 event/timing ports; phase 2 binds the audio data/control channels and
 reports them, capturing the stream format and key. Acknowledges the session
-control methods (RECORD, SETRATEANCHORTIME, FLUSHBUFFERED, …).
+control methods (RECORD, SETPEERS, …).
 
-**Milestone 5 (decode & play buffered AAC) — implemented.** For buffered
+**Milestone 5 (decode & play buffered AAC) — complete.** For buffered
 audio (`type 103`), the data channel is a **TCP** connection: it is framed
 into packets, each decrypted with ChaCha20-Poly1305 (key `shk`), decoded from
 raw AAC-LC via `symphonia`, and played to ALSA through a prebuffered output
 thread. `--alsa-device` selects the device, `--no-audio` decodes without
-playing. Playback uses a simple prebuffer; PTP-accurate timing and drift
-correction are milestone 6.
+playing. Validated against a real macOS sender (clean audio out).
+
+**Milestone 6 (soft timing: pause/resume, seek) — implemented.** Honors
+transport control for a single stream: `SETRATEANCHORTIME`'s rate pauses and
+resumes the ALSA device; `FLUSHBUFFERED` drops buffered audio so seeking is
+responsive. The TCP reader backpressures on the player's queue depth, so
+latency and memory stay bounded and the sound card's drain rate sets the pace.
+
+By design this receiver targets **one Mac → one stream → one output** and does
+**not** implement PTP: it never binds UDP 319/320 and replies `timingPort: 0`.
+PTP exists to align *multiple* outputs to a shared clock; with a single output
+there is nothing to align to, so the Mac's own buffering plus our backpressure
+are sufficient. Multi-room / grouped playback would require PTP and is out of
+scope. See [`notes/milestone-6.md`](notes/milestone-6.md).
 
 ## Build & run
 

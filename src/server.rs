@@ -138,9 +138,18 @@ async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Re
             session.set_parameter(&request.body);
             Some(Response::ok(proto))
         }
+        // Transport control: play/pause rate and the RTP anchor.
+        "SETRATEANCHORTIME" => {
+            session.set_rate_anchor(&request.body);
+            Some(Response::ok(proto))
+        }
+        // Seek/skip: drop buffered audio.
+        "FLUSHBUFFERED" => {
+            session.flush(&request.body);
+            Some(Response::ok(proto))
+        }
         // Other session control verbs: acknowledge so the sender proceeds.
-        "RECORD" | "SETRATEANCHORTIME" | "SETPEERS" | "SETPEERSX" | "FLUSHBUFFERED"
-        | "TEARDOWN" => {
+        "RECORD" | "SETPEERS" | "SETPEERSX" | "TEARDOWN" => {
             session.ack(&request.method);
             Some(Response::ok(proto))
         }
