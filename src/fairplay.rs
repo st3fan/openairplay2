@@ -2,9 +2,10 @@
 //!
 //! A stock Apple sender requires `POST /fp-setup` after pairing, before it
 //! will send `SETUP`. This is not live crypto: the receiver replies with fixed
-//! tables. The tables are the well-known interop values from shairport-sync /
-//! the openairplay Python receiver (GPL) — the same interop footing as the
-//! embedded AirPort key in the AirPlay 1 receiver.
+//! tables. The tables are well-known reverse-engineered FairPlay interop
+//! constants (Apple-derived); they circulate across receivers under differing
+//! licenses (shairport-sync is MIT; the openairplay Python receiver's FairPlay
+//! code is GPLv2). See `notes/licensing.md` for the licensing/DMCA caveats.
 //!
 //! Requests are `application/octet-stream` beginning with `FPLY`
 //! (`46 50 4c 59`):
