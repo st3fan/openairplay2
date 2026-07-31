@@ -1,24 +1,27 @@
 //! AirPlay 2 control server: accept loop and request dispatch.
 //!
-//! Milestone 1 answers `GET /info` with the device plist and logs every other
-//! request (returning `501`) so the sender's real request sequence — in
-//! particular the pairing handshake — is visible for milestone 2.
+//! Milestone 2: `GET /info`, transient `POST /pair-setup`, and the switch to
+//! the encrypted channel once pairing completes. Everything else is logged and
+//! `501`'d so later milestones can see the real request sequence.
 
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
-use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::http::{read_request, Request, Response};
+use crate::cipher::control_channel;
+use crate::crypto_stream::ControlConnection;
+use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
+use crate::pairing::{Outcome, PairSetup};
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
 pub const INFO_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
+pub const PAIRING_CONTENT_TYPE: &str = "application/octet-stream";
 
 pub struct Context {
     pub config: Config,
@@ -45,21 +48,48 @@ async fn handle_connection(
     context: Arc<Context>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let (read_half, write_half) = stream.into_split();
+    let mut conn = ControlConnection::new(read_half, write_half);
+    let mut pair = PairSetup::new();
 
-    while let Some(request) = read_request(&mut reader).await? {
-        log_request(&peer, &request);
-        let response = dispatch(&request, &context);
+    while let Some(request) = conn.read_request().await? {
+        log_request(&peer, &request, conn.is_encrypted());
+
+        // `/pair-setup` advances the state machine and may install the cipher
+        // (after the plaintext M4 response is written).
+        if request.method == "POST" && request.target == "/pair-setup" {
+            let outcome = pair.handle(&request.body);
+            let (tlv, secret) = match outcome {
+                Outcome::Continue(tlv) => (tlv, None),
+                Outcome::Failed(tlv) => (tlv, None),
+                Outcome::Done {
+                    response,
+                    shared_secret,
+                } => (response, Some(shared_secret)),
+            };
+            let response = finalize(
+                Response::ok(&request.protocol).body(PAIRING_CONTENT_TYPE, tlv),
+                &request,
+            );
+            conn.write_response(&response).await?;
+            if let Some(secret) = secret {
+                let (enc, dec) = control_channel(&secret);
+                conn.enable_encryption(enc, dec);
+            }
+            continue;
+        }
+
+        let response = finalize(dispatch(&request, &context), &request);
         debug!("[{peer}] -> {} {}", request.method, response.status());
-        response.write_to(&mut write_half).await?;
+        conn.write_response(&response).await?;
     }
     Ok(())
 }
 
-fn log_request(peer: &SocketAddr, request: &Request) {
+fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
+    let lock = if encrypted { " [enc]" } else { "" };
     info!(
-        "[{peer}] {} {} {}",
+        "[{peer}]{lock} {} {} {}",
         request.method, request.target, request.protocol
     );
     for (name, value) in request.headers.iter() {
@@ -71,19 +101,20 @@ fn log_request(peer: &SocketAddr, request: &Request) {
 }
 
 fn dispatch(request: &Request, context: &Context) -> Response {
-    let proto = &request.protocol;
-    let mut response = match (request.method.as_str(), request.target.as_str()) {
-        ("GET", "/info") => Response::ok(proto).body(
+    match (request.method.as_str(), request.target.as_str()) {
+        ("GET", "/info") => Response::ok(&request.protocol).body(
             INFO_CONTENT_TYPE,
             info_plist(&context.config, &context.identity),
         ),
         (method, target) => {
             warn!("{method} {target} not implemented yet");
-            Response::new(proto, 501, "Not Implemented")
+            Response::new(&request.protocol, 501, "Not Implemented")
         }
-    };
+    }
+}
 
-    // AirPlay echoes CSeq and carries a Server header.
+/// Add the headers every response carries (echoed `CSeq`, `Server`).
+fn finalize(mut response: Response, request: &Request) -> Response {
     if let Some(cseq) = request.headers.get("CSeq") {
         response = response.header("CSeq", cseq);
     }

@@ -1,9 +1,14 @@
 pub mod avahi;
+pub mod cipher;
+pub mod crypto_stream;
 pub mod http;
 pub mod identity;
 pub mod info;
 pub mod mac;
+pub mod pairing;
 pub mod server;
+pub mod srp;
+pub mod tlv;
 
 /// Receiver-wide configuration.
 #[derive(Debug, Clone)]
