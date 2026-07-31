@@ -5,6 +5,9 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, info, warn};
 use plist::{Dictionary, Value};
@@ -12,7 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
-use crate::buffered::{split_blocks, AudioDecryptor};
+use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
 use crate::decode::AacDecoder;
 use crate::player::{Player, PlayerSender};
 
@@ -35,6 +38,11 @@ pub struct Session {
     alsa_device: Option<String>,
     /// The playback thread, alive for the duration of a buffered stream.
     player: Option<Player>,
+    /// Control handle for the player (pause/resume, flush) from the RTSP path.
+    player_control: Option<PlayerSender>,
+    /// `FLUSHBUFFERED` boundary: the reader drops audio packets with a sequence
+    /// number below this, discarding buffered-ahead audio on seek/skip.
+    flush_until_seq: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -48,6 +56,8 @@ impl Session {
             volume: 0.0,
             alsa_device,
             player: None,
+            player_control: None,
+            flush_until_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -181,9 +191,16 @@ impl Session {
             (Some(decryptor), Ok(decoder)) => {
                 let player = Player::spawn(rate, channels, self.alsa_device.clone());
                 let sender = player.sender();
+                self.player_control = Some(player.sender());
                 self.player = Some(player);
+                let max_queued = crate::player::max_queued_samples(rate, channels);
                 self.tasks.push(tokio::spawn(buffered_audio(
-                    listener, decryptor, decoder, sender,
+                    listener,
+                    decryptor,
+                    decoder,
+                    sender,
+                    max_queued,
+                    self.flush_until_seq.clone(),
                 )));
                 info!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
             }
@@ -197,6 +214,40 @@ impl Session {
             }
         }
         Ok(port)
+    }
+
+    /// Handle `SETRATEANCHORTIME`: the sender's play/pause rate (and the RTP
+    /// anchor, which we log). The network-time fields matter only with a PTP
+    /// clock, so we ignore them (see notes/milestone-6.md). `rate=0` engages
+    /// the pause gate (the player drops all audio until resumed); `rate=1`
+    /// releases it. A persistent gate is required because the Mac keeps sending
+    /// buffered-ahead audio during a pause.
+    pub fn set_rate_anchor(&mut self, body: &[u8]) {
+        let Some((rate, rtp)) = parse_rate_anchor(body) else {
+            warn!("SETRATEANCHORTIME: could not parse body");
+            return;
+        };
+        debug!("SETRATEANCHORTIME rate={rate} rtpTime={rtp}");
+        if let Some(ctrl) = &self.player_control {
+            ctrl.set_paused(rate == 0);
+        }
+    }
+
+    /// Handle `FLUSHBUFFERED` (seek/skip): drop buffered audio so playback
+    /// jumps promptly instead of draining stale buffer. The Mac buffers far
+    /// ahead, so besides clearing our decoded queue we set a sequence boundary
+    /// the reader uses to discard the buffered-ahead audio still arriving over
+    /// TCP (`flushUntilSeq` = drop everything before this packet).
+    pub fn flush(&mut self, body: &[u8]) {
+        if let Some(seq) = parse_flush_until_seq(body) {
+            self.flush_until_seq.store(seq, Ordering::Relaxed);
+            debug!("FLUSHBUFFERED until seq {seq}");
+        } else {
+            debug!("FLUSHBUFFERED (no seq boundary)");
+        }
+        if let Some(ctrl) = &self.player_control {
+            ctrl.flush();
+        }
     }
 
     /// Answer a `GET_PARAMETER` query. A sender asks `volume\r\n` during setup
@@ -290,6 +341,29 @@ fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
     (44100, 2)
 }
 
+/// Parse a `SETRATEANCHORTIME` plist into `(rate, rtpTime)`. `rate` is 0
+/// (pause) or 1 (play); `rtpTime` is the anchor timestamp.
+fn parse_rate_anchor(body: &[u8]) -> Option<(u64, u64)> {
+    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
+    let dict = value.as_dictionary()?;
+    let rate = dict.get("rate").and_then(int_field)?;
+    let rtp = dict.get("rtpTime").and_then(int_field).unwrap_or(0);
+    Some((rate, rtp))
+}
+
+/// Read an integer plist field whether it was encoded signed or unsigned.
+fn int_field(v: &Value) -> Option<u64> {
+    v.as_unsigned_integer()
+        .or_else(|| v.as_signed_integer().map(|s| s as u64))
+}
+
+/// Parse a `FLUSHBUFFERED` plist for its `flushUntilSeq` boundary (drop all
+/// packets with a lower sequence number).
+fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
+    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
+    value.as_dictionary()?.get("flushUntilSeq").and_then(int_field)
+}
+
 /// The buffered-audio pipeline: accept the sender's TCP connection, frame the
 /// stream into packets, decrypt each, decode the AAC, and hand PCM to the
 /// player.
@@ -298,6 +372,8 @@ async fn buffered_audio(
     decryptor: AudioDecryptor,
     mut decoder: AacDecoder,
     player: PlayerSender,
+    max_queued: usize,
+    flush_until_seq: Arc<AtomicU64>,
 ) {
     let Ok((mut stream, peer)) = listener.accept().await else {
         return;
@@ -307,7 +383,14 @@ async fn buffered_audio(
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     let mut decrypt_failures: u64 = 0;
+    let mut skipped: u64 = 0;
     loop {
+        // Backpressure: if the player's queue is full, stop reading so the
+        // Mac's TCP send blocks. This bounds latency/memory without a clock —
+        // the sound card's drain rate sets the pace.
+        while player.pending_samples() > max_queued {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         match stream.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
@@ -316,6 +399,19 @@ async fn buffered_audio(
                 let owned: Vec<Vec<u8>> = packets.iter().map(|p| p.to_vec()).collect();
                 buf.drain(..used);
                 for packet in owned {
+                    // Drop buffered-ahead audio below the flush boundary using
+                    // the plaintext seq — cheap, no decrypt/decode. This is how
+                    // seek/skip discards the old track still in the socket.
+                    let boundary = flush_until_seq.load(Ordering::Relaxed);
+                    if let Some(seq) = packet_seq(&packet) {
+                        if boundary != 0 && (seq as u64) < boundary {
+                            skipped += 1;
+                            if skipped <= 3 || skipped.is_multiple_of(2000) {
+                                debug!("buffered audio: skipping seq {seq} < {boundary}");
+                            }
+                            continue;
+                        }
+                    }
                     let Some(audio) = decryptor.decrypt(&packet) else {
                         decrypt_failures += 1;
                         if decrypt_failures <= 3 {
@@ -336,7 +432,7 @@ async fn buffered_audio(
             }
         }
     }
-    info!("buffered audio disconnected ({decrypt_failures} decrypt failures)");
+    info!("buffered audio disconnected ({decrypt_failures} decrypt failures, {skipped} skipped)");
 }
 
 /// Accept and drain a buffered-audio connection we can't decode (missing key
@@ -440,5 +536,53 @@ mod tests {
         );
         // Unknown parameters yield an empty body rather than a bad one.
         assert!(session.get_parameter(b"progress\r\n").is_empty());
+    }
+
+    #[test]
+    fn parses_real_setrateanchortime() {
+        // The exact fields a real Mac sent (milestone-5 capture).
+        let mut dict = Dictionary::new();
+        dict.insert("rate".into(), Value::Integer(1u64.into()));
+        dict.insert(
+            "networkTimeTimelineID".into(),
+            Value::Integer((-2116301217048756216i64).into()),
+        );
+        dict.insert("networkTimeSecs".into(), Value::Integer(1323152u64.into()));
+        dict.insert(
+            "networkTimeFrac".into(),
+            Value::Integer(6275326383463858176u64.into()),
+        );
+        dict.insert("networkTimeFlags".into(), Value::Integer(0u64.into()));
+        dict.insert("rtpTime".into(), Value::Integer(3174381381u64.into()));
+        let body = encode_plist(&dict).unwrap();
+
+        assert_eq!(parse_rate_anchor(&body), Some((1, 3174381381)));
+    }
+
+    #[test]
+    fn parses_real_flushbuffered() {
+        // The exact fields a real Mac sent on skip (log capture).
+        let mut dict = Dictionary::new();
+        dict.insert("flushUntilSeq".into(), Value::Integer(5179978u64.into()));
+        dict.insert("flushUntilTS".into(), Value::Integer(2204469244u64.into()));
+        let body = encode_plist(&dict).unwrap();
+        assert_eq!(parse_flush_until_seq(&body), Some(5179978));
+
+        // A body without the field yields None (no boundary set).
+        let empty = encode_plist(&Dictionary::new()).unwrap();
+        assert_eq!(parse_flush_until_seq(&empty), None);
+    }
+
+    #[test]
+    fn rate_anchor_pause_and_missing_fields() {
+        // rate 0 = pause; rtpTime defaults to 0 when absent.
+        let mut dict = Dictionary::new();
+        dict.insert("rate".into(), Value::Integer(0u64.into()));
+        let body = encode_plist(&dict).unwrap();
+        assert_eq!(parse_rate_anchor(&body), Some((0, 0)));
+
+        // No rate field at all → None.
+        let empty = encode_plist(&Dictionary::new()).unwrap();
+        assert_eq!(parse_rate_anchor(&empty), None);
     }
 }
