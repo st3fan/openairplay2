@@ -38,10 +38,16 @@ In:
   v1 put pause in-band behind the ~2 s buffer (acted 3 s late); v2 used a flush,
   which the incoming audio simply played past. The gate is set out-of-band and
   the player drops the queue + `drop`+`prepare`s the device on engage.
-- **Seek/skip via out-of-band flush** (`FLUSHBUFFERED`): a `flush_gen` atomic
-  the control path bumps instantly; every queued packet is stamped with its
-  generation; on a flush the player drops all stale-stamped packets
-  (microseconds, not played). New audio for the new position plays.
+- **Seek/skip via out-of-band flush** (`FLUSHBUFFERED`): two parts, because the
+  Mac buffers *far* ahead (~60 s of the old track can be in flight).
+  (1) A `flush_gen` atomic the control path bumps instantly; every queued packet
+  is stamped with its generation; the player drops stale-stamped packets and
+  resets the device — this clears *our* ~2 s decoded queue + ALSA buffer.
+  (2) `FLUSHBUFFERED` also carries `flushUntilSeq`; the reader drops incoming
+  packets whose plaintext sequence number is below it, discarding the old
+  track's buffered-ahead audio still arriving over TCP. Without (2) we'd read
+  and play tens of seconds of the old track after a skip ("stays on the same
+  track"). Sequence — not the per-track-rebased timestamp — is the boundary.
 - **Bounded latency** (`player.rs` + the buffered reader): the player exposes
   how many frames are queued; the TCP reader backpressures (stops reading, so
   the Mac's send blocks) when the queue exceeds a target. This replaces the

@@ -42,7 +42,7 @@ impl AudioDecryptor {
         if packet.len() < HEADER_LEN + NONCE_SUFFIX_LEN + TAG_LEN {
             return None;
         }
-        let seq = u32::from_be_bytes(packet[0..4].try_into().unwrap()) & 0x7F_FFFF;
+        let seq = packet_seq(packet).unwrap();
         let timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
         let ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
 
@@ -63,6 +63,16 @@ impl AudioDecryptor {
             payload,
         })
     }
+}
+
+/// Peek the 24-bit packet sequence number from the (plaintext) header without
+/// decrypting — used to drop packets below a `FLUSHBUFFERED` boundary cheaply.
+/// Returns `None` if the packet is too short to hold a header.
+pub fn packet_seq(packet: &[u8]) -> Option<u32> {
+    if packet.len() < 4 {
+        return None;
+    }
+    Some(u32::from_be_bytes(packet[0..4].try_into().unwrap()) & 0xFF_FFFF)
 }
 
 /// Split a buffer of TCP bytes into complete `[u16 len][packet]` blocks,
