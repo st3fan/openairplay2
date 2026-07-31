@@ -18,6 +18,7 @@ use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
 use crate::pairing::{Outcome, PairSetup};
+use crate::session::Session;
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
@@ -49,9 +50,11 @@ async fn handle_connection(
     context: Arc<Context>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
+    let local_ip = stream.local_addr()?.ip();
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
     let mut pair = PairSetup::new();
+    let mut session = Session::new(local_ip);
 
     while let Some(request) = conn.read_request().await? {
         log_request(&peer, &request, conn.is_encrypted());
@@ -80,7 +83,11 @@ async fn handle_connection(
             continue;
         }
 
-        let response = finalize(dispatch(&request, &context), &request);
+        let response = match dispatch_session(&mut session, &request).await {
+            Some(response) => response,
+            None => dispatch(&request, &context),
+        };
+        let response = finalize(response, &request);
         debug!("[{peer}] -> {} {}", request.method, response.status());
         conn.write_response(&response).await?;
     }
@@ -104,6 +111,30 @@ fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
             request.body.len(),
             hex::encode(&request.body)
         );
+    }
+}
+
+/// Handle the streaming-session methods (SETUP and the control verbs) that
+/// operate on the per-connection [`Session`]. Returns `None` if `request`
+/// isn't one of them, so the caller can fall back to the stateless dispatch.
+async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Response> {
+    let proto = &request.protocol;
+    match request.method.as_str() {
+        "SETUP" => Some(match session.handle_setup(&request.body).await {
+            Ok(body) => Response::ok(proto).body(INFO_CONTENT_TYPE, body),
+            Err(e) => {
+                warn!("SETUP failed: {e}");
+                Response::new(proto, 400, "Bad Request")
+            }
+        }),
+        // Session control verbs: acknowledge so the sender proceeds. Bodies
+        // (rate anchors, flush points, volume) are consumed in later milestones.
+        "RECORD" | "SETRATEANCHORTIME" | "SETPEERS" | "SETPEERSX" | "FLUSHBUFFERED"
+        | "TEARDOWN" | "SET_PARAMETER" | "GET_PARAMETER" | "POST_FEEDBACK" => {
+            session.ack(&request.method);
+            Some(Response::ok(proto))
+        }
+        _ => None,
     }
 }
 

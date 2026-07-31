@@ -173,6 +173,98 @@ async fn transient_pairing_then_encrypted_info() {
         &fp2[144..164],
         "phase 2 echoes the last 20 bytes"
     );
+
+    // SETUP phase 1 (timingProtocol only, no streams) → event/timing ports.
+    let mut d = plist::Dictionary::new();
+    d.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
+    let (status, body) =
+        encrypted_request(&mut stream, &mut enc, &mut dec, "SETUP", &plist_bytes(d)).await;
+    assert_eq!(status, "RTSP/1.0 200 OK");
+    let resp = plist::Value::from_reader(std::io::Cursor::new(body)).unwrap();
+    let resp = resp.as_dictionary().unwrap();
+    assert!(
+        resp.get("eventPort")
+            .unwrap()
+            .as_unsigned_integer()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        resp.get("timingPort").unwrap().as_unsigned_integer(),
+        Some(0)
+    );
+
+    // SETUP phase 2 (streams array) → data/control ports.
+    let mut s = plist::Dictionary::new();
+    s.insert("type".into(), plist::Value::Integer(96u64.into()));
+    s.insert("shk".into(), plist::Value::Data(vec![9u8; 32]));
+    s.insert("spf".into(), plist::Value::Integer(352u64.into()));
+    let mut d = plist::Dictionary::new();
+    d.insert(
+        "streams".into(),
+        plist::Value::Array(vec![plist::Value::Dictionary(s)]),
+    );
+    let (status, body) =
+        encrypted_request(&mut stream, &mut enc, &mut dec, "SETUP", &plist_bytes(d)).await;
+    assert_eq!(status, "RTSP/1.0 200 OK");
+    let resp = plist::Value::from_reader(std::io::Cursor::new(body)).unwrap();
+    let streams = resp
+        .as_dictionary()
+        .unwrap()
+        .get("streams")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let stream0 = streams[0].as_dictionary().unwrap();
+    assert_eq!(stream0.get("type").unwrap().as_unsigned_integer(), Some(96));
+    assert!(
+        stream0
+            .get("dataPort")
+            .unwrap()
+            .as_unsigned_integer()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        stream0
+            .get("controlPort")
+            .unwrap()
+            .as_unsigned_integer()
+            .unwrap()
+            > 0
+    );
+}
+
+fn plist_bytes(dict: plist::Dictionary) -> Vec<u8> {
+    let mut buf = Vec::new();
+    plist::Value::Dictionary(dict)
+        .to_writer_binary(&mut buf)
+        .unwrap();
+    buf
+}
+
+/// Send an encrypted request (RTSP/HTTP) with a binary plist body and read the
+/// encrypted response.
+async fn encrypted_request(
+    stream: &mut TcpStream,
+    enc: &mut openairplay2::cipher::Encryptor,
+    dec: &mut openairplay2::cipher::Decryptor,
+    method: &str,
+    body: &[u8],
+) -> (String, Vec<u8>) {
+    let proto = if method == "SETUP" {
+        "RTSP/1.0"
+    } else {
+        "HTTP/1.1"
+    };
+    let mut req = format!(
+        "{method} rtsp://x/1 {proto}\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    stream.write_all(&enc.encrypt(&req)).await.unwrap();
+    read_encrypted_http(stream, dec).await
 }
 
 /// Send an encrypted POST with a binary body and read the encrypted response.

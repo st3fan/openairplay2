@@ -8,6 +8,7 @@ pub mod info;
 pub mod mac;
 pub mod pairing;
 pub mod server;
+pub mod session;
 pub mod srp;
 pub mod tlv;
 

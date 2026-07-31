@@ -27,8 +27,16 @@ against a real macOS sender.
 
 **Milestone 3 (FairPlay `fp-setup`) — complete.** Answers the FairPlay
 `fp-setup` handshake (the canned interop tables), which a real sender requires
-after pairing before it will send `SETUP`. SETUP, audio, and timing are still
-to come.
+after pairing before it will send `SETUP`. Validated against a real macOS
+sender (it got past FairPlay and sent `SETUP`).
+
+**Milestone 4 (SETUP & receiving the stream) — complete.** Handles the
+two-phase `SETUP` — phase 1 binds the event channel and reports the
+event/timing ports; phase 2 binds the audio data/control UDP channels and
+reports them, capturing the stream format and key. Acknowledges the session
+control methods (RECORD, SETRATEANCHORTIME, FLUSHBUFFERED, …) and receives the
+stream (logged, not yet decoded). Audio decode/playback and PTP timing are
+still to come.
 
 ## Build & run
 
