@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::cipher::control_channel;
 use crate::crypto_stream::ControlConnection;
+use crate::fairplay;
 use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
@@ -96,7 +97,13 @@ fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
         debug!("[{peer}]   {name}: {value}");
     }
     if !request.body.is_empty() {
-        debug!("[{peer}]   body: {} bytes", request.body.len());
+        // Dump the body as hex so the real request contents (SETUP plists,
+        // pairing TLVs) can be inspected offline during bring-up.
+        debug!(
+            "[{peer}]   body ({} bytes): {}",
+            request.body.len(),
+            hex::encode(&request.body)
+        );
     }
 }
 
@@ -106,6 +113,18 @@ fn dispatch(request: &Request, context: &Context) -> Response {
             INFO_CONTENT_TYPE,
             info_plist(&context.config, &context.identity),
         ),
+        ("POST", "/fp-setup") => match fairplay::fp_setup(&request.body) {
+            Some(reply) => Response::ok(&request.protocol).body(PAIRING_CONTENT_TYPE, reply),
+            None => {
+                warn!("fp-setup: malformed FairPlay request");
+                Response::new(&request.protocol, 400, "Bad Request")
+            }
+        },
+        // Keep-alive / control methods a sender interleaves; acknowledge so the
+        // session survives long enough to reach SETUP.
+        ("POST", "/feedback") | ("POST", "/command") | ("POST", "/audioMode") => {
+            Response::ok(&request.protocol)
+        }
         (method, target) => {
             warn!("{method} {target} not implemented yet");
             Response::new(&request.protocol, 501, "Not Implemented")

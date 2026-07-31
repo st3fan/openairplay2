@@ -141,6 +141,56 @@ async fn transient_pairing_then_encrypted_info() {
         dict.get("deviceID").unwrap().as_string(),
         Some("AA:BB:CC:DD:EE:FF")
     );
+
+    // FairPlay fp-setup over the encrypted channel, phase 1 (the exact request
+    // a real macOS sender sends, mode 1) then phase 2.
+    let fp1: [u8; 16] = [
+        0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x00, 0x01,
+        0xbb,
+    ];
+    let (status, body) = encrypted_post(&mut stream, &mut enc, &mut dec, "/fp-setup", &fp1).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(body.len(), 142, "phase 1 reply is a 142-byte table");
+    assert_eq!(&body[0..4], b"FPLY");
+
+    let mut fp2 = vec![0u8; 164];
+    fp2[0..4].copy_from_slice(b"FPLY");
+    fp2[4] = 3;
+    fp2[5] = 1;
+    fp2[6] = 3; // phase 2
+    for (i, b) in fp2.iter_mut().enumerate().skip(144) {
+        *b = i as u8;
+    }
+    let (status, body) = encrypted_post(&mut stream, &mut enc, &mut dec, "/fp-setup", &fp2).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(
+        body.len(),
+        32,
+        "phase 2 reply is 12-byte header + 20-byte echo"
+    );
+    assert_eq!(
+        &body[12..32],
+        &fp2[144..164],
+        "phase 2 echoes the last 20 bytes"
+    );
+}
+
+/// Send an encrypted POST with a binary body and read the encrypted response.
+async fn encrypted_post(
+    stream: &mut TcpStream,
+    enc: &mut openairplay2::cipher::Encryptor,
+    dec: &mut openairplay2::cipher::Decryptor,
+    target: &str,
+    body: &[u8],
+) -> (String, Vec<u8>) {
+    let mut req = format!(
+        "POST {target} HTTP/1.1\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    stream.write_all(&enc.encrypt(&req)).await.unwrap();
+    read_encrypted_http(stream, dec).await
 }
 
 /// Read one HTTP response from the encrypted channel, decrypting blocks until a

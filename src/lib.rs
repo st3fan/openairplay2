@@ -1,6 +1,7 @@
 pub mod avahi;
 pub mod cipher;
 pub mod crypto_stream;
+pub mod fairplay;
 pub mod http;
 pub mod identity;
 pub mod info;

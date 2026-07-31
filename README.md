@@ -22,9 +22,13 @@ device plist.
 **Milestone 2 (transient pairing & channel encryption) — complete.**
 Implements HomeKit transient `pair-setup` (SRP-6a over the 3072-bit group,
 SHA-512, fixed code `3939`) and, on completion, encrypts the control channel
-with ChaCha20-Poly1305 (HKDF-derived keys, HAP block framing). After pairing,
-the sender's requests decrypt transparently. SETUP, audio, and timing are
-still to come.
+with ChaCha20-Poly1305 (HKDF-derived keys, HAP block framing). Validated
+against a real macOS sender.
+
+**Milestone 3 (FairPlay `fp-setup`) — complete.** Answers the FairPlay
+`fp-setup` handshake (the canned interop tables), which a real sender requires
+after pairing before it will send `SETUP`. SETUP, audio, and timing are still
+to come.
 
 ## Build & run
 
