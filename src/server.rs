@@ -55,7 +55,7 @@ async fn handle_connection(
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
     let mut pair = PairSetup::new();
-    let mut session = Session::new(local_ip);
+    let mut session = Session::new(local_ip, context.config.alsa_device.clone());
 
     while let Some(request) = conn.read_request().await? {
         log_request(&peer, &request, conn.is_encrypted());
