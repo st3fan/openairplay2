@@ -17,7 +17,14 @@ and `notes/milestone-*.md` for each milestone.
 **Milestone 1 (discovery & `/info`) — complete.** Advertises `_airplay._tcp`
 via Avahi with an AirPlay 2 `features` bitmask and an Ed25519 public key, runs
 the HTTP/RTSP control server on port 7000, and answers `GET /info` with the
-device plist. Pairing, SETUP, audio, and timing are still to come.
+device plist.
+
+**Milestone 2 (transient pairing & channel encryption) — complete.**
+Implements HomeKit transient `pair-setup` (SRP-6a over the 3072-bit group,
+SHA-512, fixed code `3939`) and, on completion, encrypts the control channel
+with ChaCha20-Poly1305 (HKDF-derived keys, HAP block framing). After pairing,
+the sender's requests decrypt transparently. SETUP, audio, and timing are
+still to come.
 
 ## Build & run
 

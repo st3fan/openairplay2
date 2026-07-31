@@ -105,10 +105,10 @@ async fn unimplemented_method_501_and_connection_survives() {
     let addr = start().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // Pairing isn't implemented in milestone 1.
+    // FairPlay setup isn't implemented (pairing is, as of milestone 2).
     let (status, headers, _) = request(
         &mut stream,
-        "POST /pair-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\n\x00\x01",
+        "POST /fp-setup RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\n\x00\x01",
     )
     .await;
     assert_eq!(status, "RTSP/1.0 501 Not Implemented");

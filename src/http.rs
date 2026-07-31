@@ -37,6 +37,70 @@ impl Headers {
     }
 }
 
+/// Parse a request head (everything before the blank line, without the
+/// trailing CRLFCRLF) into method, target, protocol, and headers. Body length
+/// is read from the `Content-Length` header by the caller.
+pub fn parse_head(head: &str) -> io::Result<(String, String, String, Headers)> {
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.splitn(3, ' ');
+    let (method, target, protocol) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(m), Some(t), Some(p)) if !m.is_empty() => (m, t, p),
+        _ => {
+            return Err(bad_data(format!(
+                "malformed request line: {request_line:?}"
+            )))
+        }
+    };
+    if !protocol.starts_with("HTTP/") && !protocol.starts_with("RTSP/") {
+        return Err(bad_data(format!("not HTTP or RTSP: {request_line:?}")));
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| bad_data(format!("malformed header line: {line:?}")))?;
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Ok((
+        method.to_string(),
+        target.to_string(),
+        protocol.to_string(),
+        Headers(headers),
+    ))
+}
+
+impl Request {
+    pub fn from_parts(
+        method: String,
+        target: String,
+        protocol: String,
+        headers: Headers,
+        body: Vec<u8>,
+    ) -> Request {
+        Request {
+            method,
+            target,
+            protocol,
+            headers,
+            body,
+        }
+    }
+
+    /// The declared body length from `Content-Length`, or 0.
+    pub fn content_length(headers: &Headers) -> io::Result<usize> {
+        match headers.get("Content-Length") {
+            Some(v) => v
+                .parse()
+                .map_err(|_| bad_data(format!("bad Content-Length: {v:?}"))),
+            None => Ok(0),
+        }
+    }
+}
+
 /// Read one request. Returns `Ok(None)` on a clean EOF at a message boundary.
 pub async fn read_request<R>(reader: &mut BufReader<R>) -> io::Result<Option<Request>>
 where
@@ -160,17 +224,21 @@ impl Response {
         self.status
     }
 
-    pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
+    /// Serialize to the wire form. AirPlay senders expect a `Content-Length`
+    /// on every response, including empty ones.
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = format!("{} {} {}\r\n", self.protocol, self.status, self.reason).into_bytes();
         for (name, value) in &self.headers {
             out.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
         }
-        // AirPlay senders expect a Content-Length on every response, including
-        // empty ones.
         out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         out.extend_from_slice(b"\r\n");
         out.extend_from_slice(&self.body);
-        writer.write_all(&out).await?;
+        out
+    }
+
+    pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.to_bytes()).await?;
         writer.flush().await
     }
 }
