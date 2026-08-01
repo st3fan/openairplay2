@@ -59,7 +59,8 @@ the standalone Linux/ALSA binary, functionally identical to the pre-split
 receiver, consuming only the public API.
 
 **Pause/resume fix ([plan](../plans/20260801-02-pause-resume-hold.md)) —
-implemented, awaiting hardware validation.** iPhone testing showed delayed,
+implemented; initial hardware validation passed (extended listening in
+progress).** iPhone testing showed delayed,
 mispositioned, stuttery resumes and a diverging sender-side timeline (stale
 Now Playing widget, resumes jumping tracks back). Root cause: pause *dropped*
 buffered audio the sender believed was safely delivered, and a sticky
