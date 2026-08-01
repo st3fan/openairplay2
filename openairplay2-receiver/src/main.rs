@@ -1,33 +1,23 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+//! The standalone Linux/ALSA AirPlay 2 receiver: a CLI over the
+//! `openairplay2` library's public API (it is embedder #1), with an ALSA
+//! sink and the dB → linear gain volume model.
+
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use log::{debug, info, warn};
-use tokio::net::TcpListener;
+use log::{debug, info};
 
 mod player;
 
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
-use openairplay2::identity::Identity;
-use openairplay2::info::txt_records;
-use openairplay2::server::{serve, Context};
-use openairplay2::{avahi, mac, AudioSink, Config, Event, SinkFactory};
+use openairplay2::{AudioSink, Event, Receiver};
 
-const DEFAULT_NAME: &str = "OpenAirPlay2";
-const DEFAULT_PORT: u16 = 7000;
-const DEFAULT_MODEL: &str = "OpenAirPlay2,1";
-const DEFAULT_SOURCE_VERSION: &str = "366.0";
-// shairport-sync's known-good AirPlay 2 features: transient pairing (bit 48)
-// plus AirPlay 2 audio. Pared down later as needed.
-const DEFAULT_FEATURES: u64 = 0x0001_8340_405C_4A00;
-const DEFAULT_STATUS_FLAGS: u32 = 0x4;
-const FALLBACK_MAC: [u8; 6] = [0x02, 0x4f, 0x41, 0x50, 0x32, 0x00];
 const DEFAULT_ALSA_DEVICE: &str = "default";
 
 struct Args {
-    name: String,
-    port: u16,
+    /// `None` → the library's defaults (name "OpenAirPlay2", port 7000).
+    name: Option<String>,
+    port: Option<u16>,
     mac: Option<[u8; 6]>,
     identity_file: Option<PathBuf>,
     avahi: bool,
@@ -43,10 +33,20 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Parse the `--mac` argument, e.g. `aa:bb:cc:dd:ee:ff`.
+fn parse_mac(s: &str) -> Option<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut parts = s.trim().split(':');
+    for byte in &mut mac {
+        *byte = u8::from_str_radix(parts.next()?, 16).ok()?;
+    }
+    parts.next().is_none().then_some(mac)
+}
+
 fn parse_args() -> Args {
     let mut args = Args {
-        name: DEFAULT_NAME.to_string(),
-        port: DEFAULT_PORT,
+        name: None,
+        port: None,
         mac: None,
         identity_file: None,
         avahi: true,
@@ -55,18 +55,19 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--name" => args.name = it.next().unwrap_or_else(|| usage()),
+            "--name" => args.name = Some(it.next().unwrap_or_else(|| usage())),
             "--port" => {
-                args.port = it
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage())
+                args.port = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or_else(|| usage()),
+                )
             }
             "--mac" => {
                 args.mac = Some(
                     it.next()
                         .as_deref()
-                        .and_then(mac::parse)
+                        .and_then(parse_mac)
                         .unwrap_or_else(|| usage()),
                 )
             }
@@ -98,35 +99,33 @@ async fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args();
 
-    let mac = args.mac.or_else(mac::discover).unwrap_or_else(|| {
-        warn!("no network interface MAC found, using a fixed fallback");
-        FALLBACK_MAC
-    });
-
     let identity_path = args.identity_file.unwrap_or_else(default_identity_path);
-    let identity = match Identity::load_or_create(&identity_path) {
-        Ok(id) => id,
+    let mut builder = Receiver::builder()
+        .identity_path(&identity_path)
+        .advertise(args.avahi);
+    if let Some(name) = args.name {
+        builder = builder.name(name);
+    }
+    if let Some(port) = args.port {
+        builder = builder.port(port);
+    }
+    if let Some(mac) = args.mac {
+        builder = builder.mac(mac);
+    }
+    let receiver = match builder.build() {
+        Ok(receiver) => receiver,
         Err(e) => {
             eprintln!("cannot load or create identity at {identity_path:?}: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let config = Config {
-        name: args.name,
-        port: args.port,
-        mac,
-        model: DEFAULT_MODEL.to_string(),
-        source_version: DEFAULT_SOURCE_VERSION.to_string(),
-        features: DEFAULT_FEATURES,
-        status_flags: DEFAULT_STATUS_FLAGS,
-    };
     info!(
         "starting AirPlay 2 receiver \"{}\" (deviceid {}, port {}, pk {})",
-        config.name,
-        config.device_id(),
-        config.port,
-        identity.public_key_hex()
+        receiver.config().name,
+        receiver.config().device_id(),
+        receiver.config().port,
+        receiver.identity().public_key_hex()
     );
     match &args.alsa_device {
         Some(dev) => info!("audio output: ALSA \"{dev}\""),
@@ -139,12 +138,12 @@ async fn main() -> ExitCode {
     let gain = SharedGain::new();
     let sink_gain = gain.clone();
     let device = args.alsa_device;
-    let sink_factory: SinkFactory = Arc::new(move |rate, channels| -> Box<dyn AudioSink> {
+    let sink_factory = move |rate: u32, channels: u8| -> Box<dyn AudioSink> {
         match &device {
             Some(dev) => Box::new(AlsaSink::open(dev, rate, channels, sink_gain.clone())),
             None => Box::new(NullSink),
         }
-    });
+    };
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -164,43 +163,8 @@ async fn main() -> ExitCode {
         }
     });
 
-    // Dual-stack if possible (IPv4 clients arrive v4-mapped), else IPv4.
-    let listener = match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.port)))
-        .await
-    {
-        Ok(l) => l,
-        Err(_) => {
-            match TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, config.port))).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("cannot bind control port {}: {e}", config.port);
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    };
-
-    let _advertisement = if args.avahi {
-        let records = txt_records(&config, &identity);
-        match avahi::publish(&config.name, config.port, &records).await {
-            Ok(ad) => Some(ad),
-            Err(e) => {
-                warn!("avahi advertisement disabled ({e}); is avahi-daemon running?");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let context = Arc::new(Context {
-        config,
-        identity,
-        sink_factory,
-        events: event_tx,
-    });
     tokio::select! {
-        result = serve(listener, context) => {
+        result = receiver.run(sink_factory, event_tx) => {
             if let Err(e) = result {
                 eprintln!("server error: {e}");
                 return ExitCode::FAILURE;

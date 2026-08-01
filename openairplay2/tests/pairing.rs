@@ -9,10 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use openairplay2::cipher::sender_control_channel;
-use openairplay2::identity::Identity;
 use openairplay2::server::{serve, Context};
 use openairplay2::srp::SrpClient;
 use openairplay2::tlv::{ty, Tlv};
+use openairplay2::Identity;
 use openairplay2::{AudioSink, Config, SinkFactory};
 
 /// Discards all audio — this test's SETUP uses a realtime stream (no sink).

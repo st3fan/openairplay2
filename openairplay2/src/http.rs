@@ -6,9 +6,12 @@
 
 use std::io;
 
+#[cfg(test)]
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+#[cfg(test)]
 const MAX_HEADERS: usize = 128;
+#[cfg(test)]
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -102,6 +105,12 @@ impl Request {
 }
 
 /// Read one request. Returns `Ok(None)` on a clean EOF at a message boundary.
+///
+/// Test-only: the production path is `crypto_stream::ControlConnection`,
+/// which must read the head a byte at a time so the cipher can be installed
+/// exactly at a message boundary. This buffered reader exercises the shared
+/// parsing in this module's tests.
+#[cfg(test)]
 pub async fn read_request<R>(reader: &mut BufReader<R>) -> io::Result<Option<Request>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -164,6 +173,7 @@ where
     }))
 }
 
+#[cfg(test)]
 async fn read_line<R>(reader: &mut BufReader<R>) -> io::Result<Option<String>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -237,6 +247,9 @@ impl Response {
         out
     }
 
+    /// Test-only: production writes go through `to_bytes` (the encrypted
+    /// channel frames them itself).
+    #[cfg(test)]
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.to_bytes()).await?;
         writer.flush().await

@@ -1,7 +1,7 @@
 # Plan: turn openairplay2 into an embeddable library
 
 - **Date:** 2026-08-01
-- **Status:** draft
+- **Status:** implemented (stacked PRs open; hardware validation pending)
 - **Scope:** this repository only. The eventual embedding into
   [st3fan/radio](https://github.com/st3fan/radio)'s `radiod` motivates the
   design but is explicitly not part of this plan; that integration happens

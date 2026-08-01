@@ -82,12 +82,14 @@ impl PlayerSender {
         self.pending.load(Ordering::Relaxed)
     }
 
-    /// Current flush generation (for tests/inspection).
+    /// Current flush generation (test inspection only).
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.flush_gen.load(Ordering::Relaxed)
     }
 
-    /// Whether the pause gate is engaged (for tests/inspection).
+    /// Whether the pause gate is engaged (test inspection only).
+    #[cfg(test)]
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }

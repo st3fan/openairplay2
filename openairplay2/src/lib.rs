@@ -1,26 +1,76 @@
-pub mod avahi;
-pub mod buffered;
+//! An embeddable AirPlay 2 audio **receiver**: a real Mac/iPhone discovers
+//! it, pairs with it, and streams to it; the host application gets decoded
+//! PCM and session events. The library owns network → PCM (discovery
+//! advertisement, transient pairing, the encrypted control channel, the
+//! buffered-audio channel, decrypt, AAC decode, and the pause/seek/
+//! backpressure semantics); the host owns PCM → speaker via an [`AudioSink`].
+//!
+//! Deliberate scope: one sender → one stream → one output. No PTP — for a
+//! single output, the sender's buffering plus this library's backpressure
+//! suffice (blocking [`AudioSink::write`] paces playback). No AirPlay wire
+//! concepts (plists, `shk`, sequence numbers) appear in this API.
+//!
+//! ```no_run
+//! use openairplay2::{AudioSink, Event, Receiver};
+//!
+//! struct MySink;
+//!
+//! impl AudioSink for MySink {
+//!     fn write(&mut self, pcm: &[i16]) { /* blocking write paces playback */ }
+//!     fn flush(&mut self) { /* seek: drop device/prebuffer state */ }
+//! }
+//!
+//! #[tokio::main]
+//! async fn main() -> std::io::Result<()> {
+//!     let receiver = Receiver::builder()
+//!         .name("Office")
+//!         .identity_path("/var/lib/myapp/airplay-identity")
+//!         .build()?;
+//!     let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+//!     tokio::spawn(async move {
+//!         while let Some(event) = rx.recv().await {
+//!             if let Event::Volume { db } = event { /* your gain path */ }
+//!         }
+//!     });
+//!     receiver.run(|_rate, _channels| Box::new(MySink), events).await
+//! }
+//! ```
+
+mod avahi;
+mod buffered;
+mod crypto_stream;
+mod decode;
+mod events;
+mod fairplay;
+mod http;
+mod identity;
+mod info;
+mod mac;
+mod pairing;
+mod player;
+mod receiver;
+mod session;
+mod sink;
+
+// Sender-side pieces the integration tests (and a future test-sender) drive
+// the real server with. Public so the tests can reach them, but not part of
+// the documented embedding API.
+#[doc(hidden)]
 pub mod cipher;
-pub mod crypto_stream;
-pub mod decode;
-pub mod events;
-pub mod fairplay;
-pub mod http;
-pub mod identity;
-pub mod info;
-pub mod mac;
-pub mod pairing;
-pub mod player;
+#[doc(hidden)]
 pub mod server;
-pub mod session;
-pub mod sink;
+#[doc(hidden)]
 pub mod srp;
+#[doc(hidden)]
 pub mod tlv;
 
 pub use events::{Event, EventSender};
+pub use identity::Identity;
+pub use info::txt_records;
+pub use receiver::{Receiver, ReceiverBuilder};
 pub use sink::{AudioSink, SinkFactory};
 
-/// Receiver-wide configuration.
+/// Receiver-wide configuration, resolved by [`ReceiverBuilder::build`].
 #[derive(Debug, Clone)]
 pub struct Config {
     pub name: String,

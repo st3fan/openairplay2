@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use openairplay2::identity::Identity;
 use openairplay2::server::{serve, Context};
+use openairplay2::Identity;
 use openairplay2::{AudioSink, Config, SinkFactory};
 
 /// Discards all audio — these tests never stream.

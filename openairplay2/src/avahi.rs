@@ -5,7 +5,7 @@
 //! Ported from the AirPlay 1 receiver, changed to the `_airplay._tcp` service
 //! type and AirPlay 2 TXT records.
 
-use log::{info, warn};
+use log::info;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::Connection;
 
@@ -73,23 +73,4 @@ pub async fn publish(
         _connection: connection,
         _group: group,
     })
-}
-
-impl Advertisement {
-    /// Best-effort explicit withdrawal (dropping the connection also works).
-    pub async fn withdraw(self) {
-        if let Err(e) = self
-            ._connection
-            .call_method(
-                Some(AVAHI_DEST),
-                &self._group,
-                Some(GROUP_IFACE),
-                "Free",
-                &(),
-            )
-            .await
-        {
-            warn!("failed to free Avahi entry group: {e}");
-        }
-    }
 }
