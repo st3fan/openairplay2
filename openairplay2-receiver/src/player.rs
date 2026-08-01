@@ -3,7 +3,7 @@
 //!
 //! This is the host side of the sink seam — the library hands it PCM that
 //! should play, and it owns the device, the pacing (blocking `writei`), and
-//! the gain. The AirPlay volume arrives as an [`crate::events::Event::Volume`]
+//! the gain. The AirPlay volume arrives as an `openairplay2::Event::Volume`
 //! in dB; the binary maps it to a linear gain shared with the sink.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,7 +13,7 @@ use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
 use log::{info, warn};
 
-use crate::sink::AudioSink;
+use openairplay2::AudioSink;
 
 /// Prebuffer this fraction of a second before the first ALSA write.
 fn start_samples(rate: u32, channels: u8) -> usize {

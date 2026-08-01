@@ -6,7 +6,9 @@ use std::sync::Arc;
 use log::{debug, info, warn};
 use tokio::net::TcpListener;
 
-use openairplay2::alsa_sink::{volume_to_gain, AlsaSink, NullSink, SharedGain};
+mod player;
+
+use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay2::identity::Identity;
 use openairplay2::info::txt_records;
 use openairplay2::server::{serve, Context};
@@ -35,7 +37,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: openairplay2 [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
+        "usage: openairplay2-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
          [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio]"
     );
     std::process::exit(2);

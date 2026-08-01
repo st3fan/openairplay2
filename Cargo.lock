@@ -780,11 +780,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 name = "openairplay2"
 version = "0.1.0"
 dependencies = [
- "alsa",
  "base64",
  "chacha20poly1305",
  "ed25519-dalek",
- "env_logger",
  "hex",
  "hkdf",
  "log",
@@ -796,6 +794,17 @@ dependencies = [
  "tokio",
  "uuid",
  "zbus",
+]
+
+[[package]]
+name = "openairplay2-receiver"
+version = "0.1.0"
+dependencies = [
+ "alsa",
+ "env_logger",
+ "log",
+ "openairplay2",
+ "tokio",
 ]
 
 [[package]]
