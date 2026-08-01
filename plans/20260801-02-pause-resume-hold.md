@@ -1,7 +1,7 @@
 # Plan: pause holds the buffer instead of dropping it
 
 - **Date:** 2026-08-01
-- **Status:** awaiting approval
+- **Status:** implemented (PR #20); initial hardware validation passed, extended listening in progress
 - **Scope:** the pause/resume path in the library's playback queue
   ([openairplay2/src/player.rs](../openairplay2/src/player.rs)). No protocol
   additions, no PTP, no receiver-binary changes expected.
