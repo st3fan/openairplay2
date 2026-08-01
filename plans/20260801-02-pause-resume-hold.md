@@ -17,9 +17,13 @@ Testing from an iPhone (post embeddable-library stack, PRs #15–#17) shows:
    confused.
 5. **Sometimes it stutters** until it "catches up".
 6. The iPhone's Now Playing widget can show a track that ended a while ago.
+7. Deep into a Music.app playlist (several tracks past the starting one),
+   a single pause/resume can restart playback at the **original track from
+   ~15 minutes earlier**.
 
 It is random and hard to reproduce — which fits the diagnosis below, because
-the failure size depends on how much audio happened to be in flight.
+the failure size depends on how much audio happened to be in flight and on
+how much divergence has accumulated over the session.
 
 ### Root cause
 
@@ -44,6 +48,26 @@ does not expect to resend it). On resume:
   discarded, which is what a stale Now Playing widget looks like (symptom 6 —
   there is no channel by which a receiver corrects the sender's UI; the only
   fix is keeping flow control honest).
+
+**The divergence accumulates.** Each drop makes the *audible* position jump
+ahead of the sender's model by the dropped span — the phone believes that
+span is still queued in our advertised 8 MB buffer, to be played at
+real-time rate, and nothing ever corrects it. A Music.app playlist streams
+gaplessly over one buffered session with no teardown between tracks, so the
+error compounds across track boundaries: after enough pause/resume cycles
+the listener is audibly tracks ahead of the phone's timeline (symptom 6
+again). A later pause/resume then resumes **from the phone's believed
+position** — Music.app re-anchors and re-sends from where *it* thinks
+playback is — which lands tracks back in the past (symptom 7). The backward
+jump is the accumulated divergence being repaid at once.
+
+Confirming observation: immediately after such a backward jump, the Now
+Playing widget matches audible playback **exactly** (title and seek
+position). The widget was never malfunctioning — it faithfully reports the
+phone's model; the jump re-synchronizes reality to that model, so the two
+agree again until the next drop re-diverges them. This is the behavior of a
+sender whose model is authoritative and a receiver that has been silently
+discarding — not of a clock/timing (PTP) problem.
 
 The randomness: Mac captures from milestone 6 showed pause arriving as
 `rate=0` **plus** `FLUSHBUFFERED`; when a flush accompanies the pause,
