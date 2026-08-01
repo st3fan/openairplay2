@@ -95,11 +95,16 @@ TCP reader backpressures on `pending_samples()` so latency and memory stay bound
 ## Invariants worth knowing before editing
 
 - **Transport control must bypass the audio queue.** An in-band command would sit behind the ~2 s
-  buffer. Pause is a persistent atomic gate (the Mac keeps pushing buffered-ahead audio during a
-  pause, so a one-shot flush would not stop it); seek is a generation counter — queued PCM is
-  stamped and stale stamps are dropped — plus `flushUntilSeq`, which discards still-arriving TCP
-  packets by their *plaintext* sequence number, before any decrypt. Both also call
-  `AudioSink::flush` so the sink discards its own device/prebuffer state.
+  buffer. Pause is a persistent atomic gate; seek is `flushUntilSeq`, applied out-of-band to the
+  queue (each decoded packet is stamped with its sequence number) and pre-decrypt to arriving TCP
+  packets by their *plaintext* sequence number. Both call `AudioSink::flush` so the sink discards
+  its own device/prebuffer state.
+- **Pause holds; only a flush discards — and exactly what it names.** A sender may pause with a
+  bare `rate=0` and expects everything it sent to still be buffered at resume, so pause parks
+  audio (queued-sample count stays up → backpressure freezes the sender's cursor) and resume
+  plays it. `FLUSHBUFFERED` discards only `seq < flushUntilSeq`, retaining the rest; the boundary
+  is consumed when the stream reaches it and reset at stream setup — a stale boundary silently
+  discarded ~47 s of audio once (see plans/20260801-02-pause-resume-hold.md).
 - **The library must stay free of audio-output dependencies** (no `alsa` anywhere in
   `cargo tree -p openairplay2`) and free of AirPlay wire types in its documented public API.
 - **Never read past a message boundary while in the clear**
