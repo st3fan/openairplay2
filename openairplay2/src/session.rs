@@ -47,8 +47,10 @@ pub struct Session {
     player: Option<Player>,
     /// Control handle for the player (pause/resume, flush) from the RTSP path.
     player_control: Option<PlayerSender>,
-    /// `FLUSHBUFFERED` boundary: the reader drops audio packets with a sequence
-    /// number below this, discarding buffered-ahead audio on seek/skip.
+    /// `FLUSHBUFFERED` boundary: the reader drops arriving audio packets with
+    /// a sequence number below this, discarding buffered-ahead audio on
+    /// seek/skip. Self-clearing (consumed when the stream reaches it) and
+    /// reset at stream setup — a stale boundary discards wanted audio.
     flush_until_seq: Arc<AtomicU64>,
 }
 
@@ -201,6 +203,10 @@ impl Session {
 
         let decryptor = self.stream_key.as_deref().and_then(AudioDecryptor::new);
         let (rate, channels) = aac_params(self.audio_format);
+        // A new stream is a fresh sequence-number epoch: a boundary left over
+        // from an earlier stream on this connection would silently discard
+        // the new stream's audio (measured at ~47 s in one session).
+        self.flush_until_seq.store(0, Ordering::Relaxed);
         match (decryptor, AacDecoder::new(rate, channels)) {
             (Some(decryptor), Ok(decoder)) => {
                 self.session_active = true;
@@ -236,9 +242,10 @@ impl Session {
     /// Handle `SETRATEANCHORTIME`: the sender's play/pause rate (and the RTP
     /// anchor, which we log). The network-time fields matter only with a PTP
     /// clock, so we ignore them (see notes/milestone-6.md). `rate=0` engages
-    /// the pause gate (the player drops all audio until resumed); `rate=1`
-    /// releases it. A persistent gate is required because the Mac keeps sending
-    /// buffered-ahead audio during a pause.
+    /// the pause gate — the player *holds* queued and arriving audio (a
+    /// flush-less pause gives no licence to drop anything; the sender expects
+    /// it all to still be buffered at resume) — and `rate=1` releases it,
+    /// playing the held audio from where playback stopped.
     pub fn set_rate_anchor(&mut self, body: &[u8]) {
         let Some((rate, rtp)) = parse_rate_anchor(body) else {
             warn!("SETRATEANCHORTIME: could not parse body");
@@ -251,20 +258,22 @@ impl Session {
         self.send_event(Event::Paused(rate == 0));
     }
 
-    /// Handle `FLUSHBUFFERED` (seek/skip): drop buffered audio so playback
-    /// jumps promptly instead of draining stale buffer. The Mac buffers far
-    /// ahead, so besides clearing our decoded queue we set a sequence boundary
-    /// the reader uses to discard the buffered-ahead audio still arriving over
-    /// TCP (`flushUntilSeq` = drop everything before this packet).
+    /// Handle `FLUSHBUFFERED` (seek/skip): discard exactly the audio the
+    /// sender names — queued/held packets with a sequence stamp below
+    /// `flushUntilSeq`, plus the stale audio still arriving over TCP (the
+    /// sender buffers far ahead) — while retaining everything at or after
+    /// the boundary. A body without a boundary discards all queued audio.
     pub fn flush(&mut self, body: &[u8]) {
-        if let Some(seq) = parse_flush_until_seq(body) {
-            self.flush_until_seq.store(seq, Ordering::Relaxed);
-            debug!("FLUSHBUFFERED until seq {seq}");
-        } else {
-            debug!("FLUSHBUFFERED (no seq boundary)");
+        let boundary = parse_flush_until_seq(body);
+        match boundary {
+            Some(seq) => {
+                self.flush_until_seq.store(seq, Ordering::Relaxed);
+                debug!("FLUSHBUFFERED until seq {seq}");
+            }
+            None => debug!("FLUSHBUFFERED (no seq boundary)"),
         }
         if let Some(ctrl) = &self.player_control {
-            ctrl.flush();
+            ctrl.flush(boundary);
         }
         self.send_event(Event::Flushed);
     }
@@ -442,12 +451,11 @@ async fn buffered_audio(
                     // Drop buffered-ahead audio below the flush boundary using
                     // the plaintext seq — cheap, no decrypt/decode. This is how
                     // seek/skip discards the old track still in the socket.
-                    let boundary = flush_until_seq.load(Ordering::Relaxed);
                     if let Some(seq) = packet_seq(&packet) {
-                        if boundary != 0 && (seq as u64) < boundary {
+                        if skip_before_boundary(&flush_until_seq, seq) {
                             skipped += 1;
                             if skipped <= 3 || skipped.is_multiple_of(2000) {
-                                debug!("buffered audio: skipping seq {seq} < {boundary}");
+                                debug!("buffered audio: skipping seq {seq}");
                             }
                             continue;
                         }
@@ -460,7 +468,7 @@ async fn buffered_audio(
                         continue;
                     };
                     match decoder.decode(&audio.payload) {
-                        Ok(pcm) if !pcm.is_empty() => player.play(pcm),
+                        Ok(pcm) if !pcm.is_empty() => player.play(u64::from(audio.seq), pcm),
                         Ok(_) => {}
                         Err(e) => debug!("buffered audio: decode error: {e}"),
                     }
@@ -473,6 +481,26 @@ async fn buffered_audio(
         }
     }
     info!("buffered audio disconnected ({decrypt_failures} decrypt failures, {skipped} skipped)");
+}
+
+/// The `FLUSHBUFFERED` discard filter for still-arriving packets: skip while
+/// `seq` is below the boundary, and **clear the boundary the moment the
+/// stream reaches it** — the flush is then complete. A boundary that outlived
+/// its flush measurably discarded ~47 s of re-sent audio in one session
+/// (see plans/20260801-02-pause-resume-hold.md).
+fn skip_before_boundary(flush_until_seq: &AtomicU64, seq: u32) -> bool {
+    let boundary = flush_until_seq.load(Ordering::Relaxed);
+    if boundary == 0 {
+        return false;
+    }
+    if u64::from(seq) < boundary {
+        return true;
+    }
+    // Reached the flush target: consume the boundary so later audio — even a
+    // re-send epoch with lower sequence numbers — plays. A concurrent newer
+    // flush wins the exchange and stays in place.
+    let _ = flush_until_seq.compare_exchange(boundary, 0, Ordering::Relaxed, Ordering::Relaxed);
+    false
 }
 
 /// Accept and drain a buffered-audio connection we can't decode (missing key
@@ -628,6 +656,23 @@ mod tests {
         let body = encode_plist(&dict).unwrap();
 
         assert_eq!(parse_rate_anchor(&body), Some((1, 3174381381)));
+    }
+
+    #[test]
+    fn flush_boundary_is_not_sticky() {
+        let boundary = AtomicU64::new(100);
+        // Stale in-flight audio below the boundary is skipped.
+        assert!(skip_before_boundary(&boundary, 50));
+        assert!(skip_before_boundary(&boundary, 99));
+        // Reaching the boundary consumes it...
+        assert!(!skip_before_boundary(&boundary, 100));
+        assert_eq!(boundary.load(Ordering::Relaxed), 0);
+        // ...so a later re-send epoch with lower sequence numbers plays
+        // (the 47-seconds-discarded regression).
+        assert!(!skip_before_boundary(&boundary, 50));
+
+        // No boundary set: nothing is skipped.
+        assert!(!skip_before_boundary(&AtomicU64::new(0), 7));
     }
 
     #[test]

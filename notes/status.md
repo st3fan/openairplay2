@@ -50,13 +50,25 @@ PCM before the ALSA write, updated live via a shared atomic so slider moves take
 effect mid-stream.
 
 **Embeddable library ([plan](../plans/20260801-01-embeddable-library.md)) —
-implemented, awaiting hardware validation.** The repo is now a workspace: the
+complete (PRs #15–#17), validated on hardware.** The repo is now a workspace: the
 `openairplay2` library owns network → PCM behind a designed embedding API
 (`Receiver` builder → `run(sink_factory, events)`; `AudioSink` for PCM out,
 `Event` for session milestones, volume delivered in dB for the host's own gain
 path) and builds without ALSA on macOS and Linux; `openairplay2-receiver` is
 the standalone Linux/ALSA binary, functionally identical to the pre-split
 receiver, consuming only the public API.
+
+**Pause/resume fix ([plan](../plans/20260801-02-pause-resume-hold.md)) —
+implemented; initial hardware validation passed (extended listening in
+progress).** iPhone testing showed delayed,
+mispositioned, stuttery resumes and a diverging sender-side timeline (stale
+Now Playing widget, resumes jumping tracks back). Root cause: pause *dropped*
+buffered audio the sender believed was safely delivered, and a sticky
+`flushUntilSeq` boundary discarded re-sent audio (~47 s measured in one
+session). Pause now holds audio — backpressure freezes the sender at the
+pause point and resume plays instantly from the held buffer — and
+`FLUSHBUFFERED` discards exactly the sequence range it names: the boundary
+self-clears when the stream reaches it and resets at stream setup.
 
 ## Design: no PTP, by intent
 
