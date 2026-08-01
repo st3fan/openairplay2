@@ -54,7 +54,13 @@ impl AudioDecryptor {
 
         let payload = self
             .cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
             .ok()?;
         Some(AudioPacket {
             seq,
@@ -105,7 +111,13 @@ mod tests {
     ];
 
     /// Build a valid encrypted packet the way a sender would.
-    fn make_packet(seq: u32, timestamp: u32, ssrc: u32, payload: &[u8], nonce8: [u8; 8]) -> Vec<u8> {
+    fn make_packet(
+        seq: u32,
+        timestamp: u32,
+        ssrc: u32,
+        payload: &[u8],
+        nonce8: [u8; 8],
+    ) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(&(seq & 0x7F_FFFF).to_be_bytes());
         header.extend_from_slice(&timestamp.to_be_bytes());
@@ -144,7 +156,10 @@ mod tests {
         let mut packet = make_packet(1, 2, 3, payload, [9; 8]);
         // Flip a ciphertext byte → auth failure.
         packet[HEADER_LEN] ^= 0xff;
-        assert!(AudioDecryptor::new(&SHK).unwrap().decrypt(&packet).is_none());
+        assert!(AudioDecryptor::new(&SHK)
+            .unwrap()
+            .decrypt(&packet)
+            .is_none());
     }
 
     #[test]

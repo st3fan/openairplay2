@@ -107,8 +107,7 @@ mod tests {
         let mut pos = 0;
         let mut decoded_any = false;
         while pos + 4 <= frames_bin.len() {
-            let len =
-                u32::from_le_bytes(frames_bin[pos..pos + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(frames_bin[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             let frame = &frames_bin[pos..pos + len];
             pos += len;
@@ -120,6 +119,9 @@ mod tests {
                 }
             }
         }
-        assert!(decoded_any, "decoder produced no PCM from the golden frames");
+        assert!(
+            decoded_any,
+            "decoder produced no PCM from the golden frames"
+        );
     }
 }
