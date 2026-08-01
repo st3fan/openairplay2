@@ -95,8 +95,31 @@ establishes two facts:
      for a pause-flush where buffered-ahead audio at/after the boundary
      should be retained.
 
+### What a DEBUG-level capture of one isolated cycle shows
+
+A `RUST_LOG=debug` capture of start → 9 s play → pause → 3 s → resume
+(iPhone, 2026-08-01) measures the failure directly:
+
+- **Pause can be flush-less.** This pause was a bare `rate=0` — no
+  `FLUSHBUFFERED` anywhere in the cycle (the playlist log showed
+  pause+flush pairs; both flavors exist). A flush-less pause gives the
+  receiver no licence to discard anything: **hold is mandatory**.
+- **The resume anchor is the exact pause position.** Resume was `rate=1`
+  with an anchor 353,514 samples ≈ 8.0 s after the start anchor, matching
+  the pause point; no packets were re-sent (no skipped-seq lines,
+  continuous stream). The sender simply expects the buffered-ahead audio
+  it already sent to still be there.
+- **Post-resume starvation, measured:** after resume the player received
+  only ≈ 9.5 s of audio in 14 s of wall time — the dropped span is waited
+  out (silence for a few seconds), then playback resumes at the sender's
+  send cursor (ahead of the pause point) from a thin, real-time-rate queue
+  (the stutter).
+
 **This is not a PTP issue.** PTP aligns multiple outputs to a shared clock;
-every symptom above is a single-output flow-control problem.
+every symptom above is a single-output flow-control problem. The two
+capture levels together cover both pause flavors, and the design below
+handles each: flush-less pause → hold everything; pause/skip with flush →
+discard exactly what `flushUntilSeq` names, keep the rest.
 
 ## Design: hold, don't drop
 
@@ -204,13 +227,12 @@ anchor's `rtpTime`.
 
 ## Open questions
 
-- Exact pause-flush boundary semantics, pending a `RUST_LOG=debug` capture
-  of one pause/resume cycle: is the iPhone's pause `flushUntilSeq` the play
-  position (buffered-ahead audio must be retained) or the send cursor
-  (everything is discarded and re-sent on resume)? Does the resume re-send
-  reuse original sequence numbers? The INFO capture proves re-sends below
-  our stored boundary happen (2006 skipped packets); the debug values decide
-  whether the generation mechanism can be fully replaced by seq stamping.
+- The exact `flushUntilSeq` value the iPhone uses on a pause-*with*-flush
+  (play position vs send cursor) is still unobserved — but no longer
+  blocking: boundary-accurate handling obeys whichever the sender names,
+  and the flush-less pause (now confirmed) is handled by holding. A debug
+  capture of a pause+flush cycle during implementation would still be nice
+  for the test fixtures.
 - Whether the ~2 s hold is enough for very long pauses — the sender may
   eventually tear the session down on its own timeline; observe during
   hardware testing.
