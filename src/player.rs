@@ -1,53 +1,38 @@
-//! ALSA audio output — a dedicated OS thread that plays interleaved `i16` PCM.
+//! The playback queue — a dedicated OS thread that feeds decoded PCM to the
+//! host's [`AudioSink`].
 //!
 //! Timing is deliberately "soft" (no PTP): the Mac buffers audio ahead and we
-//! drain it at the sound card's rate. The playback thread prebuffers a cushion,
-//! then blocking writes pace playback; the TCP reader backpressures on the
-//! queued-sample count so latency and memory stay bounded.
+//! drain it at the sink's rate. Blocking `AudioSink::write` calls pace this
+//! thread, and the TCP reader backpressures on the queued-sample count so
+//! latency and memory stay bounded.
 //!
 //! Transport control is **out-of-band** from the audio queue (an in-band
 //! command would sit behind the ~2 s buffer and only act seconds later):
 //!
-//! - **Pause** is a persistent `paused` flag. While set, the player drops all
-//!   audio and holds silence — the Mac keeps sending buffered-ahead audio, so a
-//!   one-shot flush wouldn't stop it; the gate must stay engaged until resume.
+//! - **Pause** is a persistent `paused` flag. While set, the queue drops all
+//!   audio — the Mac keeps sending buffered-ahead audio, so a one-shot flush
+//!   wouldn't stop it; the gate must stay engaged until resume.
 //! - **Flush** (seek) bumps a generation counter; each queued packet is stamped
-//!   with its generation, and the player drops stale-stamped packets. New audio
+//!   with its generation, and stale-stamped packets are dropped. New audio
 //!   for the new position (a fresh generation) plays.
+//!
+//! Both also call [`AudioSink::flush`] so the sink discards whatever it has
+//! buffered of its own — the audio already handed over must go silent now,
+//! not after the hardware buffer drains.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use alsa::pcm::{Access, Format, HwParams, State, PCM};
-use alsa::{Direction, ValueOr};
-use log::{debug, info, warn};
+use log::debug;
 
-/// Prebuffer this fraction of a second before the first ALSA write.
-fn start_samples(rate: u32, channels: u8) -> usize {
-    (rate as usize / 2) * channels as usize // ~0.5 s
-}
+use crate::sink::AudioSink;
 
 /// Queue high-water mark (interleaved samples): above this the reader
 /// backpressures so latency/memory stay bounded. ~2 s of audio.
 pub fn max_queued_samples(rate: u32, channels: u8) -> usize {
     rate as usize * channels as usize * 2
-}
-
-/// Scale interleaved samples by a linear gain in `[0, 1]`. Full gain is a
-/// no-op; zero is silence. Gain ≤ 1 so the product stays in range.
-fn apply_gain(samples: &mut [i16], gain: f32) {
-    if gain >= 0.999 {
-        return;
-    }
-    if gain <= 0.0 {
-        samples.fill(0);
-        return;
-    }
-    for s in samples.iter_mut() {
-        *s = (f32::from(*s) * gain) as i16;
-    }
 }
 
 enum Command {
@@ -68,10 +53,8 @@ pub struct PlayerSender {
     pending: Arc<AtomicUsize>,
     /// Bumped on every flush; stamps outgoing audio so stale audio is dropped.
     flush_gen: Arc<AtomicU64>,
-    /// While true the player drops all audio and holds silence.
+    /// While true the queue drops all audio and holds silence.
     paused: Arc<AtomicBool>,
-    /// Linear playback gain in `[0, 1]`, stored as `f32` bits.
-    volume: Arc<AtomicU32>,
 }
 
 impl PlayerSender {
@@ -81,7 +64,7 @@ impl PlayerSender {
         let _ = self.tx.send(Command::Pcm(gen, pcm));
     }
 
-    /// Engage/release the pause gate. While paused the player drops all audio.
+    /// Engage/release the pause gate. While paused the queue drops all audio.
     pub fn set_paused(&self, paused: bool) {
         self.paused.store(paused, Ordering::Relaxed);
         let _ = self.tx.send(Command::Wake);
@@ -92,12 +75,6 @@ impl PlayerSender {
     pub fn flush(&self) {
         self.flush_gen.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.send(Command::Wake);
-    }
-
-    /// Set the linear playback gain (`1.0` = full, `0.0` = mute). Applied live.
-    pub fn set_volume(&self, gain: f32) {
-        self.volume
-            .store(gain.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     /// Interleaved samples currently queued — the backpressure signal.
@@ -116,7 +93,7 @@ impl PlayerSender {
     }
 }
 
-/// Owns the playback thread; dropping it stops the thread and closes the device.
+/// Owns the playback thread; dropping it stops the thread and drops the sink.
 pub struct Player {
     tx: Option<Sender<Command>>,
     handle: Option<JoinHandle<()>>,
@@ -124,30 +101,25 @@ pub struct Player {
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
-    volume: Arc<AtomicU32>,
 }
 
 impl Player {
-    /// Spawn the playback thread. `device` is an ALSA device name, or `None`
-    /// for decode-only (no audio). Never fails: a device that won't open is
-    /// logged and audio is discarded so the session keeps running.
-    pub fn spawn(sample_rate: u32, channels: u8, device: Option<String>) -> Player {
+    /// Spawn the playback thread feeding `sink`.
+    pub fn spawn(sink: Box<dyn AudioSink>) -> Player {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicUsize::new(0));
         let flush_gen = Arc::new(AtomicU64::new(0));
         let paused = Arc::new(AtomicBool::new(false));
-        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits())); // full volume
         let ctx = RunCtx {
             stop: stop.clone(),
             pending: pending.clone(),
             flush_gen: flush_gen.clone(),
             paused: paused.clone(),
-            volume: volume.clone(),
         };
         let handle = std::thread::Builder::new()
-            .name("alsa-player".into())
-            .spawn(move || run(sample_rate, channels, device, rx, ctx))
+            .name("audio-player".into())
+            .spawn(move || run(sink, rx, ctx))
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -156,7 +128,6 @@ impl Player {
             pending,
             flush_gen,
             paused,
-            volume,
         }
     }
 
@@ -166,7 +137,6 @@ impl Player {
             pending: self.pending.clone(),
             flush_gen: self.flush_gen.clone(),
             paused: self.paused.clone(),
-            volume: self.volume.clone(),
         }
     }
 }
@@ -190,30 +160,9 @@ struct RunCtx {
     pending: Arc<AtomicUsize>,
     flush_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
-    volume: Arc<AtomicU32>,
 }
 
-fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Command>, ctx: RunCtx) {
-    let mut output = match device {
-        Some(name) => match AlsaOutput::open(&name, sample_rate, channels) {
-            Ok(out) => {
-                info!("player: ALSA \"{name}\" {sample_rate} Hz {channels}ch");
-                Some(out)
-            }
-            Err(e) => {
-                warn!("player: cannot open ALSA ({e}); decode-only");
-                None
-            }
-        },
-        None => {
-            info!("player: --no-audio, decode-only");
-            None
-        }
-    };
-
-    let threshold = start_samples(sample_rate, channels);
-    let mut prebuffer: Vec<i16> = Vec::new();
-    let mut started = false;
+fn run(mut sink: Box<dyn AudioSink>, rx: Receiver<Command>, ctx: RunCtx) {
     let mut cur_gen: u64 = 0;
     let mut was_paused = false;
     let mut packets: u64 = 0;
@@ -230,11 +179,8 @@ fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Comm
         let just_paused = paused && !was_paused;
         if flushed || just_paused {
             cur_gen = gen;
-            prebuffer.clear();
-            started = false;
-            if let Some(out) = output.as_mut() {
-                out.reset(); // discard queued frames → immediate silence
-            }
+            // The sink discards its own buffers → immediate silence.
+            sink.flush();
             // Drop everything already queued (stale on flush; unwanted on pause).
             loop {
                 match rx.try_recv() {
@@ -260,7 +206,7 @@ fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Comm
         match command {
             Command::Stop => break,
             Command::Wake => {}
-            Command::Pcm(stamp, mut pcm) => {
+            Command::Pcm(stamp, pcm) => {
                 ctx.pending.fetch_sub(pcm.len(), Ordering::Relaxed);
                 if paused || stamp != cur_gen {
                     continue; // paused, or produced before a flush → drop
@@ -269,146 +215,56 @@ fn run(sample_rate: u32, channels: u8, device: Option<String>, rx: Receiver<Comm
                 if packets <= 3 || packets.is_multiple_of(250) {
                     debug!("player: {packets} packets");
                 }
-                let Some(out) = output.as_mut() else {
-                    continue; // decode-only
-                };
-                // Apply the current volume (live) just before playback.
-                let gain = f32::from_bits(ctx.volume.load(Ordering::Relaxed));
-                apply_gain(&mut pcm, gain);
-                if started {
-                    out.write(&pcm);
-                } else {
-                    prebuffer.extend_from_slice(&pcm);
-                    if prebuffer.len() >= threshold {
-                        started = true;
-                        out.write(&prebuffer);
-                        prebuffer.clear();
-                    }
-                }
+                sink.write(&pcm);
             }
         }
     }
     debug!("player: stopped, {packets} packets");
 }
 
-struct AlsaOutput {
-    pcm: PCM,
-    channels: usize,
-}
-
-impl AlsaOutput {
-    fn open(device: &str, rate: u32, channels: u8) -> Result<AlsaOutput, alsa::Error> {
-        let pcm = PCM::new(device, Direction::Playback, false)?;
-        {
-            let hwp = HwParams::any(&pcm)?;
-            hwp.set_channels(u32::from(channels))?;
-            hwp.set_rate(rate, ValueOr::Nearest)?;
-            hwp.set_format(Format::s16())?;
-            hwp.set_access(Access::RWInterleaved)?;
-            let _ = hwp.set_buffer_time_near(500_000, ValueOr::Nearest);
-            pcm.hw_params(&hwp)?;
-        }
-        pcm.prepare()?;
-        Ok(AlsaOutput {
-            pcm,
-            channels: channels as usize,
-        })
-    }
-
-    /// Write all interleaved samples, blocking to pace playback and recovering
-    /// from underruns.
-    fn write(&mut self, samples: &[i16]) {
-        let Ok(io) = self.pcm.io_i16() else {
-            warn!("player: ALSA io handle lost");
-            return;
-        };
-        let mut frames = samples;
-        while !frames.is_empty() {
-            match io.writei(frames) {
-                Ok(0) => break,
-                Ok(written) => frames = &frames[written * self.channels..],
-                Err(e) => {
-                    if self.pcm.try_recover(e, true).is_err() {
-                        warn!("player: unrecoverable ALSA write error");
-                        return;
-                    }
-                }
-            }
-        }
-        if self.pcm.state() != State::Running {
-            let _ = self.pcm.start();
-        }
-    }
-
-    /// Discard queued frames (immediate silence) and ready the device for new
-    /// audio. Used on pause/flush. Unlike `snd_pcm_pause`, `drop` + `prepare`
-    /// are supported everywhere (`snd_pcm_pause` fails with EBADFD on `front`).
-    fn reset(&mut self) {
-        let _ = self.pcm.drop();
-        let _ = self.pcm.prepare();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
 
-    #[test]
-    fn thresholds_for_44100_stereo() {
-        assert_eq!(start_samples(44100, 2), 44100); // 0.5 s interleaved
-        assert_eq!(max_queued_samples(44100, 2), 176_400); // 2 s interleaved
+    /// Records every delivered packet and every flush.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        writes: Arc<Mutex<Vec<Vec<i16>>>>,
+        flushes: Arc<AtomicUsize>,
     }
 
-    #[test]
-    fn apply_gain_scales_samples() {
-        // Half gain halves amplitude.
-        let mut s = [100i16, -100, 20000, -20000];
-        apply_gain(&mut s, 0.5);
-        assert_eq!(s, [50, -50, 10000, -10000]);
-
-        // Zero gain → silence.
-        let mut s = [1i16, -32768, 32767];
-        apply_gain(&mut s, 0.0);
-        assert_eq!(s, [0, 0, 0]);
-
-        // Full gain leaves samples untouched (and doesn't clip the extremes).
-        let mut s = [1i16, -32768, 32767];
-        apply_gain(&mut s, 1.0);
-        assert_eq!(s, [1, -32768, 32767]);
-    }
-
-    #[test]
-    fn flush_bumps_generation() {
-        let player = Player::spawn(44100, 2, None);
-        let sender = player.sender();
-        assert_eq!(sender.generation(), 0);
-        sender.flush();
-        assert_eq!(sender.generation(), 1);
-        sender.flush();
-        assert_eq!(sender.generation(), 2);
-    }
-
-    #[test]
-    fn set_paused_toggles_gate() {
-        let player = Player::spawn(44100, 2, None);
-        let sender = player.sender();
-        assert!(!sender.is_paused());
-        sender.set_paused(true);
-        assert!(sender.is_paused());
-        sender.set_paused(false);
-        assert!(!sender.is_paused());
-    }
-
-    #[test]
-    fn play_then_consume_tracks_pending() {
-        // With no device the thread drains commands; after it settles, the
-        // pending counter returns to zero.
-        let player = Player::spawn(44100, 2, None);
-        let sender = player.sender();
-        for _ in 0..10 {
-            sender.play(vec![0i16; 2048]);
+    impl AudioSink for Recorder {
+        fn write(&mut self, pcm: &[i16]) {
+            self.writes.lock().unwrap().push(pcm.to_vec());
         }
-        // Let the decode-only thread consume the queue (bounded wait).
+        fn flush(&mut self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A recorder whose `write` signals entry and then blocks until released,
+    /// so tests can hold the playback thread mid-write deterministically.
+    struct GatedRecorder {
+        recorder: Recorder,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl AudioSink for GatedRecorder {
+        fn write(&mut self, pcm: &[i16]) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            self.recorder.write(pcm);
+        }
+        fn flush(&mut self) {
+            self.recorder.flush();
+        }
+    }
+
+    /// Wait (bounded) until the queue is drained.
+    fn settle(sender: &PlayerSender) {
         for _ in 0..400 {
             if sender.pending_samples() == 0 {
                 break;
@@ -416,5 +272,120 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(sender.pending_samples(), 0);
+    }
+
+    #[test]
+    fn max_queued_for_44100_stereo() {
+        assert_eq!(max_queued_samples(44100, 2), 176_400); // 2 s interleaved
+    }
+
+    #[test]
+    fn delivers_packets_in_order() {
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let player = Player::spawn(Box::new(recorder));
+        let sender = player.sender();
+        sender.play(vec![1i16; 4]);
+        sender.play(vec![2i16; 4]);
+        sender.play(vec![3i16; 4]);
+        settle(&sender);
+        drop(player);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![vec![1i16; 4], vec![2i16; 4], vec![3i16; 4]]
+        );
+    }
+
+    #[test]
+    fn pause_drops_delivery_and_flushes_sink() {
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let flushes = recorder.flushes.clone();
+        let player = Player::spawn(Box::new(recorder));
+        let sender = player.sender();
+
+        sender.set_paused(true);
+        assert!(sender.is_paused());
+        sender.play(vec![1i16; 4]);
+        sender.play(vec![2i16; 4]);
+        settle(&sender);
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "paused audio must not play"
+        );
+        assert!(
+            flushes.load(Ordering::Relaxed) >= 1,
+            "pause must flush the sink for immediate silence"
+        );
+
+        // Resume: new audio plays again.
+        sender.set_paused(false);
+        sender.play(vec![3i16; 4]);
+        settle(&sender);
+        drop(player);
+        assert_eq!(*writes.lock().unwrap(), vec![vec![3i16; 4]]);
+    }
+
+    #[test]
+    fn flush_drops_queued_pcm_and_flushes_sink() {
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let flushes = recorder.flushes.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let player = Player::spawn(Box::new(GatedRecorder {
+            recorder,
+            entered: entered_tx,
+            release: release_rx,
+        }));
+        let sender = player.sender();
+
+        // Hold the thread inside write(p1) while p2/p3 queue up behind it.
+        sender.play(vec![1i16; 4]);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("thread entered write");
+        sender.play(vec![2i16; 4]);
+        sender.play(vec![3i16; 4]);
+
+        // Seek: queued (stale-generation) audio must never reach the sink.
+        sender.flush();
+        assert_eq!(sender.generation(), 1);
+        release_tx.send(()).unwrap();
+
+        settle(&sender);
+        drop(player);
+        assert_eq!(*writes.lock().unwrap(), vec![vec![1i16; 4]]);
+        assert_eq!(flushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn backpressure_counter_rises_and_falls() {
+        let recorder = Recorder::default();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let player = Player::spawn(Box::new(GatedRecorder {
+            recorder,
+            entered: entered_tx,
+            release: release_rx,
+        }));
+        let sender = player.sender();
+
+        sender.play(vec![0i16; 100]);
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("thread entered write");
+        // The first packet was taken off the queue; the rest are pending
+        // while the sink blocks.
+        sender.play(vec![0i16; 100]);
+        sender.play(vec![0i16; 100]);
+        assert_eq!(sender.pending_samples(), 200);
+
+        // Release all writes; the queue drains back to zero.
+        for _ in 0..3 {
+            let _ = release_tx.send(());
+        }
+        settle(&sender);
+        drop(player);
     }
 }

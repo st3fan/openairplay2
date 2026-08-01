@@ -1,8 +1,10 @@
+pub mod alsa_sink;
 pub mod avahi;
 pub mod buffered;
 pub mod cipher;
 pub mod crypto_stream;
 pub mod decode;
+pub mod events;
 pub mod fairplay;
 pub mod http;
 pub mod identity;
@@ -12,8 +14,12 @@ pub mod pairing;
 pub mod player;
 pub mod server;
 pub mod session;
+pub mod sink;
 pub mod srp;
 pub mod tlv;
+
+pub use events::{Event, EventSender};
+pub use sink::{AudioSink, SinkFactory};
 
 /// Receiver-wide configuration.
 #[derive(Debug, Clone)]
@@ -29,8 +35,6 @@ pub struct Config {
     pub features: u64,
     /// AirPlay status flags.
     pub status_flags: u32,
-    /// ALSA device to play to, or `None` for decode-only (`--no-audio`).
-    pub alsa_device: Option<String>,
 }
 
 impl Config {

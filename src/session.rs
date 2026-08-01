@@ -1,7 +1,8 @@
 //! Per-connection AirPlay 2 streaming session: the `SETUP` phases, the bound
 //! event/data/control sockets, and acknowledgement of the session control
 //! methods. For buffered audio (type 103) the TCP data channel is decrypted,
-//! decoded (AAC-LC) and played to ALSA.
+//! decoded (AAC-LC) and delivered to the host's [`AudioSink`], with session
+//! milestones reported as [`Event`]s.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -17,7 +18,9 @@ use tokio::task::JoinHandle;
 
 use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
 use crate::decode::AacDecoder;
+use crate::events::{Event, EventSender};
 use crate::player::{Player, PlayerSender};
+use crate::sink::{AudioSink, SinkFactory};
 
 /// Stream type constants from the SETUP `streams` array.
 const TYPE_REALTIME: u64 = 96;
@@ -34,8 +37,12 @@ pub struct Session {
     stream_type: Option<u64>,
     /// AirPlay volume in dB (0 = full, −30 ≈ min, −144 = mute).
     volume: f32,
-    /// ALSA device to play to, or `None` for decode-only.
-    alsa_device: Option<String>,
+    /// Creates the host's sink at SETUP phase 2.
+    sink_factory: SinkFactory,
+    /// Where session milestones are reported to the host.
+    events: EventSender,
+    /// True between `SessionStarted` and `SessionEnded`.
+    session_active: bool,
     /// The playback thread, alive for the duration of a buffered stream.
     player: Option<Player>,
     /// Control handle for the player (pause/resume, flush) from the RTSP path.
@@ -46,7 +53,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(local_ip: IpAddr, alsa_device: Option<String>) -> Session {
+    pub fn new(local_ip: IpAddr, sink_factory: SinkFactory, events: EventSender) -> Session {
         Session {
             local_ip,
             tasks: Vec::new(),
@@ -54,11 +61,18 @@ impl Session {
             audio_format: None,
             stream_type: None,
             volume: 0.0,
-            alsa_device,
+            sink_factory,
+            events,
+            session_active: false,
             player: None,
             player_control: None,
             flush_until_seq: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Report a session milestone; a host that dropped its receiver is fine.
+    fn send_event(&self, event: Event) {
+        let _ = self.events.send(event);
     }
 
     /// Handle a `SETUP` request. Returns the response plist bytes. Phase 1
@@ -189,13 +203,12 @@ impl Session {
         let (rate, channels) = aac_params(self.audio_format);
         match (decryptor, AacDecoder::new(rate, channels)) {
             (Some(decryptor), Ok(decoder)) => {
-                let player = Player::spawn(rate, channels, self.alsa_device.clone());
+                self.session_active = true;
+                self.send_event(Event::SessionStarted { rate, channels });
+                let sink: Box<dyn AudioSink> = (self.sink_factory)(rate, channels);
+                let player = Player::spawn(sink);
                 let sender = player.sender();
-                let control = player.sender();
-                // A volume SET_PARAMETER often arrives before the stream starts;
-                // apply the last-seen volume so we don't begin at full blast.
-                control.set_volume(volume_to_gain(self.volume));
-                self.player_control = Some(control);
+                self.player_control = Some(player.sender());
                 self.player = Some(player);
                 let max_queued = crate::player::max_queued_samples(rate, channels);
                 self.tasks.push(tokio::spawn(buffered_audio(
@@ -235,6 +248,7 @@ impl Session {
         if let Some(ctrl) = &self.player_control {
             ctrl.set_paused(rate == 0);
         }
+        self.send_event(Event::Paused(rate == 0));
     }
 
     /// Handle `FLUSHBUFFERED` (seek/skip): drop buffered audio so playback
@@ -252,6 +266,7 @@ impl Session {
         if let Some(ctrl) = &self.player_control {
             ctrl.flush();
         }
+        self.send_event(Event::Flushed);
     }
 
     /// Answer a `GET_PARAMETER` query. A sender asks `volume\r\n` during setup
@@ -267,18 +282,16 @@ impl Session {
     }
 
     /// Apply a `SET_PARAMETER` body — currently just the volume line. The
-    /// volume (dB) is converted to linear gain and pushed to the player, so
-    /// moving the slider changes playback volume live.
+    /// volume (dB) is recorded (to answer `GET_PARAMETER`) and reported to
+    /// the host, which owns the gain path.
     pub fn set_parameter(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
             if let Some(v) = line.trim().strip_prefix("volume:") {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     self.volume = db;
-                    debug!("SET_PARAMETER volume {db} dB (gain {:.4})", volume_to_gain(db));
-                    if let Some(ctrl) = &self.player_control {
-                        ctrl.set_volume(volume_to_gain(db));
-                    }
+                    debug!("SET_PARAMETER volume {db} dB");
+                    self.send_event(Event::Volume { db });
                 }
             }
         }
@@ -288,10 +301,25 @@ impl Session {
     pub fn ack(&self, method: &str) {
         debug!("ack {method}");
     }
+
+    /// Handle `TEARDOWN`: the sender is done with the stream.
+    pub fn teardown(&mut self) {
+        debug!("ack TEARDOWN");
+        self.end_session();
+    }
+
+    /// Report `SessionEnded` once per started session.
+    fn end_session(&mut self) {
+        if self.session_active {
+            self.session_active = false;
+            self.send_event(Event::SessionEnded);
+        }
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.end_session();
         for task in self.tasks.drain(..) {
             task.abort();
         }
@@ -370,16 +398,10 @@ fn int_field(v: &Value) -> Option<u64> {
 /// packets with a lower sequence number).
 fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
     let value = Value::from_reader(io::Cursor::new(body)).ok()?;
-    value.as_dictionary()?.get("flushUntilSeq").and_then(int_field)
-}
-
-/// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
-/// volume, `-144 dB` (and below) is muted; we never amplify above unity.
-fn volume_to_gain(db: f32) -> f32 {
-    if db <= -144.0 {
-        return 0.0;
-    }
-    10f32.powf(db.min(0.0) / 20.0)
+    value
+        .as_dictionary()?
+        .get("flushUntilSeq")
+        .and_then(int_field)
 }
 
 /// The buffered-audio pipeline: accept the sender's TCP connection, frame the
@@ -471,14 +493,29 @@ async fn drain_tcp(listener: TcpListener) {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     fn local() -> IpAddr {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     }
 
+    struct TestSink;
+
+    impl AudioSink for TestSink {
+        fn write(&mut self, _pcm: &[i16]) {}
+        fn flush(&mut self) {}
+    }
+
+    /// A session wired to a discarding sink, plus the host's event receiver.
+    fn session() -> (Session, UnboundedReceiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
+        (Session::new(local(), factory, tx), rx)
+    }
+
     #[tokio::test]
     async fn phase1_response_has_event_and_timing_ports() {
-        let mut session = Session::new(local(), None);
+        let (mut session, _events) = session();
         // Minimal phase-1 plist: timingProtocol=PTP, no streams.
         let mut dict = Dictionary::new();
         dict.insert("timingProtocol".into(), Value::String("PTP".into()));
@@ -494,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn phase2_response_binds_ports_and_echoes_type() {
-        let mut session = Session::new(local(), None);
+        let (mut session, mut events) = session();
         let mut stream = Dictionary::new();
         stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
         stream.insert("audioFormat".into(), Value::Integer(0x40000u64.into()));
@@ -524,12 +561,26 @@ mod tests {
         assert!(s.get("controlPort").unwrap().as_unsigned_integer().unwrap() > 0);
         assert!(s.get("audioBufferSize").is_some());
         assert_eq!(session.stream_key, Some(vec![7u8; 32]));
+
+        // The host learned the stream started, with the negotiated format.
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::SessionStarted {
+                rate: 44100,
+                channels: 2
+            })
+        );
+
+        // Dropping the session (connection closed) ends it exactly once.
+        drop(session);
+        assert_eq!(events.try_recv(), Ok(Event::SessionEnded));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn phase_detection_uses_streams_presence() {
         // A dict with no streams is phase 1 (event port), with streams is phase 2.
-        let mut s1 = Session::new(local(), None);
+        let (mut s1, _events) = session();
         let empty = encode_plist(&Dictionary::new()).unwrap();
         let r1 = s1.handle_setup(&empty).await.unwrap();
         assert!(Value::from_reader(io::Cursor::new(r1))
@@ -541,7 +592,7 @@ mod tests {
 
     #[test]
     fn volume_query_returns_current_volume() {
-        let mut session = Session::new(local(), None);
+        let (mut session, mut events) = session();
         // A sender's exact query is "volume\r\n".
         assert_eq!(
             session.get_parameter(b"volume\r\n"),
@@ -552,6 +603,8 @@ mod tests {
             session.get_parameter(b"volume\r\n"),
             b"volume: -12.500000\r\n"
         );
+        // The volume reaches the host as an event, in dB as sent.
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
         // Unknown parameters yield an empty body rather than a bad one.
         assert!(session.get_parameter(b"progress\r\n").is_empty());
     }
@@ -575,16 +628,6 @@ mod tests {
         let body = encode_plist(&dict).unwrap();
 
         assert_eq!(parse_rate_anchor(&body), Some((1, 3174381381)));
-    }
-
-    #[test]
-    fn volume_db_to_gain() {
-        assert!((volume_to_gain(0.0) - 1.0).abs() < 1e-6); // full
-        assert!((volume_to_gain(-6.0206) - 0.5).abs() < 1e-3); // −6 dB ≈ half
-        assert!((volume_to_gain(-20.0) - 0.1).abs() < 1e-4); // −20 dB = 0.1
-        assert_eq!(volume_to_gain(-144.0), 0.0); // muted
-        assert_eq!(volume_to_gain(-200.0), 0.0); // below sentinel = muted
-        assert!((volume_to_gain(6.0) - 1.0).abs() < 1e-6); // never amplify
     }
 
     #[test]

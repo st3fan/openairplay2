@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::net::TcpListener;
 
+use openairplay2::alsa_sink::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay2::identity::Identity;
 use openairplay2::info::txt_records;
 use openairplay2::server::{serve, Context};
-use openairplay2::{avahi, mac, Config};
+use openairplay2::{avahi, mac, AudioSink, Config, Event, SinkFactory};
 
 const DEFAULT_NAME: &str = "OpenAirPlay2";
 const DEFAULT_PORT: u16 = 7000;
@@ -117,7 +118,6 @@ async fn main() -> ExitCode {
         source_version: DEFAULT_SOURCE_VERSION.to_string(),
         features: DEFAULT_FEATURES,
         status_flags: DEFAULT_STATUS_FLAGS,
-        alsa_device: args.alsa_device,
     };
     info!(
         "starting AirPlay 2 receiver \"{}\" (deviceid {}, port {}, pk {})",
@@ -126,10 +126,41 @@ async fn main() -> ExitCode {
         config.port,
         identity.public_key_hex()
     );
-    match &config.alsa_device {
+    match &args.alsa_device {
         Some(dev) => info!("audio output: ALSA \"{dev}\""),
         None => info!("audio output: disabled (--no-audio)"),
     }
+
+    // The sink seam: the library delivers PCM to an AlsaSink per stream and
+    // reports session events; the volume path is ours (dB → linear gain,
+    // shared with the sink so slider moves apply live).
+    let gain = SharedGain::new();
+    let sink_gain = gain.clone();
+    let device = args.alsa_device;
+    let sink_factory: SinkFactory = Arc::new(move |rate, channels| -> Box<dyn AudioSink> {
+        match &device {
+            Some(dev) => Box::new(AlsaSink::open(dev, rate, channels, sink_gain.clone())),
+            None => Box::new(NullSink),
+        }
+    });
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                Event::Volume { db } => {
+                    debug!("volume {db} dB");
+                    gain.set(volume_to_gain(db));
+                }
+                Event::SessionStarted { rate, channels } => {
+                    info!("session started ({rate} Hz, {channels}ch)");
+                }
+                Event::SessionEnded => info!("session ended"),
+                Event::Paused(paused) => debug!("paused: {paused}"),
+                Event::Flushed => debug!("flushed"),
+                _ => {}
+            }
+        }
+    });
 
     // Dual-stack if possible (IPv4 clients arrive v4-mapped), else IPv4.
     let listener = match TcpListener::bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, config.port)))
@@ -160,7 +191,12 @@ async fn main() -> ExitCode {
         None
     };
 
-    let context = Arc::new(Context { config, identity });
+    let context = Arc::new(Context {
+        config,
+        identity,
+        sink_factory,
+        events: event_tx,
+    });
     tokio::select! {
         result = serve(listener, context) => {
             if let Err(e) = result {
