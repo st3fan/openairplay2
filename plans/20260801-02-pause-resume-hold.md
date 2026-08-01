@@ -69,10 +69,31 @@ agree again until the next drop re-diverges them. This is the behavior of a
 sender whose model is authoritative and a receiver that has been silently
 discarding — not of a clock/timing (PTP) problem.
 
-The randomness: Mac captures from milestone 6 showed pause arriving as
-`rate=0` **plus** `FLUSHBUFFERED`; when a flush accompanies the pause,
-discarding is exactly what was asked and resume works. The iPhone evidently
-does not always send the flush — then discarding is exactly wrong.
+### What an INFO-level capture of the repro shows
+
+A log of the failing session (iPhone, Music.app playlist, 2026-08-01)
+establishes two facts:
+
+- **The iPhone's pause always includes the flush**: every pause is a
+  `SETRATEANCHORTIME` + `FLUSHBUFFERED` pair; every resume is a lone
+  `SETRATEANCHORTIME`. (An earlier draft guessed the flush was sometimes
+  missing — wrong.)
+- **The `flushUntilSeq` boundary filter is discarding wanted audio.** The
+  ~17-minute playlist session ended with `buffered audio disconnected
+  (0 decrypt failures, 2006 skipped)` — 2006 packets × 1024 samples ≈
+  **47 seconds of audio** silently dropped by the reader's
+  `seq < flushUntilSeq` check. The sender re-sends buffered audio after a
+  resume with sequence numbers below our stored boundary, and two defects
+  turn that into data loss:
+  1. the boundary is **sticky** — set on every flush and never reset, so a
+     re-send below the latest boundary is discarded until the seq catches
+     up to it (the delayed/mispositioned resume, measured);
+  2. independent of the boundary, our flush handling **drops the entire
+     decoded queue** via the generation bump, rather than discarding
+     exactly what the flush asked for (`seq < flushUntilSeq`) — correct
+     for forward skips (everything queued is below the boundary), wrong
+     for a pause-flush where buffered-ahead audio at/after the boundary
+     should be retained.
 
 **This is not a PTP issue.** PTP aligns multiple outputs to a shared clock;
 every symptom above is a single-output flow-control problem.
@@ -95,11 +116,15 @@ Pause becomes a *freeze* of the pipeline instead of a *discard*:
   continue normally. Playback restarts instantly (the sink's ~0.5 s prebuffer
   refills from the ~2 s we hold), at the right position, with a full buffer —
   no gap, no jump, no stutter.
-- **Seek/skip (`FLUSHBUFFERED`) is unchanged:** the flush generation still
-  discards queued *and held* stale packets, and `flushUntilSeq` still drops
-  still-arriving packets by plaintext sequence number. A sender that pauses
-  with an explicit flush therefore still gets discard semantics — the flush
-  says so; mere pause no longer implies it.
+- **Seek/skip (`FLUSHBUFFERED`) becomes boundary-accurate:** discard exactly
+  what the flush asks for — packets with `seq < flushUntilSeq` — from the
+  decoded queue, the hold buffer, and the still-arriving TCP stream, and
+  retain everything at/after the boundary. This requires stamping decoded
+  PCM with its packet sequence number (replacing or augmenting the
+  generation stamp). The boundary must also stop being sticky: a re-send at
+  or above the last boundary plays; the measured 47 s of discarded re-sent
+  audio must go to zero. Forward skips behave as today (everything queued is
+  below the boundary); pause-flushes stop destroying buffered-ahead audio.
 
 ### Mechanics (playback thread)
 
@@ -133,11 +158,15 @@ stamps are dropped and their samples subtracted from pending.
 Stack layout per the plan+implementation-in-one-stack convention: this plan
 is the bottom PR; implementation PRs stack on top after approval.
 
-### Phase 1 — hold-don't-drop
+### Phase 1 — hold-don't-drop + boundary-accurate flush
 
-Rework the playback thread as designed above; update the pause unit tests
-(pause currently *asserts* dropping — it will assert holding instead) and add
-new ones. Library-only.
+Rework the playback thread as designed above (hold on pause; stamp decoded
+PCM with its packet seq; flush discards exactly `seq < flushUntilSeq` and the
+boundary is not sticky); update the pause unit tests (pause currently
+*asserts* dropping — it will assert holding instead) and add new ones.
+Library-only. Before implementation details are finalized, a `RUST_LOG=debug`
+capture of one pause/resume cycle pins down the exact boundary semantics
+(see open questions).
 
 ### Phase 2 — anchor trimming (contingent)
 
@@ -151,9 +180,12 @@ anchor's `rtpTime`.
   - pause → play N → resume delivers all N in order (today they are dropped);
   - `pending_samples()` stays high across a pause (the backpressure signal)
     and drains after resume;
-  - flush during pause discards held audio and subtracts it from pending;
+  - flush during pause discards held audio below the boundary and subtracts
+    it from pending, and retains held audio at/after the boundary;
   - pause still calls `AudioSink::flush` immediately (silence);
-  - resume after flush-during-pause plays only new-generation audio.
+  - a re-send at/above the last flush boundary is played, not skipped (the
+    sticky-boundary regression test);
+  - resume after flush-during-pause plays only post-boundary audio.
 - Hardware (iPhone, the original repro): start → immediate; pause →
   immediate silence; resume → immediate, correct position, no stutter;
   Now Playing widget stays accurate through several pause/resume cycles;
@@ -172,9 +204,13 @@ anchor's `rtpTime`.
 
 ## Open questions
 
-- Whether the iPhone's pause ever includes `FLUSHBUFFERED` (capture will
-  tell); the design is correct either way, since flush keeps its discard
-  semantics.
+- Exact pause-flush boundary semantics, pending a `RUST_LOG=debug` capture
+  of one pause/resume cycle: is the iPhone's pause `flushUntilSeq` the play
+  position (buffered-ahead audio must be retained) or the send cursor
+  (everything is discarded and re-sent on resume)? Does the resume re-send
+  reuse original sequence numbers? The INFO capture proves re-sends below
+  our stored boundary happen (2006 skipped packets); the debug values decide
+  whether the generation mechanism can be fully replaced by seq stamping.
 - Whether the ~2 s hold is enough for very long pauses — the sender may
   eventually tear the session down on its own timeline; observe during
   hardware testing.
