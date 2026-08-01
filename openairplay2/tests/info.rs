@@ -7,13 +7,23 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use openairplay2::identity::Identity;
 use openairplay2::server::{serve, Context};
-use openairplay2::Config;
+use openairplay2::Identity;
+use openairplay2::{AudioSink, Config, SinkFactory};
+
+/// Discards all audio — these tests never stream.
+struct TestSink;
+
+impl AudioSink for TestSink {
+    fn write(&mut self, _pcm: &[i16]) {}
+    fn flush(&mut self) {}
+}
 
 async fn start() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let sink_factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
+    let (events, _) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {
         config: Config {
             name: "Test Room".into(),
@@ -23,9 +33,10 @@ async fn start() -> SocketAddr {
             source_version: "366.0".into(),
             features: 0x0001_8340_405C_4A00,
             status_flags: 0x4,
-            alsa_device: None,
         },
         identity: Identity::generate(),
+        sink_factory,
+        events,
     });
     tokio::spawn(serve(listener, context));
     addr

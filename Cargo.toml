@@ -1,24 +1,3 @@
-[package]
-name = "openairplay2"
-version = "0.1.0"
-edition = "2021"
-description = "AirPlay 2 receiver for Linux/ALSA"
-license = "MIT"
-
-[dependencies]
-alsa = "0.12"
-base64 = "0.22"
-chacha20poly1305 = "0.10"
-symphonia = { version = "0.5", default-features = false, features = ["aac"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-env_logger = "0.11"
-hex = "0.4"
-hkdf = "0.12"
-log = "0.4"
-num-bigint = "0.4"
-plist = "1"
-rand = "0.8"
-sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
-uuid = { version = "1", features = ["v4"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+[workspace]
+members = ["openairplay2", "openairplay2-receiver"]
+resolver = "2"

@@ -19,6 +19,15 @@ iOS device discovers it on the network, pairs with it, and streams to it, and
 audio comes out of an ALSA device with working transport controls — all verified
 against a real Mac.
 
+The repository is a cargo workspace with two artifacts:
+
+- **`openairplay2`** — an embeddable library: network in, decoded PCM +
+  session events out. The host application provides the audio output (an
+  `AudioSink`) and its own volume model; no ALSA dependency, builds and
+  tests on macOS as well as Linux.
+- **`openairplay2-receiver`** — the standalone Linux/ALSA receiver binary,
+  built on the library's public API.
+
 It handles the full path end to end: mDNS/Bonjour discovery, HomeKit transient
 pairing, a ChaCha20-Poly1305-encrypted control channel, the FairPlay `fp-setup`
 handshake, two-phase `SETUP`, and buffered **AAC** playback — plus **pause /
@@ -35,12 +44,12 @@ The milestone-by-milestone development history is in
 
 ## Build & run
 
-Building links against nothing exotic yet; a running `avahi-daemon` is needed
-for discovery.
+Building links against nothing exotic (`libasound2-dev` for the receiver
+binary); a running `avahi-daemon` is needed for discovery.
 
 ```sh
 cargo build --release
-./target/release/openairplay2 --name "Living Room"
+./target/release/openairplay2-receiver --name "Living Room"
 ```
 
 ### Options
@@ -58,3 +67,40 @@ cargo build --release
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real
 sender sends.
+
+## Embedding
+
+The library's public API is small: build a `Receiver`, hand it a sink factory
+and an event channel, run it on your tokio runtime.
+
+```rust,no_run
+use openairplay2::{AudioSink, Event, Receiver};
+
+struct MySink; // your PCM → speaker path
+
+impl AudioSink for MySink {
+    fn write(&mut self, pcm: &[i16]) { /* blocking write paces playback */ }
+    fn flush(&mut self) { /* seek: drop your device/prebuffer state */ }
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let receiver = Receiver::builder()
+        .name("Office")
+        .identity_path("/var/lib/myapp/airplay-identity")
+        .build()?;
+    let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Event::Volume { db } = event { /* your gain path */ }
+        }
+    });
+    receiver.run(|_rate, _channels| Box::new(MySink), events).await
+}
+```
+
+The library keeps the session semantics (pairing, decrypt, AAC decode, the
+pause gate, seek flushing, backpressure); the host sees only PCM and events —
+`SessionStarted`, `Volume` (in AirPlay dB), `Paused`, `Flushed`,
+`SessionEnded`. A host that owns its mDNS registration builds with
+`.advertise(false)` and publishes `receiver.txt_records()` itself.

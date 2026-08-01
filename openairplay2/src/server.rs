@@ -13,12 +13,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::cipher::control_channel;
 use crate::crypto_stream::ControlConnection;
+use crate::events::EventSender;
 use crate::fairplay;
 use crate::http::{Request, Response};
 use crate::identity::Identity;
 use crate::info::info_plist;
 use crate::pairing::{Outcome, PairSetup};
 use crate::session::Session;
+use crate::sink::SinkFactory;
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
@@ -29,6 +31,10 @@ pub const PARAMETERS_CONTENT_TYPE: &str = "text/parameters";
 pub struct Context {
     pub config: Config,
     pub identity: Identity,
+    /// Creates the host's audio sink at SETUP phase 2, once per stream.
+    pub sink_factory: SinkFactory,
+    /// Where sessions report their milestones to the host.
+    pub events: EventSender,
 }
 
 pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<()> {
@@ -55,7 +61,11 @@ async fn handle_connection(
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
     let mut pair = PairSetup::new();
-    let mut session = Session::new(local_ip, context.config.alsa_device.clone());
+    let mut session = Session::new(
+        local_ip,
+        context.sink_factory.clone(),
+        context.events.clone(),
+    );
 
     while let Some(request) = conn.read_request().await? {
         log_request(&peer, &request, conn.is_encrypted());
@@ -148,8 +158,13 @@ async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Re
             session.flush(&request.body);
             Some(Response::ok(proto))
         }
+        // The sender is done with the stream.
+        "TEARDOWN" => {
+            session.teardown();
+            Some(Response::ok(proto))
+        }
         // Other session control verbs: acknowledge so the sender proceeds.
-        "RECORD" | "SETPEERS" | "SETPEERSX" | "TEARDOWN" => {
+        "RECORD" | "SETPEERS" | "SETPEERSX" => {
             session.ack(&request.method);
             Some(Response::ok(proto))
         }

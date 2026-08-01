@@ -49,6 +49,15 @@ converted to a linear gain (`10^(dB/20)`, `-144 dB` = mute) and applied to the
 PCM before the ALSA write, updated live via a shared atomic so slider moves take
 effect mid-stream.
 
+**Embeddable library ([plan](../plans/20260801-01-embeddable-library.md)) —
+implemented, awaiting hardware validation.** The repo is now a workspace: the
+`openairplay2` library owns network → PCM behind a designed embedding API
+(`Receiver` builder → `run(sink_factory, events)`; `AudioSink` for PCM out,
+`Event` for session milestones, volume delivered in dB for the host's own gain
+path) and builds without ALSA on macOS and Linux; `openairplay2-receiver` is
+the standalone Linux/ALSA binary, functionally identical to the pre-split
+receiver, consuming only the public API.
+
 ## Design: no PTP, by intent
 
 This receiver targets **one Mac → one stream → one output** and does **not**
