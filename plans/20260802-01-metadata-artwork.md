@@ -188,4 +188,7 @@ touched files, additive API):
 
 ## Status
 
-Plan under review.
+Approved; phase 1 implemented (PR #23). Unit + integration tests green,
+clippy/fmt clean. Hardware validation against a real sender pending —
+in particular observing when senders push metadata relative to SETUP
+phase 2 (the latch design covers both timings).
