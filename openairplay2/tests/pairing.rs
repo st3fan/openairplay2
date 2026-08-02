@@ -35,7 +35,7 @@ async fn start() -> SocketAddr {
             mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
             model: "OpenAirPlay2,1".into(),
             source_version: "366.0".into(),
-            features: 0x0001_8340_405C_4A00,
+            features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
         },
         identity: Identity::generate(),

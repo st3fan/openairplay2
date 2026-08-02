@@ -31,7 +31,7 @@ async fn start() -> SocketAddr {
             mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
             model: "OpenAirPlay2,1".into(),
             source_version: "366.0".into(),
-            features: 0x0001_8340_405C_4A00,
+            features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
         },
         identity: Identity::generate(),
@@ -106,7 +106,7 @@ async fn get_info_returns_device_plist() {
     );
     assert_eq!(
         dict.get("features").unwrap().as_unsigned_integer(),
-        Some(0x0001_8340_405C_4A00)
+        Some(0x0001_8340_405F_CA00)
     );
     assert_eq!(dict.get("pk").unwrap().as_data().unwrap().len(), 32);
     assert!(dict.get("txtAirPlay").unwrap().as_data().is_some());

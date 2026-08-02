@@ -114,8 +114,10 @@ TCP reader backpressures on `pending_samples()` so latency and memory stay bound
 - **Every response needs `Content-Length` (even empty), the echoed `CSeq`, and the request's own
   protocol token** (`HTTP/1.1` vs `RTSP/1.0`). A `GET_PARAMETER volume` with an empty body makes a
   real sender abort before `SETUP` phase 2.
-- **The `features` bitmask `0x0001_8340_405C_4A00`** ([receiver.rs](openairplay2/src/receiver.rs))
+- **The `features` bitmask `0x0001_8340_405F_CA00`** ([receiver.rs](openairplay2/src/receiver.rs))
   is a known-good shairport-sync value. Getting it wrong makes senders offer AirPlay 1 or nothing.
+  Bits 15/16/17 are the metadata bits (covers, progress, DAAP text) — senders silently skip
+  sending track metadata/artwork unless these are advertised.
 - **The identity (Ed25519 `pk` + `pi` UUID) must be stable across restarts** — senders remember a
   receiver by it. The builder therefore requires `identity` or `identity_path` (no ephemeral
   default); the receiver binary persists to `~/.config/openairplay2/identity`.
