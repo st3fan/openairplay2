@@ -98,7 +98,7 @@ mod tests {
             mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
             model: "OpenAirPlay2,1".into(),
             source_version: "366.0".into(),
-            features: 0x0001_8340_405C_4A00,
+            features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
         };
         (config, Identity::generate())
@@ -109,7 +109,7 @@ mod tests {
         let (config, id) = fixture();
         let records = txt_records(&config, &id);
         assert!(records.iter().any(|r| r == "deviceid=AA:BB:CC:DD:EE:FF"));
-        assert!(records.iter().any(|r| r == "features=0x405C4A00,0x18340"));
+        assert!(records.iter().any(|r| r == "features=0x405FCA00,0x18340"));
         assert!(records
             .iter()
             .any(|r| r == &format!("pk={}", id.public_key_hex())));
@@ -139,7 +139,7 @@ mod tests {
         );
         assert_eq!(
             dict.get("features").unwrap().as_unsigned_integer(),
-            Some(0x0001_8340_405C_4A00)
+            Some(0x0001_8340_405F_CA00)
         );
         assert_eq!(
             dict.get("pk").unwrap().as_data().unwrap(),

@@ -31,7 +31,8 @@ The repository is a cargo workspace with two artifacts:
 It handles the full path end to end: mDNS/Bonjour discovery, HomeKit transient
 pairing, a ChaCha20-Poly1305-encrypted control channel, the FairPlay `fp-setup`
 handshake, two-phase `SETUP`, and buffered **AAC** playback — plus **pause /
-resume**, **seek / skip**, and **volume** control.
+resume**, **seek / skip**, and **volume** control, and **now-playing events**
+(track title/artist/album and cover art) for embedding hosts to display.
 
 By design it targets **one Mac → one stream → one output**. It deliberately does
 **not** implement PTP (it never binds UDP 319/320): PTP exists to align multiple

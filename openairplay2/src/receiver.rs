@@ -20,9 +20,11 @@ const DEFAULT_PORT: u16 = 7000;
 const DEFAULT_MODEL: &str = "OpenAirPlay2,1";
 const DEFAULT_SOURCE_VERSION: &str = "366.0";
 /// shairport-sync's known-good AirPlay 2 features: transient pairing (bit 48)
-/// plus AirPlay 2 audio. Getting this wrong makes senders offer AirPlay 1 or
-/// nothing at all.
-const DEFAULT_FEATURES: u64 = 0x0001_8340_405C_4A00;
+/// plus AirPlay 2 audio, plus the metadata bits 15/16/17 (covers, progress,
+/// DAAP text) — senders only push track metadata and artwork when these are
+/// advertised. Getting this wrong makes senders offer AirPlay 1 or nothing
+/// at all.
+const DEFAULT_FEATURES: u64 = 0x0001_8340_405F_CA00;
 const DEFAULT_STATUS_FLAGS: u32 = 0x4;
 /// Locally-administered fallback (starts with 0x02) when discovery finds no
 /// interface MAC.
@@ -251,7 +253,7 @@ mod tests {
         let config = receiver.config();
         assert_eq!(config.name, "OpenAirPlay2");
         assert_eq!(config.port, 7000);
-        assert_eq!(config.features, 0x0001_8340_405C_4A00);
+        assert_eq!(config.features, 0x0001_8340_405F_CA00);
         assert_eq!(config.device_id(), "AA:BB:CC:DD:EE:FF");
 
         let receiver = Receiver::builder()

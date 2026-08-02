@@ -156,6 +156,22 @@ async fn main() -> ExitCode {
                     info!("session started ({rate} Hz, {channels}ch)");
                 }
                 Event::SessionEnded => info!("session ended"),
+                Event::Metadata {
+                    title,
+                    artist,
+                    album,
+                } => {
+                    let field = |v: Option<String>| v.unwrap_or_else(|| "-".into());
+                    info!(
+                        "now playing: {} — {} ({})",
+                        field(artist),
+                        field(title),
+                        field(album)
+                    );
+                }
+                Event::Artwork { content_type, data } => {
+                    info!("artwork: {content_type}, {} bytes", data.len());
+                }
                 Event::Paused(paused) => debug!("paused: {paused}"),
                 Event::Flushed => debug!("flushed"),
                 _ => {}

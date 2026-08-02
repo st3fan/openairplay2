@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
 use crate::decode::AacDecoder;
+use crate::dmap;
 use crate::events::{Event, EventSender};
 use crate::player::{Player, PlayerSender};
 use crate::sink::{AudioSink, SinkFactory};
@@ -25,6 +26,9 @@ use crate::sink::{AudioSink, SinkFactory};
 /// Stream type constants from the SETUP `streams` array.
 const TYPE_REALTIME: u64 = 96;
 const TYPE_BUFFERED: u64 = 103;
+
+/// `SET_PARAMETER` content type carrying DMAP track metadata.
+const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
 
 pub struct Session {
     /// The address the control connection arrived on — what we bind to and
@@ -43,6 +47,12 @@ pub struct Session {
     events: EventSender,
     /// True between `SessionStarted` and `SessionEnded`.
     session_active: bool,
+    /// Metadata/artwork that arrived while no session was active (senders
+    /// may push them during the handshake, before SETUP phase 2). The
+    /// latest of each is latched here and delivered right after
+    /// `SessionStarted`, so the host only ever sees them inside a session.
+    pending_metadata: Option<Event>,
+    pending_artwork: Option<Event>,
     /// The playback thread, alive for the duration of a buffered stream.
     player: Option<Player>,
     /// Control handle for the player (pause/resume, flush) from the RTSP path.
@@ -66,6 +76,8 @@ impl Session {
             sink_factory,
             events,
             session_active: false,
+            pending_metadata: None,
+            pending_artwork: None,
             player: None,
             player_control: None,
             flush_until_seq: Arc::new(AtomicU64::new(0)),
@@ -211,6 +223,12 @@ impl Session {
             (Some(decryptor), Ok(decoder)) => {
                 self.session_active = true;
                 self.send_event(Event::SessionStarted { rate, channels });
+                // Replay metadata/artwork that arrived before the session
+                // started, so they land inside it.
+                let latched = [self.pending_metadata.take(), self.pending_artwork.take()];
+                for event in latched.into_iter().flatten() {
+                    self.send_event(event);
+                }
                 let sink: Box<dyn AudioSink> = (self.sink_factory)(rate, channels);
                 let player = Player::spawn(sink);
                 let sender = player.sender();
@@ -290,10 +308,29 @@ impl Session {
         }
     }
 
-    /// Apply a `SET_PARAMETER` body — currently just the volume line. The
+    /// Apply a `SET_PARAMETER` body, dispatched on its `Content-Type`:
+    /// DMAP track metadata, cover art, or (the default) `text/parameters`
+    /// lines — currently the volume.
+    pub fn set_parameter(&mut self, content_type: Option<&str>, body: &[u8]) {
+        // Strip any parameters ("; charset=...") from the media type.
+        let media_type = content_type.map(|ct| ct.split(';').next().unwrap_or(ct).trim());
+        match media_type {
+            Some(ct) if ct.eq_ignore_ascii_case(DMAP_CONTENT_TYPE) => self.set_metadata(body),
+            Some(ct)
+                if ct
+                    .get(..6)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("image/")) =>
+            {
+                self.set_artwork(ct, body)
+            }
+            _ => self.set_text_parameters(body),
+        }
+    }
+
+    /// The `text/parameters` flavor — currently just the volume line. The
     /// volume (dB) is recorded (to answer `GET_PARAMETER`) and reported to
     /// the host, which owns the gain path.
-    pub fn set_parameter(&mut self, body: &[u8]) {
+    fn set_text_parameters(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
             if let Some(v) = line.trim().strip_prefix("volume:") {
@@ -303,6 +340,52 @@ impl Session {
                     self.send_event(Event::Volume { db });
                 }
             }
+        }
+    }
+
+    /// DMAP track metadata. Metadata is decoration: an unparseable payload
+    /// is dropped with a debug log, never an error to the sender.
+    fn set_metadata(&mut self, body: &[u8]) {
+        let Some(meta) = dmap::parse(body) else {
+            debug!(
+                "SET_PARAMETER metadata: unrecognized DMAP payload ({} bytes)",
+                body.len()
+            );
+            return;
+        };
+        debug!(
+            "SET_PARAMETER metadata: title={:?} artist={:?} album={:?}",
+            meta.title, meta.artist, meta.album
+        );
+        self.send_session_event(Event::Metadata {
+            title: meta.title,
+            artist: meta.artist,
+            album: meta.album,
+        });
+    }
+
+    /// Cover art, forwarded as-is (`image/none`/empty means cleared).
+    fn set_artwork(&mut self, content_type: &str, body: &[u8]) {
+        debug!(
+            "SET_PARAMETER artwork: {content_type}, {} bytes",
+            body.len()
+        );
+        self.send_session_event(Event::Artwork {
+            content_type: content_type.to_string(),
+            data: body.to_vec(),
+        });
+    }
+
+    /// Deliver an event the host expects only inside a session; before
+    /// `SessionStarted` it is latched (latest wins) and replayed once the
+    /// session starts.
+    fn send_session_event(&mut self, event: Event) {
+        if self.session_active {
+            self.send_event(event);
+        } else if matches!(event, Event::Artwork { .. }) {
+            self.pending_artwork = Some(event);
+        } else {
+            self.pending_metadata = Some(event);
         }
     }
 
@@ -626,7 +709,7 @@ mod tests {
             session.get_parameter(b"volume\r\n"),
             b"volume: 0.000000\r\n"
         );
-        session.set_parameter(b"volume: -12.5\r\n");
+        session.set_parameter(Some("text/parameters"), b"volume: -12.5\r\n");
         assert_eq!(
             session.get_parameter(b"volume\r\n"),
             b"volume: -12.500000\r\n"
@@ -635,6 +718,122 @@ mod tests {
         assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
         // Unknown parameters yield an empty body rather than a bad one.
         assert!(session.get_parameter(b"progress\r\n").is_empty());
+    }
+
+    /// One DMAP entry: 4-byte tag + big-endian u32 length + payload.
+    fn dmap_entry(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut e = tag.to_vec();
+        e.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        e.extend_from_slice(payload);
+        e
+    }
+
+    /// A complete track statement: `mlit` wrapping title/artist/album.
+    fn dmap_track(title: &str) -> Vec<u8> {
+        let children = [
+            dmap_entry(b"minm", title.as_bytes()),
+            dmap_entry(b"asar", b"Artist"),
+            dmap_entry(b"asal", b"Album"),
+        ]
+        .concat();
+        dmap_entry(b"mlit", &children)
+    }
+
+    /// Run a phase-2 SETUP for a buffered stream, starting the session.
+    async fn start_stream(session: &mut Session) {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
+        stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let body = encode_plist(&dict).unwrap();
+        session.handle_setup(&body).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_and_artwork_reach_the_host_mid_session() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::SessionStarted { .. })
+        ));
+
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Song"));
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Metadata {
+                title: Some("Song".into()),
+                artist: Some("Artist".into()),
+                album: Some("Album".into()),
+            })
+        );
+
+        session.set_parameter(Some("image/png"), b"\x89PNG");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Artwork {
+                content_type: "image/png".into(),
+                data: b"\x89PNG".to_vec(),
+            })
+        );
+
+        // `image/none` with an empty body is the artwork-cleared statement,
+        // forwarded rather than suppressed (it can happen mid-track).
+        session.set_parameter(Some("image/none"), b"");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Artwork {
+                content_type: "image/none".into(),
+                data: Vec::new(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn early_metadata_is_latched_until_session_start() {
+        let (mut session, mut events) = session();
+        // Pushed during the handshake, before SETUP phase 2: nothing yet...
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("First"));
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Second"));
+        session.set_parameter(Some("image/jpeg"), b"JPEG");
+        assert!(events.try_recv().is_err());
+
+        // ...and the latest of each replays right after SessionStarted.
+        start_stream(&mut session).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Metadata { title: Some(t), .. }) if t == "Second"
+        ));
+        assert!(matches!(events.try_recv(), Ok(Event::Artwork { .. })));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_never_reaches_the_host() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::SessionStarted { .. })
+        ));
+
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"");
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"garbage, not dmap");
+        // Truncated: an mlit that claims more payload than exists.
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"mlit\x00\x00\xff\xff");
+        assert!(events.try_recv().is_err());
+
+        // The session itself is unharmed — the volume path still works.
+        session.set_parameter(Some("text/parameters"), b"volume: -6.0\r\n");
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
     }
 
     #[test]
