@@ -200,7 +200,10 @@ touched files, additive API):
 
 Approved; phase 1 implemented (PR #23). Unit + integration tests green,
 clippy/fmt clean. First hardware capture found the missing metadata
-feature bits (see above), fixed in the same PR. Hardware validation
-against a real sender pending — in particular observing when senders
-push metadata relative to SETUP phase 2 (the latch design covers both
-timings).
+feature bits (see above), fixed in the same PR. Second capture
+(iPhone, Music.app playlist, 2026-08-02) validated the whole contract:
+title/artist/album parsed for every track across seven track changes
+with zero unrecognized payloads, `image/jpeg` artwork (~180 KB) on each
+change, and a real mid-session `image/none` clear. This sender pushes
+metadata *after* SETUP phase 2 (~1 s after the pipeline starts), so the
+early-metadata latch stayed idle — kept as armor for other senders.
