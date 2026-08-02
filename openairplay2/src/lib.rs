@@ -40,6 +40,7 @@ mod avahi;
 mod buffered;
 mod crypto_stream;
 mod decode;
+mod dmap;
 mod events;
 mod fairplay;
 mod http;

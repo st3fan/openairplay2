@@ -70,6 +70,16 @@ pause point and resume plays instantly from the held buffer — and
 `FLUSHBUFFERED` discards exactly the sequence range it names: the boundary
 self-clears when the stream reaches it and resets at stream setup.
 
+**Metadata and artwork events
+([plan](../plans/20260802-01-metadata-artwork.md)) — implemented (hardware
+validation pending).** Requested by the embedding consumer
+([st3fan/radio](https://github.com/st3fan/radio)): `SET_PARAMETER` payloads
+are now dispatched on `Content-Type` — DMAP track metadata
+(title/artist/album via a minimal `mlit` walker) becomes `Event::Metadata`,
+cover art becomes `Event::Artwork` (forwarded as-is, `image/none`/empty =
+cleared). Both are delivered only inside a session: pushed-early payloads
+are latched and replayed right after `SessionStarted`.
+
 ## Design: no PTP, by intent
 
 This receiver targets **one Mac → one stream → one output** and does **not**

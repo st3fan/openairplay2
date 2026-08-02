@@ -145,7 +145,7 @@ async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Re
             Some(Response::ok(proto).body(PARAMETERS_CONTENT_TYPE, body))
         }
         "SET_PARAMETER" => {
-            session.set_parameter(&request.body);
+            session.set_parameter(request.headers.get("Content-Type"), &request.body);
             Some(Response::ok(proto))
         }
         // Transport control: play/pause rate and the RTP anchor.
