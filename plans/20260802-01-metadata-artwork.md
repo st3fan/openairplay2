@@ -120,6 +120,16 @@ Checked against the code as of 2026-08-02:
 - **No public-API wire types leak:** `Event::Metadata`/`Event::Artwork`
   carry plain `String`/`Vec<u8>`, consistent with the invariant that
   the documented API stays free of AirPlay wire types.
+- **Found during hardware validation: the `features` bitmask must
+  advertise metadata.** A first capture against a real iPhone showed
+  zero metadata/artwork `SET_PARAMETER`s — senders check the receiver's
+  advertised features and our bitmask had bits 15/16/17
+  (AudioMetaCovers, AudioMetaProgress, AudioMetaTxtDAAP) cleared.
+  Setting them (low word `0x405C4A00` → `0x405FCA00`, which is exactly
+  shairport-sync's shipped value) is part of this change; without it the
+  whole feature is dead on the wire. The receiver binary now also logs
+  `Metadata`/`Artwork` at info level, so hardware runs show
+  `now playing: Artist — Title (Album)` lines directly.
 
 ## Testing suggestions
 
@@ -189,6 +199,8 @@ touched files, additive API):
 ## Status
 
 Approved; phase 1 implemented (PR #23). Unit + integration tests green,
-clippy/fmt clean. Hardware validation against a real sender pending —
-in particular observing when senders push metadata relative to SETUP
-phase 2 (the latch design covers both timings).
+clippy/fmt clean. First hardware capture found the missing metadata
+feature bits (see above), fixed in the same PR. Hardware validation
+against a real sender pending — in particular observing when senders
+push metadata relative to SETUP phase 2 (the latch design covers both
+timings).
