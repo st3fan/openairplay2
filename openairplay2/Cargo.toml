@@ -2,8 +2,15 @@
 name = "openairplay2"
 version = "0.1.0"
 edition = "2021"
+# The floor set by our dependencies (plist, time); CI tests current stable.
+rust-version = "1.88"
 description = "Embeddable AirPlay 2 audio receiver library (network in, PCM + events out)"
 license = "MIT"
+repository = "https://github.com/st3fan/openairplay2"
+documentation = "https://docs.rs/openairplay2"
+readme = "../README.md"
+keywords = ["airplay", "airplay2", "audio", "receiver", "raop"]
+categories = ["multimedia::audio", "network-programming"]
 
 # No audio-output dependency here: the host owns PCM → speaker. This crate
 # must keep building (and its tests passing) on macOS as well as Linux.
