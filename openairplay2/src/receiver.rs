@@ -149,6 +149,8 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// Start configuring a receiver. See [`ReceiverBuilder`] for the options;
+    /// an identity is the one required setting.
     pub fn builder() -> ReceiverBuilder {
         ReceiverBuilder::new()
     }

@@ -36,6 +36,8 @@
 //! }
 //! ```
 
+#![warn(missing_docs)]
+
 mod avahi;
 mod buffered;
 mod crypto_stream;
@@ -74,8 +76,11 @@ pub use sink::{AudioSink, SinkFactory};
 /// Receiver-wide configuration, resolved by [`ReceiverBuilder::build`].
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// The receiver name senders see in the AirPlay picker.
     pub name: String,
+    /// TCP port of the HTTP/RTSP control server.
     pub port: u16,
+    /// The MAC address used as the AirPlay `deviceid`.
     pub mac: [u8; 6],
     /// Apple model string, e.g. `OpenAirPlay2,1`.
     pub model: String,

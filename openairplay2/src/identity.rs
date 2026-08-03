@@ -12,6 +12,10 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use uuid::Uuid;
 
+/// The receiver's stable device identity: an Ed25519 keypair (the AirPlay
+/// `pk`) and a public-identifier UUID (`pi`). Senders remember a receiver by
+/// these, so they must not change across restarts — persist with
+/// [`Identity::load_or_create`] or store them yourself.
 pub struct Identity {
     signing_key: SigningKey,
     pi: Uuid,
@@ -39,6 +43,9 @@ impl Identity {
         }
     }
 
+    /// Generate a fresh random identity. It is the caller's job to keep it —
+    /// a receiver that greets senders with a new identity every run will not
+    /// be recognized.
     pub fn generate() -> Identity {
         Identity {
             signing_key: SigningKey::generate(&mut OsRng),
