@@ -1,5 +1,9 @@
 # OpenAirPlay 2
 
+[![crates.io](https://img.shields.io/crates/v/openairplay2.svg)](https://crates.io/crates/openairplay2)
+[![docs.rs](https://img.shields.io/docsrs/openairplay2)](https://docs.rs/openairplay2)
+[![CI](https://github.com/st3fan/openairplay2/actions/workflows/ci.yml/badge.svg)](https://github.com/st3fan/openairplay2/actions/workflows/ci.yml)
+
 An **AirPlay 2 audio receiver** for Linux, written in Rust — the AirPlay 2
 counterpart of [openairplay1](https://github.com/st3fan/openairplay1) (a working
 AirPlay 1 / RAOP receiver).
@@ -9,8 +13,9 @@ pairing (SRP + Curve25519 + Ed25519), a ChaCha20-Poly1305-encrypted control
 channel carrying binary plists, per-packet ChaCha20-Poly1305 audio, AAC as
 well as ALAC, and PTP timing.
 
-See [`notes.md`](notes.md) for the protocol research and the milestone plan,
-and `notes/milestone-*.md` for each milestone.
+See [`notes.md`](https://github.com/st3fan/openairplay2/blob/main/notes.md)
+for the protocol research and the milestone plan, and `notes/milestone-*.md`
+for each milestone.
 
 ## Status
 
@@ -41,7 +46,7 @@ plus our backpressure are enough. Multi-room / grouped playback would require PT
 and is out of scope.
 
 The milestone-by-milestone development history is in
-[`notes/status.md`](notes/status.md).
+[`notes/status.md`](https://github.com/st3fan/openairplay2/blob/main/notes/status.md).
 
 ## Build & run
 
@@ -51,6 +56,12 @@ binary); a running `avahi-daemon` is needed for discovery.
 ```sh
 cargo build --release
 ./target/release/openairplay2-receiver --name "Living Room"
+```
+
+Or install the released binary straight from crates.io:
+
+```sh
+cargo install openairplay2-receiver
 ```
 
 ### Options
@@ -73,6 +84,11 @@ sender sends.
 
 The library's public API is small: build a `Receiver`, hand it a sink factory
 and an event channel, run it on your tokio runtime.
+
+```toml
+[dependencies]
+openairplay2 = "0.1"
+```
 
 ```rust,no_run
 use openairplay2::{AudioSink, Event, Receiver};
