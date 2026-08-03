@@ -2,8 +2,11 @@
 
 Releases are tag-driven: pushing a `vX.Y.Z` tag runs
 [release.yml](../.github/workflows/release.yml), which tests the
-workspace and publishes the `openairplay2` library to crates.io using
-Trusted Publishing (GitHub OIDC — no stored API token).
+workspace and publishes the `openairplay2` library and then the
+`openairplay2-receiver` binary to crates.io using Trusted Publishing
+(GitHub OIDC — no stored API token). The library must publish first —
+the binary depends on it, and its pre-publish verification build
+resolves the library from the registry, not the workspace.
 
 ## One-time setup (first release only)
 
@@ -16,10 +19,12 @@ already exists, so the very first publish is manual:
    ```sh
    cargo login          # paste the token
    cargo publish -p openairplay2
+   cargo publish -p openairplay2-receiver   # after the library is up
    ```
 
-2. On crates.io → the `openairplay2` crate → Settings → Trusted
-   Publishing, add a GitHub publisher:
+2. On crates.io, for **each** crate (`openairplay2` and
+   `openairplay2-receiver`) → Settings → Trusted Publishing, add a
+   GitHub publisher:
    - repository: `st3fan/openairplay2`
    - workflow filename: `release.yml`
 3. Revoke the API token — it is no longer needed. Subsequent releases

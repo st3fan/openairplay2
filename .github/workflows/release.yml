@@ -31,3 +31,9 @@ jobs:
         run: cargo publish -p openairplay2
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # cargo waits for the library to be available in the index before
+      # verifying the dependent binary crate.
+      - name: Publish openairplay2-receiver
+        run: cargo publish -p openairplay2-receiver
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
