@@ -128,6 +128,14 @@ TCP reader backpressures on `pending_samples()` so latency and memory stay bound
   [notes/licensing.md](notes/licensing.md) before touching or extending that path; do not import
   FairPlay *decryption* code (the known implementations are GPLv2 and this project is MIT).
 
+## Runbooks
+
+Operational procedures live in `runbooks/`. When asked to do a **release**, follow
+[runbooks/releasing.md](runbooks/releasing.md) — tag-driven crates.io publishing via the Release
+workflow, with the failure procedure and the autopilot arrangement. CI
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux and the
+library on macOS for every PR — the macOS portability deliverable is enforced there.
+
 ## Tests
 
 Unit tests live inline (`#[cfg(test)] mod tests`) next to the code; integration tests in
