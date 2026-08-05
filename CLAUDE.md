@@ -17,7 +17,9 @@ A cargo workspace with two members:
   else is private or `#[doc(hidden)]` (test-sender pieces: `srp`, `tlv`, `cipher`, `server`).
 - **`openairplay2-receiver/`** — the standalone Linux-only binary: CLI + `AlsaSink`
   (ALSA output, prebuffer cushion, dB→linear gain). It consumes only the library's public API
-  (it is embedder #1).
+  (it is embedder #1). It is also what `packaging/` packages: a `.deb` (systemd unit,
+  `/etc/default` options file, `openairplay2` system user) built by `packaging/build-deb.sh`
+  from `[package.metadata.deb]` in its `Cargo.toml`.
 
 Deliberate scope: **one sender → one stream → one output**. There is no PTP (UDP 319/320 is
 never bound, `SETUP` replies `timingPort: 0`) — PTP exists to align *multiple* outputs, and for
@@ -135,8 +137,11 @@ TCP reader backpressures on `pending_samples()` so latency and memory stay bound
 ## Runbooks
 
 Operational procedures live in `runbooks/`. When asked to do a **release**, follow
-[runbooks/releasing.md](runbooks/releasing.md) — tag-driven crates.io publishing via the Release
-workflow, with the failure procedure and the autopilot arrangement. CI
+[runbooks/releasing.md](runbooks/releasing.md) — publishing a GitHub Release is the only event
+that ships anything: [release.yml](.github/workflows/release.yml) checks the tag against the
+crate version and dispatches [cargo.yml](.github/workflows/cargo.yml) (crates.io) and
+[debian.yml](.github/workflows/debian.yml) (amd64 + arm64 `.deb`s, attached to the release) in
+parallel. The runbook also holds the failure procedure and the autopilot arrangement. CI
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux and the
 library on macOS for every PR — the macOS portability deliverable is enforced there.
 

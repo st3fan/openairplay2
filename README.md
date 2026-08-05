@@ -48,6 +48,33 @@ and is out of scope.
 The milestone-by-milestone development history is in
 [`notes/status.md`](https://github.com/st3fan/openairplay2/blob/main/notes/status.md).
 
+## Install (Debian / Ubuntu)
+
+Every release carries a `.deb` for **amd64** and **arm64**. Download the one
+for your machine from the
+[releases page](https://github.com/st3fan/openairplay2/releases) and install
+it — it brings a systemd service that starts at boot:
+
+```sh
+sudo apt-get install -y ./openairplay2-receiver_X.Y.Z-1_arm64.deb
+```
+
+Set the name and the audio device in `/etc/default/openairplay2-receiver`
+(the same flags as below), then:
+
+```sh
+sudo systemctl restart openairplay2-receiver
+systemctl status openairplay2-receiver
+```
+
+The service runs as its own `openairplay2` user and keeps its pairing
+identity in `/var/lib/openairplay2`, so senders keep recognizing the receiver
+across upgrades. The packages carry a build-provenance attestation:
+
+```sh
+gh attestation verify openairplay2-receiver_X.Y.Z-1_arm64.deb --repo st3fan/openairplay2
+```
+
 ## Build & run
 
 Building links against nothing exotic (`libasound2-dev` for the receiver
