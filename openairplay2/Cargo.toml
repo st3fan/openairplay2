@@ -1,6 +1,6 @@
 [package]
 name = "openairplay2"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # The floor set by our dependencies (plist, time); CI tests current stable.
 rust-version = "1.88"
