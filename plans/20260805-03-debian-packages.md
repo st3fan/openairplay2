@@ -171,31 +171,47 @@ the first local build rather than at release time.
 
 `release.yml` moves from `on: push: tags: [v*]` to `on: release: [published]`,
 matching radio's rule that **publishing a GitHub Release is the only event that
-ships anything**. That keeps one workflow file (so the crates.io Trusted
-Publishing configuration, which is keyed on `release.yml`, is untouched) and
-gives the `.deb` jobs a release to attach to. The tag-push path is retired
-rather than adapted — it has never actually run a release (both crates were
-published by hand at 0.2.0), so nothing is being destabilized.
+ships anything**. Keeping the same filename matters: the crates.io Trusted
+Publishing configuration is keyed on it. The tag-push path is retired rather
+than adapted — it has never actually run a release (both crates were published
+by hand at 0.2.0), so nothing is being destabilized.
 
-Jobs:
+`release.yml` itself becomes a **dispatcher**: it checks the version and then
+calls two reusable workflows, which run in parallel and are independently
+readable and independently runnable.
 
-1. **`version`** — assert the tag (minus `v`) equals
-   `openairplay2-receiver/Cargo.toml`'s version; warn-only for prereleases so
-   `vX.Y.Z-rcN` tags can exercise the workflow end to end.
-2. **`crates-io`** — the existing steps unchanged: test, OIDC auth, publish the
-   library, then the binary.
-3. **`deb` (matrix: amd64, arm64)** — `debian:trixie` container, apt
-   `build-essential pkg-config libasound2-dev git curl ca-certificates`, rustup
-   (trixie's rustc predates our `rust-version = 1.88`), `Swatinem/rust-cache`,
-   `cargo test --workspace`, `cargo install cargo-deb --locked`,
-   `packaging/build-deb.sh <arch>`, `actions/attest-build-provenance`, upload
-   the artifact. `fail-fast: false` — one runner flake must not cancel the other
-   architecture.
-4. **`release-assets`** — download both, `sha256sum > SHA256SUMS`,
-   `gh release upload --repo "$GITHUB_REPOSITORY" "$TAG" --clobber`.
+```
+release.yml            on: release: published
+ ├── version           tag vX.Y.Z == openairplay2-receiver/Cargo.toml
+ ├── cargo.yml   ──────┐ (workflow_call) publish both crates to crates.io
+ └── debian.yml  ──────┘ (workflow_call) build .debs, attach them
+      ├── build (matrix: amd64 native, arm64 native)   ← in parallel
+      └── assets  SHA256SUMS + gh release upload
+```
 
-Permissions per job, least-privilege: `id-token`/`attestations: write` on the
-build jobs, `contents: write` only on the upload job.
+- **`release.yml`** — job `version` asserts the tag (minus `v`) equals
+  `openairplay2-receiver/Cargo.toml`'s version, warn-only for prereleases so
+  `vX.Y.Z-rcN` tags can exercise the whole thing; then `cargo` and `debian`,
+  both `needs: version`, both `uses: ./.github/workflows/…`. Permissions are
+  granted per call (least privilege): `id-token: write` for the crates.io OIDC
+  exchange, `id-token`/`attestations`/`contents: write` for the `.deb` side.
+- **`cargo.yml`** — `on: workflow_call`, one job, the existing steps unchanged:
+  ALSA headers, `cargo test --workspace`, `crates-io-auth-action`, publish the
+  library, then the binary (that order is mandatory — the binary's pre-publish
+  verification resolves the library from the registry).
+- **`debian.yml`** — `on: workflow_call` (input: `tag`, empty means build only)
+  plus `workflow_dispatch`, so a packaging change can be smoke-tested on a
+  branch without cutting a release. Job `build` is the architecture matrix:
+  `amd64` on `ubuntu-latest` and `arm64` on `ubuntu-24.04-arm`, both native,
+  both in a `debian:trixie` container — apt `build-essential pkg-config
+  libasound2-dev git curl ca-certificates`, rustup (trixie's rustc predates our
+  `rust-version = 1.88`), `Swatinem/rust-cache`, `cargo test --workspace`,
+  `cargo install cargo-deb --locked`, `packaging/build-deb.sh <arch>`,
+  `actions/attest-build-provenance`, upload artifact. `fail-fast: false` — one
+  runner flake must not cancel the other architecture. Job `assets` (only when
+  `tag` is set) downloads both, writes `SHA256SUMS`, and
+  `gh release upload --repo "$GITHUB_REPOSITORY" "$TAG" --clobber`, so the
+  release page carries two `.deb`s you can download and `dpkg -i` directly.
 
 ### Docs
 
@@ -238,11 +254,11 @@ scripts, `build-deb.sh`), `[package.metadata.deb]` in the receiver's
 `Cargo.toml`, and the SIGTERM handler in `main.rs`. Ends with a `.deb` built
 locally on amd64 and installed in a Debian 13 container/VM.
 
-**Phase 2 — ship it.** `release.yml` rewritten (version check, crates.io, the
-amd64/arm64 `.deb` matrix, attestation, asset upload), `runbooks/releasing.md`
-rewritten, README install section, CLAUDE.md pointer. Ends with a prerelease
-tag (`vX.Y.Z-rcN`) driving a full workflow run whose artifacts are inspected
-and then deleted.
+**Phase 2 — ship it.** `release.yml` reduced to a dispatcher over the new
+`cargo.yml` and `debian.yml` (version check, crates.io, the amd64/arm64 `.deb`
+matrix, attestation, asset upload), `runbooks/releasing.md` rewritten, README
+install section, CLAUDE.md pointer. Ends with a prerelease tag (`vX.Y.Z-rcN`)
+driving a full workflow run whose artifacts are inspected and then deleted.
 
 ## Test strategy
 
@@ -271,8 +287,10 @@ Nothing here is unit-testable; the verification is the artifact itself.
   `journalctl -u openairplay2-receiver` shows the startup lines and stays quiet
   at `info` while streaming (the logging convention from plan `20260805-02`),
   and that `systemctl stop` shuts down cleanly via the new SIGTERM path.
-- **The workflow itself** is tested with a prerelease tag before any real
-  release, then the prerelease and its tag are deleted.
+- **The workflow itself**: `debian.yml` can be run on its own from the Actions
+  tab (`workflow_dispatch`) to prove the matrix builds, and the whole
+  dispatcher is exercised with a prerelease tag before any real release — then
+  the prerelease and its tag are deleted.
 
 ## Acceptance criteria
 
