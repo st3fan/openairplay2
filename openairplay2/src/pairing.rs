@@ -34,11 +34,17 @@ pub enum Outcome {
 pub struct PairSetup {
     srp: Option<SrpServer>,
     transient: bool,
+    /// The SRP password: `3939` for transient, or the configured pincode.
+    pin: String,
 }
 
 impl PairSetup {
-    pub fn new() -> PairSetup {
-        PairSetup::default()
+    pub fn new(pincode: Option<&str>) -> PairSetup {
+        PairSetup {
+            srp: None,
+            transient: false,
+            pin: pincode.unwrap_or(PAIR_SETUP_PIN).to_string(),
+        }
     }
 
     /// Process one `POST /pair-setup` request body (TLV8).
@@ -64,7 +70,7 @@ impl PairSetup {
             .is_some_and(|b| b & FLAG_TRANSIENT != 0);
         info!("pair-setup M1 (transient={})", self.transient);
 
-        let srp = SrpServer::new(PAIR_SETUP_PIN);
+        let srp = SrpServer::new(&self.pin);
         let mut response = Tlv::new();
         response
             .put_u8(ty::STATE, STATE_M2)
@@ -128,7 +134,7 @@ mod tests {
     /// shared secret from both sides.
     #[test]
     fn transient_pair_setup_completes_with_matching_secret() {
-        let mut setup = PairSetup::new();
+        let mut setup = PairSetup::new(None);
 
         // M1: client starts, transient flag set.
         let mut m1 = Tlv::new();
@@ -166,7 +172,7 @@ mod tests {
 
     #[test]
     fn wrong_pin_fails_at_m3() {
-        let mut setup = PairSetup::new();
+        let mut setup = PairSetup::new(None);
         let mut m1 = Tlv::new();
         m1.put_u8(ty::STATE, 1)
             .put_u8(ty::METHOD, 0)
@@ -188,5 +194,45 @@ mod tests {
             }
             _ => panic!("expected failure"),
         }
+    }
+
+    /// Drive M1→M3 and return the outcome, as a client presenting `pin`.
+    fn run_setup(setup: &mut PairSetup, pin: &str) -> Outcome {
+        let mut m1 = Tlv::new();
+        m1.put_u8(ty::STATE, 1)
+            .put_u8(ty::METHOD, 0)
+            .put_u8(ty::FLAGS, 0x10);
+        let m2 = match setup.handle(&m1.encode()) {
+            Outcome::Continue(r) => Tlv::decode(&r).unwrap(),
+            other => return other,
+        };
+        let mut client = SrpClient::new(pin);
+        let proof = client.process(m2.get(ty::SALT).unwrap(), m2.get(ty::PUBLIC_KEY).unwrap());
+        let mut m3 = Tlv::new();
+        m3.put_u8(ty::STATE, 3)
+            .put(ty::PUBLIC_KEY, client.public_a())
+            .put(ty::PROOF, proof.to_vec());
+        setup.handle(&m3.encode())
+    }
+
+    /// A configured pincode becomes the SRP password: a client that presents
+    /// it pairs; the standard `3939` is refused.
+    #[test]
+    fn configured_pincode_is_the_srp_password() {
+        let mut setup = PairSetup::new(Some("1212"));
+        assert!(matches!(
+            run_setup(&mut setup, "1212"),
+            Outcome::Done { .. }
+        ));
+
+        let mut setup = PairSetup::new(Some("1212"));
+        assert!(matches!(run_setup(&mut setup, "3939"), Outcome::Failed(_)));
+
+        // No pincode configured: the standard transient 3939 still pairs.
+        let mut setup = PairSetup::new(None);
+        assert!(matches!(
+            run_setup(&mut setup, "3939"),
+            Outcome::Done { .. }
+        ));
     }
 }

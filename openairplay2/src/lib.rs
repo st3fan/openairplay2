@@ -90,6 +90,12 @@ pub struct Config {
     pub features: u64,
     /// AirPlay status flags.
     pub status_flags: u32,
+    /// `Some` → require this pincode to pair (advertised as "password
+    /// required" via status-flag bit 7; a sender enters it in transient
+    /// pairing). `None` → the standard transient code `3939`. Unlike
+    /// openairplay1 there is no "open" mode — AirPlay 2 always pairs. Never
+    /// logged.
+    pub pincode: Option<String>,
 }
 
 impl Config {

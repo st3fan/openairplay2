@@ -55,8 +55,12 @@ option list is in the [README](README.md).
 One TCP control connection carries the whole session, in three regimes on the same socket:
 
 1. **Plaintext HTTP/RTSP** — `GET /info`, `POST /pair-setup`.
-2. **Transient pairing** — SRP-6a (3072-bit group, SHA-512, fixed code `3939`), M1→M2, M3→M4.
-   The SRP session key `K` becomes the channel secret.
+2. **Transient pairing** — SRP-6a (3072-bit group, SHA-512, fixed code `3939`, or the configured `--pincode`), M1→M2, M3→M4.
+   The SRP session key `K` becomes the channel secret. A configured pincode
+   sets status-flag bit 7 ("password required") and answers `pair-pin-start`
+   with an empty 200, so a sender prompts for and enters the pincode, which
+   becomes the SRP password; iOS pairs at M4 + the encrypted channel (no
+   M5/M6 in this flow). See `notes/protocol.md`.
 3. **Encrypted** — everything after M4 is ChaCha20-Poly1305 in HomeKit block framing
    (`[u16 len LE][ciphertext][tag]`), keys HKDF-SHA512-derived per direction.
 
