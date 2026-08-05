@@ -75,6 +75,7 @@ cargo install openairplay2-receiver
 | `--alsa-device NAME` | ALSA output device to play to | `default` |
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
+| `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). The pincode is never logged. | transient `3939` |
 | `-h`, `--help` | Print usage and exit | — |
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real

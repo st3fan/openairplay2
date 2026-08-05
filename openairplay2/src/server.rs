@@ -60,7 +60,7 @@ async fn handle_connection(
     let local_ip = stream.local_addr()?.ip();
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
-    let mut pair = PairSetup::new();
+    let mut pair = PairSetup::new(context.config.pincode.as_deref());
     let mut session = Session::new(
         local_ip,
         context.sink_factory.clone(),
@@ -91,6 +91,19 @@ async fn handle_connection(
                 let (enc, dec) = control_channel(&secret);
                 conn.enable_encryption(enc, dec);
             }
+            continue;
+        }
+
+        // `pair-pin-start`: a sender that sees status-flag bit 7 (pincode
+        // required) asks the receiver to make the code available before
+        // `pair-setup`. Answer an empty 200 (shairport does the same); the
+        // actual code is the configured `--pincode`, which the user types on
+        // the sender, and is used as the SRP password in the `pair-setup`
+        // that follows.
+        if request.method == "POST" && request.target == "/pair-pin-start" {
+            info!("pair-pin-start: asking the sender for the pincode");
+            let response = finalize(Response::ok(&request.protocol), &request);
+            conn.write_response(&response).await?;
             continue;
         }
 

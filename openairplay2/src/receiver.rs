@@ -26,6 +26,21 @@ const DEFAULT_SOURCE_VERSION: &str = "366.0";
 /// at all.
 const DEFAULT_FEATURES: u64 = 0x0001_8340_405F_CA00;
 const DEFAULT_STATUS_FLAGS: u32 = 0x4;
+/// Status-flag bit 7 ("Password required"), which makes Apple senders prompt
+/// for a pincode and pair with it instead of silently using transient `3939`
+/// (proven on iOS 26). Shairport-sync sets the same bit when a password is
+/// configured.
+const PASSWORD_REQUIRED_FLAG: u32 = 1 << 7;
+
+/// Advertised status flags: audio-attached, plus "password required" when a
+/// pincode is configured.
+fn status_flags(pincode: bool) -> u32 {
+    if pincode {
+        DEFAULT_STATUS_FLAGS | PASSWORD_REQUIRED_FLAG
+    } else {
+        DEFAULT_STATUS_FLAGS
+    }
+}
 /// Locally-administered fallback (starts with 0x02) when discovery finds no
 /// interface MAC.
 const FALLBACK_MAC: [u8; 6] = [0x02, 0x4f, 0x41, 0x50, 0x32, 0x00];
@@ -43,6 +58,7 @@ pub struct ReceiverBuilder {
     identity: Option<Identity>,
     identity_path: Option<PathBuf>,
     advertise: bool,
+    pincode: Option<String>,
 }
 
 impl ReceiverBuilder {
@@ -54,6 +70,7 @@ impl ReceiverBuilder {
             identity: None,
             identity_path: None,
             advertise: true,
+            pincode: None,
         }
     }
 
@@ -100,6 +117,15 @@ impl ReceiverBuilder {
         self
     }
 
+    /// Require this pincode to pair: a sender must enter it (AirPlay 2's
+    /// analog of openairplay1's `--password`); the receiver advertises
+    /// "password required" (status-flag bit 7). Unset → transient `3939`.
+    /// Never logged.
+    pub fn pincode(mut self, pincode: impl Into<String>) -> Self {
+        self.pincode = Some(pincode.into());
+        self
+    }
+
     /// Resolve the identity and MAC and produce a runnable [`Receiver`].
     pub fn build(self) -> io::Result<Receiver> {
         let identity = match (self.identity, &self.identity_path) {
@@ -131,7 +157,8 @@ impl ReceiverBuilder {
                 model: DEFAULT_MODEL.to_string(),
                 source_version: DEFAULT_SOURCE_VERSION.to_string(),
                 features: DEFAULT_FEATURES,
-                status_flags: DEFAULT_STATUS_FLAGS,
+                status_flags: status_flags(self.pincode.is_some()),
+                pincode: self.pincode,
             },
             identity,
             advertise: self.advertise,
@@ -227,6 +254,26 @@ impl Receiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pincode_sets_password_required_status_flag() {
+        // No pincode: just audio attached.
+        assert_eq!(status_flags(false), 0x4);
+        // Pincode set: also advertise "password required" (status bit 7),
+        // which is what makes iOS prompt for it.
+        assert_eq!(status_flags(true), 0x4 | 1 << 7);
+    }
+
+    #[test]
+    fn build_applies_the_pincode() {
+        let receiver = Receiver::builder()
+            .identity(Identity::generate())
+            .pincode("1212")
+            .build()
+            .unwrap();
+        assert_eq!(receiver.config().pincode.as_deref(), Some("1212"));
+        assert_eq!(receiver.config().status_flags, 0x4 | 1 << 7);
+    }
 
     #[test]
     fn build_requires_an_identity() {
