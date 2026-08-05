@@ -80,6 +80,19 @@ cover art becomes `Event::Artwork` (forwarded as-is, `image/none`/empty =
 cleared). Both are delivered only inside a session: pushed-early payloads
 are latched and replayed right after `SessionStarted`.
 
+**Debian packages ([plan](../plans/20260805-03-debian-packages.md),
+[armhf](../plans/20260805-04-armhf-package.md)) — implemented; hardware
+validation pending.** The receiver ships as a `.deb` for **amd64**, **arm64**
+and **armhf**, each built by the release (amd64/arm64 natively, armhf
+cross-compiled — no 32-bit ARM runners exist), attested, and attached to the
+GitHub Release. Installing one yields a systemd service running as its own
+`openairplay2` user, configured through `/etc/default/openairplay2-receiver`,
+with the pairing identity in `/var/lib/openairplay2` so upgrades never force a
+re-pair. Publishing a GitHub Release is now the only event that ships anything:
+`release.yml` checks the tag against the crate version and dispatches
+`cargo.yml` (crates.io) and `debian.yml` (the architecture matrix) in parallel.
+The binary also handles SIGTERM, which is how systemd stops it.
+
 ## Design: no PTP, by intent
 
 This receiver targets **one Mac → one stream → one output** and does **not**
