@@ -100,6 +100,7 @@ mod tests {
             source_version: "366.0".into(),
             features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
+            password: None,
         };
         (config, Identity::generate())
     }

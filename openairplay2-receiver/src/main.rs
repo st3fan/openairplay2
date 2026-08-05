@@ -23,12 +23,14 @@ struct Args {
     avahi: bool,
     /// ALSA device, or `None` for `--no-audio`.
     alsa_device: Option<String>,
+    /// Require this PIN to pair; `None` → default `3939`.
+    password: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay2-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio]"
+         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio] [--password CODE]"
     );
     std::process::exit(2);
 }
@@ -51,6 +53,7 @@ fn parse_args() -> Args {
         identity_file: None,
         avahi: true,
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
+        password: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -77,6 +80,7 @@ fn parse_args() -> Args {
             "--no-avahi" => args.avahi = false,
             "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
             "--no-audio" => args.alsa_device = None,
+            "--password" => args.password = Some(it.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -112,6 +116,9 @@ async fn main() -> ExitCode {
     if let Some(mac) = args.mac {
         builder = builder.mac(mac);
     }
+    if let Some(password) = args.password {
+        builder = builder.password(password);
+    }
     let receiver = match builder.build() {
         Ok(receiver) => receiver,
         Err(e) => {
@@ -127,6 +134,11 @@ async fn main() -> ExitCode {
         receiver.config().port,
         receiver.identity().public_key_hex()
     );
+    // The pairing PIN is a secret: say whether one is set, never the value.
+    match &receiver.config().password {
+        Some(_) => info!("pairing pin: configured (a sender must enter it to pair)"),
+        None => info!("pairing pin: default"),
+    }
     match &args.alsa_device {
         Some(dev) => info!("audio output: ALSA \"{dev}\""),
         None => info!("audio output: disabled (--no-audio)"),

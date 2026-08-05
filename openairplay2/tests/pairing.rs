@@ -24,6 +24,10 @@ impl AudioSink for TestSink {
 }
 
 async fn start() -> SocketAddr {
+    start_with_password(None).await
+}
+
+async fn start_with_password(password: Option<&str>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let sink_factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
@@ -37,6 +41,7 @@ async fn start() -> SocketAddr {
             source_version: "366.0".into(),
             features: 0x0001_8340_405F_CA00,
             status_flags: 0x4,
+            password: password.map(str::to_string),
         },
         identity: Identity::generate(),
         sink_factory,
@@ -321,4 +326,57 @@ async fn read_encrypted_http(
         cipherbuf.drain(0..used);
         plain.extend_from_slice(&pt);
     }
+}
+
+/// Drive M1→M3 over a fresh connection as a client presenting `client_pin`
+/// to the server at `addr`. Returns the client, its M1 proof, and the decoded
+/// M4 response TLV (error or success).
+async fn pair_over_socket(addr: SocketAddr, client_pin: &str) -> (SrpClient, Vec<u8>, Tlv) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    let mut m1 = Tlv::new();
+    m1.put_u8(ty::STATE, 1)
+        .put_u8(ty::METHOD, 0)
+        .put_u8(ty::FLAGS, 0x10);
+    let (_, body) = plain_request(
+        &mut stream,
+        "POST /pair-setup RTSP/1.0\r\nCSeq: 0",
+        &m1.encode(),
+    )
+    .await;
+    let m2 = Tlv::decode(&body).unwrap();
+    let salt = m2.get(ty::SALT).unwrap();
+    let b = m2.get(ty::PUBLIC_KEY).unwrap();
+
+    let mut client = SrpClient::new(client_pin);
+    let proof = client.process(salt, b);
+    let mut m3 = Tlv::new();
+    m3.put_u8(ty::STATE, 3)
+        .put(ty::PUBLIC_KEY, client.public_a())
+        .put(ty::PROOF, proof.to_vec());
+    let (_, body) = plain_request(
+        &mut stream,
+        "POST /pair-setup RTSP/1.0\r\nCSeq: 1",
+        &m3.encode(),
+    )
+    .await;
+    (client, proof.to_vec(), Tlv::decode(&body).unwrap())
+}
+
+#[tokio::test]
+async fn configured_pin_is_enforced_over_the_socket() {
+    let addr = start_with_password(Some("1234")).await;
+
+    // A client with the wrong PIN fails SRP: M4 carries the auth error.
+    let (_client, _proof, m4) = pair_over_socket(addr, "0000").await;
+    assert_eq!(m4.get_u8(ty::ERROR), Some(0x02), "wrong PIN is refused");
+
+    // A client with the right PIN pairs: M4 carries no error and verifies.
+    let (client, proof, m4) = pair_over_socket(addr, "1234").await;
+    assert_eq!(m4.get_u8(ty::STATE), Some(4));
+    assert_eq!(m4.get_u8(ty::ERROR), None, "no error on the correct PIN");
+    assert!(
+        client.verify_hamk(m4.get(ty::PROOF).unwrap(), &proof),
+        "HAMK must verify with the configured PIN"
+    );
 }

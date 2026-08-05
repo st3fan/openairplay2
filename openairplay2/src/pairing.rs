@@ -15,7 +15,9 @@ const STATE_M2: u8 = 2;
 const STATE_M4: u8 = 4;
 const FLAG_TRANSIENT: u8 = 0x10;
 const ERROR_AUTHENTICATION: u8 = 0x02;
-const PAIR_SETUP_PIN: &str = "3939";
+/// The default pairing PIN, used when no password is configured. AirPlay 2
+/// always pairs, so unlike openairplay1 there is no "open" mode.
+pub const PAIR_SETUP_PIN: &str = "3939";
 
 pub enum Outcome {
     /// A TLV response; the exchange continues.
@@ -30,15 +32,20 @@ pub enum Outcome {
     Failed(Vec<u8>),
 }
 
-#[derive(Default)]
 pub struct PairSetup {
     srp: Option<SrpServer>,
     transient: bool,
+    pin: String,
 }
 
 impl PairSetup {
-    pub fn new() -> PairSetup {
-        PairSetup::default()
+    /// Start a pair-setup exchange that authenticates with `pin`.
+    pub fn new(pin: &str) -> PairSetup {
+        PairSetup {
+            srp: None,
+            transient: false,
+            pin: pin.to_string(),
+        }
     }
 
     /// Process one `POST /pair-setup` request body (TLV8).
@@ -64,7 +71,7 @@ impl PairSetup {
             .is_some_and(|b| b & FLAG_TRANSIENT != 0);
         info!("pair-setup M1 (transient={})", self.transient);
 
-        let srp = SrpServer::new(PAIR_SETUP_PIN);
+        let srp = SrpServer::new(&self.pin);
         let mut response = Tlv::new();
         response
             .put_u8(ty::STATE, STATE_M2)
@@ -128,7 +135,7 @@ mod tests {
     /// shared secret from both sides.
     #[test]
     fn transient_pair_setup_completes_with_matching_secret() {
-        let mut setup = PairSetup::new();
+        let mut setup = PairSetup::new(PAIR_SETUP_PIN);
 
         // M1: client starts, transient flag set.
         let mut m1 = Tlv::new();
@@ -142,7 +149,7 @@ mod tests {
         assert_eq!(m2.get_u8(ty::STATE), Some(2));
 
         // Client computes its proof from the salt and B.
-        let mut client = SrpClient::new("3939");
+        let mut client = SrpClient::new(PAIR_SETUP_PIN);
         let m1_proof = client.process(m2.get(ty::SALT).unwrap(), m2.get(ty::PUBLIC_KEY).unwrap());
 
         // M3: client sends A + proof.
@@ -166,7 +173,7 @@ mod tests {
 
     #[test]
     fn wrong_pin_fails_at_m3() {
-        let mut setup = PairSetup::new();
+        let mut setup = PairSetup::new(PAIR_SETUP_PIN);
         let mut m1 = Tlv::new();
         m1.put_u8(ty::STATE, 1)
             .put_u8(ty::METHOD, 0)
@@ -188,5 +195,39 @@ mod tests {
             }
             _ => panic!("expected failure"),
         }
+    }
+
+    /// A configured room PIN authenticates a client that knows it and refuses
+    /// one that does not.
+    #[test]
+    fn configured_pin_is_enforced() {
+        // A client that knows the configured PIN pairs successfully.
+        let correct = full_pair_setup("1234", "1234");
+        assert!(matches!(correct, Outcome::Done { .. }), "correct PIN pairs");
+
+        // A client with the wrong PIN fails SRP authentication.
+        let wrong = full_pair_setup("1234", "0000");
+        assert!(matches!(wrong, Outcome::Failed(_)), "wrong PIN is refused");
+    }
+
+    /// Run a full M1→M3 exchange against a PairSetup using `server_pin` with a
+    /// client presenting `client_pin`, returning the outcome of M3.
+    fn full_pair_setup(server_pin: &str, client_pin: &str) -> Outcome {
+        let mut setup = PairSetup::new(server_pin);
+        let mut m1 = Tlv::new();
+        m1.put_u8(ty::STATE, 1)
+            .put_u8(ty::METHOD, 0)
+            .put_u8(ty::FLAGS, 0x10);
+        let m2 = match setup.handle(&m1.encode()) {
+            Outcome::Continue(r) => Tlv::decode(&r).unwrap(),
+            other => return other,
+        };
+        let mut client = SrpClient::new(client_pin);
+        let proof = client.process(m2.get(ty::SALT).unwrap(), m2.get(ty::PUBLIC_KEY).unwrap());
+        let mut m3 = Tlv::new();
+        m3.put_u8(ty::STATE, 3)
+            .put(ty::PUBLIC_KEY, client.public_a())
+            .put(ty::PROOF, proof.to_vec());
+        setup.handle(&m3.encode())
     }
 }

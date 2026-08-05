@@ -90,6 +90,13 @@ pub struct Config {
     pub features: u64,
     /// AirPlay status flags.
     pub status_flags: u32,
+    /// AirPlay 2 has no AirPlay 1-style password; its access control is
+    /// pairing. `Some` → a sender must present this value in transient
+    /// pair-setup to stream (a room PIN, entered on the sender when it
+    /// pairs); `None` → the historical default PIN `3939`. Unlike
+    /// openairplay1, `None` is *not* an "open" mode — AirPlay 2 always
+    /// requires pairing. Never logged.
+    pub password: Option<String>,
 }
 
 impl Config {

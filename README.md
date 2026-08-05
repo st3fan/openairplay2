@@ -75,6 +75,7 @@ cargo install openairplay2-receiver
 | `--alsa-device NAME` | ALSA output device to play to | `default` |
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
+| `--password CODE` | Require this PIN to pair (entered on the sender when it first connects); unset = the default `3939`. The PIN is never logged. | default `3939` |
 | `-h`, `--help` | Print usage and exit | — |
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real

@@ -60,7 +60,14 @@ async fn handle_connection(
     let local_ip = stream.local_addr()?.ip();
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
-    let mut pair = PairSetup::new();
+    // The room PIN: a configured password, or the historical default. AirPlay
+    // 2 always pairs, so there is no "open" mode.
+    let pin = context
+        .config
+        .password
+        .as_deref()
+        .unwrap_or(crate::pairing::PAIR_SETUP_PIN);
+    let mut pair = PairSetup::new(pin);
     let mut session = Session::new(
         local_ip,
         context.sink_factory.clone(),

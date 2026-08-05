@@ -43,6 +43,7 @@ pub struct ReceiverBuilder {
     identity: Option<Identity>,
     identity_path: Option<PathBuf>,
     advertise: bool,
+    password: Option<String>,
 }
 
 impl ReceiverBuilder {
@@ -54,6 +55,7 @@ impl ReceiverBuilder {
             identity: None,
             identity_path: None,
             advertise: true,
+            password: None,
         }
     }
 
@@ -100,6 +102,15 @@ impl ReceiverBuilder {
         self
     }
 
+    /// Require this PIN in transient pair-setup before a sender may stream.
+    /// AirPlay 2's analog of openairplay1's `--password`: a sender must enter
+    /// it (typically numeric) when it first pairs. When unset, the historical
+    /// default `3939` is used. The value is never logged.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
     /// Resolve the identity and MAC and produce a runnable [`Receiver`].
     pub fn build(self) -> io::Result<Receiver> {
         let identity = match (self.identity, &self.identity_path) {
@@ -132,6 +143,7 @@ impl ReceiverBuilder {
                 source_version: DEFAULT_SOURCE_VERSION.to_string(),
                 features: DEFAULT_FEATURES,
                 status_flags: DEFAULT_STATUS_FLAGS,
+                password: self.password,
             },
             identity,
             advertise: self.advertise,
