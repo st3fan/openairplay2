@@ -122,8 +122,20 @@ before phase 3/4 code is written:
 > - a **wrong** pincode → `pair-setup M3: SRP proof verification failed`;
 > - the **correct** pincode → `pair-setup M4 (persistent): SRP ok, awaiting M5`.
 > So the pincode gate (bit 7 → `pair-pin-start` prompt → SRP with the pincode)
-> is confirmed. The remaining gap to *music* is completing the persistent
-> identity exchange (M5/M6) and then `/pair-verify`.
+> is confirmed.
+>
+> **Final result (2026-08-05) — pincode protection works end to end and
+> streams.** With `--pincode 1212`, a fresh identity, and the M4 response
+> installing the encrypted channel (like the transient path — iOS sends
+> nothing after M4 unless the channel goes encrypted), a real iPhone: prompts →
+> accepts the right pincode (wrong is rejected at SRP) → the channel encrypts →
+> runs `/fp-setup`, `SETUP`, transport, and streams audio (metadata, artwork
+> and `progress` arrive). **Crucially, iOS does NOT send M5/M6 in this pin
+> flow** — it completes at M4 + encrypted channel and goes straight to the
+> session. So the persistent identity exchange is not exercised here; `pair-
+> verify`/durable controller storage is a separate follow-up (needed only for
+> the "remembered device, no code next time" nicety; iOS itself remembers the
+> pincode sender-side between runs).
 >
 > **The iOS dialog is a free-text "password", not a numeric PIN.** iOS labels
 > the entry "password" and accepts arbitrary strings, so `--pincode` may be any
