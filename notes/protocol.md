@@ -102,17 +102,35 @@ This is the HomeKit Accessory Protocol "Pairing" sub-spec (HAP-R2).
 These are not assumed; they are captured from a real sender and recorded here
 before phase 3/4 code is written:
 
-- **M5/M6 identity envelope**: the exact HKDF salt/info strings and the
-  derived-key layout (encryption key for the ChaCha20 envelope) that iOS uses.
-- **pair-verify** M1→M4: the exact request/response TLVs (key fields,
-  signature layout) and the HKDF info strings for the session key.
-- **iOS prompt**: with a fresh receiver identity, does iOS show a
-  "enter the setup code" dialog on first contact, and does it accept the
-  configured `--password`? (This is what makes it a usable pincode.)
-- **Advertising bits**: which `features`/`status` bits make a sender choose
-  persistent pairing over transient (`sf`, etc.).
-- **Storage**: what a controller's record must contain for a later
-  `pair-verify` and a later re-setup.
+> **Captured 2026-08-05 (iPhone, iOS 26) — the mechanism is confirmed.** With
+> status-flag bit 7 ("Password required"; `0x4` → `0x84` alongside
+> audio-attached) set, iOS **stopped sending transient pair-setup** and
+> instead sent **`POST /pair-pin-start`**, then disconnected when we answered
+> `501` ("Unable to connect"). So the pincode flow is:
+>
+> ```
+> status-flag bit 7 set  ->  iOS sends /pair-pin-start  ->  persistent
+> /pair-setup (M1-M6, SRP with the setup code)  ->  /pair-verify (M1-M4)
+> ```
+>
+> Shairport-sync's `handle_pair_pin_start` answers `/pair-pin-start` with an
+> **empty 200** — "the client calls /pair-pin-start and the device displays the
+> code". For a headless receiver the code is our configured `--password`; the
+> user types it on the sender, which uses it as the SRP password in the
+> subsequent persistent `/pair-setup`.
+
+- **M5/M6 identity envelope (still to capture)**: the exact HKDF salt/info
+  strings and the derived-key layout (the ChaCha20 pair-setup envelope). Once
+  the receiver answers `/pair-pin-start` and the SRP steps of persistent
+  `/pair-setup`, record the M5/M6 `EncryptedData` bytes.
+- **pair-verify** M1→M4 (still to capture): the exact request/response TLVs
+  and the HKDF info strings for the session key.
+- **iOS code prompt**: with bit 7 set and `/pair-pin-start` answered, does iOS
+  show the "enter the code on the device" dialog and accept the configured
+  `--password`? (Expected from the HAP one-time-code flow; to confirm in
+  phase 3.)
+- **Storage**: what a controller record must contain for a later `pair-verify`
+  and a later re-setup.
 
 These fill sections below; until then the "ground truth" is shairport-sync's
 `pair_ap` and the HAP spec, cited above.
