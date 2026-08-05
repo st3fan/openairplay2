@@ -8,7 +8,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::cipher::control_channel;
@@ -42,11 +42,11 @@ pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<(
         let (stream, peer) = listener.accept().await?;
         let context = context.clone();
         tokio::spawn(async move {
-            info!("[{peer}] connected");
+            debug!("[{peer}] connected");
             if let Err(e) = handle_connection(stream, peer, context).await {
                 warn!("[{peer}] connection error: {e}");
             }
-            info!("[{peer}] disconnected");
+            debug!("[{peer}] disconnected");
         });
     }
 }
@@ -101,7 +101,7 @@ async fn handle_connection(
         // the sender, and is used as the SRP password in the `pair-setup`
         // that follows.
         if request.method == "POST" && request.target == "/pair-pin-start" {
-            info!("pair-pin-start: asking the sender for the pincode");
+            debug!("pair-pin-start: asking the sender for the pincode");
             let response = finalize(Response::ok(&request.protocol), &request);
             conn.write_response(&response).await?;
             continue;
@@ -120,7 +120,7 @@ async fn handle_connection(
 
 fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
     let lock = if encrypted { " [enc]" } else { "" };
-    info!(
+    debug!(
         "[{peer}]{lock} {} {} {}",
         request.method, request.target, request.protocol
     );

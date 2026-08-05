@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 use plist::{Dictionary, Value};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, UdpSocket};
@@ -112,11 +112,11 @@ impl Session {
             .get("timingProtocol")
             .and_then(|v| v.as_string())
             .unwrap_or("(none)");
-        info!("SETUP phase 1: timingProtocol={timing}");
+        debug!("SETUP phase 1: timingProtocol={timing}");
 
         let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let event_port = listener.local_addr()?.port();
-        info!("SETUP phase 1: event port {event_port}");
+        debug!("SETUP phase 1: event port {event_port}");
         self.tasks.push(tokio::spawn(event_channel(listener)));
 
         let self_ip = self.local_ip.to_string();
@@ -155,7 +155,7 @@ impl Session {
             .and_then(|v| v.as_data())
             .map(<[u8]>::to_vec);
         let spf = stream.get("spf").and_then(|v| v.as_unsigned_integer());
-        info!(
+        debug!(
             "SETUP phase 2: type={stream_type:?} audioFormat={:?} spf={spf:?} shk={}",
             self.audio_format,
             self.stream_key.as_ref().map_or(0, Vec::len)
@@ -176,7 +176,7 @@ impl Session {
             self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
             port
         };
-        info!("SETUP phase 2: data port {data_port}, control port {control_port}");
+        debug!("SETUP phase 2: data port {data_port}, control port {control_port}");
 
         let mut stream_response = Dictionary::new();
         stream_response.insert(
@@ -243,7 +243,7 @@ impl Session {
                     max_queued,
                     self.flush_until_seq.clone(),
                 )));
-                info!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
+                debug!("buffered audio: TCP data port {port}, {rate} Hz {channels}ch");
             }
             (None, _) => {
                 warn!("buffered audio: missing/invalid shk; draining without decode");
@@ -452,7 +452,7 @@ async fn audio_channel(socket: UdpSocket, label: &'static str) {
             Ok(n) => {
                 count += 1;
                 if count <= 3 || count.is_multiple_of(250) {
-                    info!("{label}: {count} packets, last {n} bytes");
+                    debug!("{label}: {count} packets, last {n} bytes");
                 }
             }
             Err(e) => {
@@ -510,7 +510,7 @@ async fn buffered_audio(
     let Ok((mut stream, peer)) = listener.accept().await else {
         return;
     };
-    info!("buffered audio connected from {peer}");
+    debug!("buffered audio connected from {peer}");
 
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
@@ -563,7 +563,7 @@ async fn buffered_audio(
             }
         }
     }
-    info!("buffered audio disconnected ({decrypt_failures} decrypt failures, {skipped} skipped)");
+    debug!("buffered audio disconnected ({decrypt_failures} decrypt failures, {skipped} skipped)");
 }
 
 /// The `FLUSHBUFFERED` discard filter for still-arriving packets: skip while
