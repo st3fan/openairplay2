@@ -1,0 +1,20 @@
+# Options for openairplay2-receiver, passed to the daemon as command-line
+# arguments. Run `openairplay2-receiver --help` for the full list, and
+# `systemctl restart openairplay2-receiver` after editing this file.
+#
+#   --name NAME               name senders see          (default OpenAirPlay2)
+#   --alsa-device NAME        ALSA output device        (default "default")
+#   --port PORT               control port              (default 7000)
+#   --pincode CODE            require this pincode to pair; without it any
+#                             device on the network can pair
+#   --no-avahi                do not advertise over mDNS
+#   --no-audio                decode but do not open ALSA (silent test run)
+#
+# --identity-file is set by the systemd unit and should not be repeated here.
+#
+# This file is root-owned and mode 0640 because a pincode is a secret.
+
+OPENAIRPLAY2_ARGS="--name OpenAirPlay2 --alsa-device default"
+
+# Set RUST_LOG=debug for the full protocol trace (very chatty while playing).
+#RUST_LOG=debug

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# The openairplay2 user and /var/lib/openairplay2 (the pairing identity) are
+# deliberately kept on remove and purge: Debian policy prefers a leftover
+# system user to uid reuse, and a purge that silently made every paired
+# sender re-pair would be a surprise. Remove them by hand if you mean it:
+#   deluser --system openairplay2 && rm -rf /var/lib/openairplay2
+
+#DEBHELPER#

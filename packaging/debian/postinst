@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Dedicated system user; audio group membership for the ALSA device.
+if ! getent passwd openairplay2 >/dev/null; then
+    adduser --system --group --no-create-home --home /nonexistent openairplay2
+fi
+if ! id -nG openairplay2 | grep -qw audio; then
+    adduser openairplay2 audio
+fi
+
+#DEBHELPER#
