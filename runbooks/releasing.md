@@ -13,9 +13,10 @@ workflows that run in parallel:
   depends on it and its pre-publish verification build resolves the library
   from the registry, not the workspace.
 - [debian.yml](../.github/workflows/debian.yml) — builds
-  `openairplay2-receiver_X.Y.Z-1_{amd64,arm64}.deb` (both natively, in
-  parallel, in `debian:trixie` containers), signs a provenance attestation for
-  each, and attaches them plus `SHA256SUMS` to the release.
+  `openairplay2-receiver_X.Y.Z-1_{amd64,arm64,armhf}.deb` in parallel, in
+  `debian:trixie` containers (amd64 and arm64 natively; armhf cross-compiled,
+  since no 32-bit ARM runners exist), signs a provenance attestation for each,
+  and attaches them plus `SHA256SUMS` to the release.
 
 ## One-time setup (first release only)
 
@@ -60,8 +61,13 @@ version line for everything — library, binary, and `.deb`.
 
   ```sh
   cargo publish --dry-run -p openairplay2
-  ./packaging/build-deb.sh
+  ./packaging/build-deb.sh              # native (this machine's architecture)
   ```
+
+  Building armhf locally needs the cross toolchain once
+  (`./packaging/setup-build.sh cross` on an amd64 box), after which
+  `./packaging/build-deb.sh armhf` works; CI does the same thing, so this is
+  only for reproducing a packaging problem.
 
 - Open the PR; Stefan merges it. The bump must be on `main` **before** the
   release: the workflow asserts the tag matches
@@ -112,7 +118,7 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 ## Testing the workflow without releasing
 
 - **Packaging changes:** run `debian.yml` on its own from the Actions tab
-  (workflow_dispatch, any branch). It builds both architectures and leaves the
+  (workflow_dispatch, any branch). It builds all three architectures and leaves the
   `.deb`s as workflow artifacts; with no tag, nothing is attached or
   published.
 - **The whole thing:** tag `vX.Y.Z-rcN` with `--prerelease` (optionally

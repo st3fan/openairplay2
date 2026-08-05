@@ -50,7 +50,8 @@ The milestone-by-milestone development history is in
 
 ## Install (Debian / Ubuntu)
 
-Every release carries a `.deb` for **amd64** and **arm64**. Download the one
+Every release carries a `.deb` for **amd64**, **arm64** and **armhf** (Debian's
+ARMv7 port — ARMv6 boards like the Pi Zero W are not supported). Download the one
 for your machine from the
 [releases page](https://github.com/st3fan/openairplay2/releases) and install
 it — it brings a systemd service that starts at boot:

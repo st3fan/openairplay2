@@ -140,7 +140,8 @@ Operational procedures live in `runbooks/`. When asked to do a **release**, foll
 [runbooks/releasing.md](runbooks/releasing.md) — publishing a GitHub Release is the only event
 that ships anything: [release.yml](.github/workflows/release.yml) checks the tag against the
 crate version and dispatches [cargo.yml](.github/workflows/cargo.yml) (crates.io) and
-[debian.yml](.github/workflows/debian.yml) (amd64 + arm64 `.deb`s, attached to the release) in
+[debian.yml](.github/workflows/debian.yml) (amd64 + arm64 + armhf `.deb`s, attached to the
+release) in
 parallel. The runbook also holds the failure procedure and the autopilot arrangement. CI
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux and the
 library on macOS for every PR — the macOS portability deliverable is enforced there.
