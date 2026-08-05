@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use log::{debug, info};
+use tokio::signal::unix::SignalKind;
 
 mod player;
 
@@ -95,6 +96,25 @@ fn default_identity_path() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".config/openairplay2/identity"),
         None => PathBuf::from("openairplay2.identity"),
+    }
+}
+
+/// Resolves on Ctrl-C or on SIGTERM — the latter is how systemd stops a
+/// service, and without a handler it would kill the process outright.
+async fn shutdown_signal() {
+    let mut sigterm = match tokio::signal::unix::signal(SignalKind::terminate()) {
+        Ok(sigterm) => sigterm,
+        // Nothing to fall back to but Ctrl-C; the default SIGTERM disposition
+        // still terminates the process, just not gracefully.
+        Err(e) => {
+            debug!("cannot listen for SIGTERM ({e}); Ctrl-C only");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
     }
 }
 
@@ -198,7 +218,7 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             info!("shutting down");
         }
     }

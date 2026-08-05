@@ -10,6 +10,47 @@ readme = "../README.md"
 keywords = ["airplay", "airplay2", "audio", "receiver", "alsa"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
+# .deb packaging for amd64/arm64 via ../packaging/build-deb.sh (native builds
+# only). Depends are pinned to trixie's package names — identical on both
+# architectures — rather than left to cargo-deb's shlibdeps guess, so the two
+# release legs produce identical metadata.
+[package.metadata.deb]
+name = "openairplay2-receiver"
+maintainer = "Stefan Arentz <stefan.arentz@gmail.com>"
+copyright = "2026 Stefan Arentz"
+extended-description = """\
+An AirPlay 2 audio receiver: a Mac or iPhone discovers it over mDNS, pairs \
+with it (HomeKit transient pairing, optionally behind a pincode), and streams \
+AAC to it; audio comes out of an ALSA device with working pause, seek and \
+volume. One sender, one stream, one output — no multi-room grouping."""
+section = "sound"
+priority = "optional"
+# adduser: postinst creates the openairplay2 system user with it.
+depends = "libasound2t64, libc6, adduser"
+# The receiver runs without Avahi — it warns, is simply undiscoverable, and
+# --no-avahi is a supported mode — so this is Recommends, not Depends.
+recommends = "avahi-daemon"
+assets = [
+    ["target/release/openairplay2-receiver", "usr/bin/", "755"],
+    [
+        "../packaging/openairplay2-receiver.default",
+        "etc/default/openairplay2-receiver",
+        "640",
+    ],
+    ["../README.md", "usr/share/doc/openairplay2-receiver/README.md", "644"],
+]
+# A pincode is a secret: root-owned, 0640, and preserved across upgrades.
+conf-files = ["/etc/default/openairplay2-receiver"]
+maintainer-scripts = "../packaging/debian"
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "../packaging"
+enable = true
+start = true
+# An upgrade must swap the running daemon, not leave the old binary serving
+# until someone remembers to restart it.
+restart-after-upgrade = true
+
 [dependencies]
 # The version makes this publishable; the path keeps workspace builds local.
 openairplay2 = { path = "../openairplay2", version = "0.2.0" }

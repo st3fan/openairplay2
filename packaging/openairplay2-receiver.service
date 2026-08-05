@@ -1,0 +1,31 @@
+[Unit]
+Description=OpenAirPlay 2 audio receiver
+Documentation=https://github.com/st3fan/openairplay2
+After=network-online.target avahi-daemon.service
+Wants=network-online.target avahi-daemon.service
+
+[Service]
+# Options live in /etc/default/openairplay2-receiver (a conffile, so local
+# edits survive upgrades). systemd reads it as root, before dropping to the
+# service user, which is what keeps --pincode readable only by root.
+EnvironmentFile=-/etc/default/openairplay2-receiver
+# --identity-file is here rather than in the options file: a system unit has
+# no HOME, so the binary's ~/.config default would land in the working
+# directory. Senders remember this receiver by the identity's public key, so
+# it has to live somewhere stable — StateDirectory gives us /var/lib.
+ExecStart=/usr/bin/openairplay2-receiver --identity-file /var/lib/openairplay2/identity $OPENAIRPLAY2_ARGS
+User=openairplay2
+Group=openairplay2
+# The ALSA device (/dev/snd/*) is group-owned by "audio"; PrivateDevices=
+# would hide it, so it is deliberately not set.
+SupplementaryGroups=audio
+StateDirectory=openairplay2
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
