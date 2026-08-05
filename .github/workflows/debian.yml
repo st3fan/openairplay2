@@ -1,10 +1,12 @@
-# Builds openairplay2-receiver .deb packages for amd64 and arm64, and — when
-# called with a release tag — attaches them to that GitHub Release.
+# Builds openairplay2-receiver .deb packages for amd64, arm64 and armhf, and —
+# when called with a release tag — attaches them to that GitHub Release.
 #
-# Both architectures build NATIVELY and in parallel: amd64 on ubuntu-latest,
-# arm64 on the free public arm64 runners, each inside a debian:trixie
-# container so the binary links against Debian 13's glibc and ALSA. The
-# receiver links nothing exotic, so there is no cross-compilation anywhere.
+# amd64 and arm64 build NATIVELY: amd64 on ubuntu-latest, arm64 on the free
+# public arm64 runners. armhf (Debian's ARMv7 port) cross-compiles on an amd64
+# host via Debian multiarch, because no 32-bit ARM runners exist — its tests
+# are therefore not run; the other two legs cover them. All three run in
+# parallel inside debian:trixie containers, so the binaries link against
+# Debian 13's glibc and ALSA.
 #
 # Called by release.yml; can also be run by hand from the Actions tab to
 # smoke-test a packaging change (no tag → the packages are built and kept as
@@ -34,26 +36,36 @@ jobs:
       id-token: write
       attestations: write
     strategy:
-      # One leg's failure (a runner or docker-pull flake) must not cancel the
-      # other architecture's build.
+      # One leg's failure (a runner or docker-pull flake, or armhf breaking)
+      # must not cancel the other architectures' builds.
       fail-fast: false
       matrix:
         include:
           - arch: amd64
             runner: ubuntu-latest
+            setup: native
           - arch: arm64
             runner: ubuntu-24.04-arm
+            setup: native
+          - arch: armhf
+            runner: ubuntu-latest
+            setup: cross
     runs-on: ${{ matrix.runner }}
     container: debian:trixie
     steps:
       # git must be present before checkout, or actions/checkout silently
-      # falls back to a tarball download without a .git directory.
-      - name: Install build dependencies
+      # falls back to a tarball download without a .git directory. The rest
+      # comes from packaging/setup-build.sh once the checkout exists, so CI
+      # and the build box install the same set.
+      - name: Install git
         run: |
           apt-get update
-          apt-get install -y git ca-certificates curl build-essential pkg-config libasound2-dev
+          apt-get install -y git ca-certificates curl
 
       - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: ./packaging/setup-build.sh ${{ matrix.setup }}
 
       # trixie's rustc is older than the crates' rust-version; use rustup.
       - name: Install Rust
@@ -66,24 +78,30 @@ jobs:
         with:
           key: ${{ matrix.arch }}
 
+      # The armhf leg cross-compiles on an amd64 host; its binaries cannot be
+      # executed here, and the amd64 leg runs the same tests anyway.
       - name: Test
+        if: matrix.setup == 'native'
         run: cargo test --workspace
 
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked
 
+      # Native and cross builds land in different directories, so the script
+      # reports the path it produced rather than the workflow globbing for it.
       - name: Build .deb
+        id: build
         run: ./packaging/build-deb.sh ${{ matrix.arch }}
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: target/debian/openairplay2-receiver_*_${{ matrix.arch }}.deb
+          subject-path: ${{ steps.build.outputs.deb }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: openairplay2-receiver-${{ matrix.arch }}
-          path: target/debian/openairplay2-receiver_*_${{ matrix.arch }}.deb
+          path: ${{ steps.build.outputs.deb }}
           if-no-files-found: error
 
   assets:

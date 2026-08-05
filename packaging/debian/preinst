@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+# The armhf package is built for Debian's ARMv7 baseline. dpkg cannot tell
+# Debian armhf (ARMv7) from Raspbian armhf (ARMv6) — a Pi Zero W would pass the
+# architecture check and then SIGILL at runtime — so refuse pre-ARMv7 hardware
+# up front. amd64 and arm64 machines pass through untouched.
+case "$(uname -m)" in
+armv[1-6]*)
+    echo "openairplay2-receiver: this package requires ARMv7 or newer; this machine is $(uname -m)" >&2
+    echo "openairplay2-receiver: ARMv6 boards (Pi Zero W, Pi 1) are not supported" >&2
+    exit 1
+    ;;
+esac
+
+#DEBHELPER#
