@@ -1,0 +1,112 @@
+# Builds openairplay2-receiver .deb packages for amd64 and arm64, and — when
+# called with a release tag — attaches them to that GitHub Release.
+#
+# Both architectures build NATIVELY and in parallel: amd64 on ubuntu-latest,
+# arm64 on the free public arm64 runners, each inside a debian:trixie
+# container so the binary links against Debian 13's glibc and ALSA. The
+# receiver links nothing exotic, so there is no cross-compilation anywhere.
+#
+# Called by release.yml; can also be run by hand from the Actions tab to
+# smoke-test a packaging change (no tag → the packages are built and kept as
+# workflow artifacts, and nothing is attached anywhere).
+name: Debian packages
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to attach the packages to; empty = build only
+        type: string
+        required: false
+        default: ""
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    # id-token + attestations: sign SLSA build provenance for the .deb
+    # (verify with `gh attestation verify`). This job never writes the repo.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      # One leg's failure (a runner or docker-pull flake) must not cancel the
+      # other architecture's build.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: debian:trixie
+    steps:
+      # git must be present before checkout, or actions/checkout silently
+      # falls back to a tarball download without a .git directory.
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y git ca-certificates curl build-essential pkg-config libasound2-dev
+
+      - uses: actions/checkout@v4
+
+      # trixie's rustc is older than the crates' rust-version; use rustup.
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: ./packaging/build-deb.sh ${{ matrix.arch }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: target/debian/openairplay2-receiver_*_${{ matrix.arch }}.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openairplay2-receiver-${{ matrix.arch }}
+          path: target/debian/openairplay2-receiver_*_${{ matrix.arch }}.deb
+          if-no-files-found: error
+
+  assets:
+    name: Attach to release
+    needs: build
+    if: inputs.tag != ''
+    # Not containerized: this job only moves files, and the runner image
+    # already has the gh CLI.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach .debs and checksums to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          gh release upload --repo "$GITHUB_REPOSITORY" "$TAG" --clobber -- *

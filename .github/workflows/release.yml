@@ -1,39 +1,66 @@
-# Release: pushing a v* tag publishes the library to crates.io.
+# Release: publishing a GitHub Release is the ONLY event that ships anything.
+# Nothing releases from a push or a pull request.
 #
-# Authentication is crates.io Trusted Publishing (GitHub OIDC): no API
-# token is stored in the repo. One-time setup and the full release
-# procedure live in runbooks/releasing.md.
+# This workflow is only the dispatcher: it checks the tag against the crate
+# version and then calls the two workflows that do the work, which run in
+# parallel and can also be run on their own:
+#
+#   cargo.yml    publish both crates to crates.io
+#   debian.yml   build the .debs (amd64 + arm64, in parallel) and attach them
+#
+# The filename matters: crates.io Trusted Publishing is configured for
+# release.yml, so the crates.io job must keep being reached from here.
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  # The tag is the single version for the release. Strict for real releases;
+  # warn-only for prereleases, so vX.Y.Z-rcN tags can exercise this workflow.
+  version:
+    name: Check tag matches crate version
     runs-on: ubuntu-latest
     permissions:
-      id-token: write # for crates.io Trusted Publishing (OIDC)
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Install ALSA headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Test before publishing
-        run: cargo test --workspace
-      - name: Authenticate with crates.io
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish openairplay2
-        run: cargo publish -p openairplay2
+      - name: Compare tag with openairplay2-receiver/Cargo.toml
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      # cargo waits for the library to be available in the index before
-      # verifying the dependent binary crate.
-      - name: Publish openairplay2-receiver
-        run: cargo publish -p openairplay2-receiver
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          version="${TAG#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' openairplay2-receiver/Cargo.toml | head -1)
+          if [ "$version" != "$crate" ]; then
+            message="tag $TAG does not match openairplay2-receiver/Cargo.toml version $crate"
+            if [ "$PRERELEASE" = "true" ]; then
+              echo "::warning::$message (allowed: prerelease)"
+            else
+              echo "::error::$message"
+              exit 1
+            fi
+          fi
+
+  cargo:
+    name: crates.io
+    needs: version
+    permissions:
+      id-token: write # crates.io Trusted Publishing (OIDC)
+      contents: read
+    uses: ./.github/workflows/cargo.yml
+
+  debian:
+    name: Debian packages
+    needs: version
+    permissions:
+      contents: write # attach the .debs to the release
+      id-token: write # sign the build provenance attestation
+      attestations: write
+    uses: ./.github/workflows/debian.yml
+    with:
+      tag: ${{ github.event.release.tag_name }}
