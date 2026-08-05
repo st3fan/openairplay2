@@ -1,7 +1,7 @@
 # OpenAirPlay2 — AirPlay 2 pairing & "pincode" protocol notes
 
 These notes record what this project understands about **AirPlay 2 pairing**
-while building its optional `--password` ("pincode") protection. They are
+while building its optional `--pincode` ("pincode") protection. They are
 research- and source-verified (shairport-sync's `pair_ap` pairing library and
 the HomeKit Accessory Protocol *Pairing* sub-spec), and are being pinned
 empirically against a real sender in Phase 2 of
@@ -28,7 +28,7 @@ pairing exists in two flavours (from shairport-sync's `pair_ap/README.md`):
   pairing, and **henceforth authenticates with `/pair-verify`**.
 
 A live test settled which of these a user-facing "pincode" maps to: setting
-`--password 4321` on the (then transient-only) receiver made an iPhone on
+`--pincode 4321` on the (then transient-only) receiver made an iPhone on
 iOS 26 send a `transient=true` M1 and an M3 proof derived from the **fixed
 `3939`**; SRP verification failed and iOS gave up with "Unable to connect".
 Transient pairing has no place for a user-entered code, so **the pincode is
@@ -115,9 +115,25 @@ before phase 3/4 code is written:
 >
 > Shairport-sync's `handle_pair_pin_start` answers `/pair-pin-start` with an
 > **empty 200** — "the client calls /pair-pin-start and the device displays the
-> code". For a headless receiver the code is our configured `--password`; the
-> user types it on the sender, which uses it as the SRP password in the
-> subsequent persistent `/pair-setup`.
+> code". For a headless receiver the code is our configured `--pincode`.
+>
+> **Captured (2026-08-05, iOS 26) — the SRP gate works.** With the receiver
+> using the configured pincode as the SRP password:
+> - a **wrong** pincode → `pair-setup M3: SRP proof verification failed`;
+> - the **correct** pincode → `pair-setup M4 (persistent): SRP ok, awaiting M5`.
+> So the pincode gate (bit 7 → `pair-pin-start` prompt → SRP with the pincode)
+> is confirmed. The remaining gap to *music* is completing the persistent
+> identity exchange (M5/M6) and then `/pair-verify`.
+>
+> **The iOS dialog is a free-text "password", not a numeric PIN.** iOS labels
+> the entry "password" and accepts arbitrary strings, so `--pincode` may be any
+> value ("hello" works), not just digits.
+>
+> **The pair-setup `0x10` (transient) flag is NOT the transient-vs-pincode
+> discriminator.** iOS sends `flags=0x10` in the SRP M1 in *both* the no-code
+> and the pincode cases; the discriminator is whether a pincode is configured
+> (then it is the SRP password, and M4→M5 continues the persistent exchange).
+> Treating `0x10` as "no pincode" and refusing it is wrong.
 
 - **M5/M6 identity envelope (still to capture)**: the exact HKDF salt/info
   strings and the derived-key layout (the ChaCha20 pair-setup envelope). Once
@@ -125,10 +141,11 @@ before phase 3/4 code is written:
   `/pair-setup`, record the M5/M6 `EncryptedData` bytes.
 - **pair-verify** M1→M4 (still to capture): the exact request/response TLVs
   and the HKDF info strings for the session key.
-- **iOS code prompt**: with bit 7 set and `/pair-pin-start` answered, does iOS
-  show the "enter the code on the device" dialog and accept the configured
-  `--password`? (Expected from the HAP one-time-code flow; to confirm in
-  phase 3.)
+- **iOS code prompt (confirmed)**: with bit 7 set and `/pair-pin-start`
+  answered, iOS shows a free-text "password" dialog and accepts the configured
+  `--pincode` (wrong rejected at SRP, right passes to M5); arbitrary strings
+  work, not just digits. The still-open parts are the exact M5/M6 and
+  `/pair-verify` bytes below.
 - **Storage**: what a controller record must contain for a later `pair-verify`
   and a later re-setup.
 
