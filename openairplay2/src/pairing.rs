@@ -6,7 +6,7 @@
 //! (non-transient) pairing, which additionally exchanges Ed25519 identities in
 //! M5/M6, is not implemented here.
 
-use log::{info, warn};
+use log::{debug, warn};
 
 use crate::srp::SrpServer;
 use crate::tlv::{ty, Tlv};
@@ -68,7 +68,7 @@ impl PairSetup {
             .get(ty::FLAGS)
             .and_then(|f| f.first())
             .is_some_and(|b| b & FLAG_TRANSIENT != 0);
-        info!("pair-setup M1 (transient={})", self.transient);
+        debug!("pair-setup M1 (transient={})", self.transient);
 
         let srp = SrpServer::new(&self.pin);
         let mut response = Tlv::new();
@@ -103,7 +103,7 @@ impl PairSetup {
 
         if self.transient {
             let shared_secret = *srp.session_key().expect("session key set after verify");
-            info!("pair-setup complete (transient); channel now encrypted");
+            debug!("pair-setup complete (transient); channel now encrypted");
             Outcome::Done {
                 response,
                 shared_secret,

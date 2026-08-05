@@ -165,16 +165,16 @@ async fn main() -> ExitCode {
                     gain.set(volume_to_gain(db));
                 }
                 Event::SessionStarted { rate, channels } => {
-                    info!("session started ({rate} Hz, {channels}ch)");
+                    debug!("session started ({rate} Hz, {channels}ch)");
                 }
-                Event::SessionEnded => info!("session ended"),
+                Event::SessionEnded => debug!("session ended"),
                 Event::Metadata {
                     title,
                     artist,
                     album,
                 } => {
                     let field = |v: Option<String>| v.unwrap_or_else(|| "-".into());
-                    info!(
+                    debug!(
                         "now playing: {} — {} ({})",
                         field(artist),
                         field(title),
@@ -182,7 +182,7 @@ async fn main() -> ExitCode {
                     );
                 }
                 Event::Artwork { content_type, data } => {
-                    info!("artwork: {content_type}, {} bytes", data.len());
+                    debug!("artwork: {content_type}, {} bytes", data.len());
                 }
                 Event::Paused(paused) => debug!("paused: {paused}"),
                 Event::Flushed => debug!("flushed"),
