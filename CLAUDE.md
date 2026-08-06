@@ -8,7 +8,7 @@ An AirPlay 2 audio **receiver** (Rust) — the AirPlay 2 counterpart of
 [openairplay1](https://github.com/st3fan/openairplay1). A real Mac/iPhone discovers it, pairs
 with it, and streams AAC to it; audio comes out of an ALSA device with pause/seek/volume.
 
-A cargo workspace with two members:
+A cargo workspace with four members:
 
 - **`openairplay2/`** — the embeddable library: network → PCM. Owns discovery advertisement,
   pairing, the encrypted channel, SETUP, decrypt, AAC decode, and the pause/seek/backpressure
@@ -19,7 +19,16 @@ A cargo workspace with two members:
   (ALSA output, prebuffer cushion, dB→linear gain). It consumes only the library's public API
   (it is embedder #1). It is also what `packaging/` packages: a `.deb` (systemd unit,
   `/etc/default` options file, `openairplay2` system user) built by `packaging/build-deb.sh`
-  from `[package.metadata.deb]` in its `Cargo.toml`.
+  from `[package.metadata.deb]` in its `Cargo.toml`. `--tui-listen ADDR` serves the
+  now-playing WebSocket ([tui.rs](openairplay2-receiver/src/tui.rs)): a snapshot on connect,
+  then one message per change, over a bounded broadcast channel so a slow display can never
+  stall the audio path.
+- **`openairplay2-tui/`** — the full-screen now-playing display (ratatui + crossterm, Kitty and
+  iTerm2 terminal graphics for cover art). It depends on neither the library nor ALSA — a
+  WebSocket client and a renderer — so it builds and runs on macOS as well, and CI enforces
+  that. **`openairplay2-tui-protocol/`** is the serde-only wire format both ends share; its
+  JSON is pinned by fixture tests because a published format that drifts silently is worse
+  than none.
 
 Deliberate scope: **one sender → one stream → one output**. There is no PTP (UDP 319/320 is
 never bound, `SETUP` replies `timingPort: 0`) — PTP exists to align *multiple* outputs, and for

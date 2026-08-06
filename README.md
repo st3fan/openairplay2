@@ -32,6 +32,9 @@ The repository is a cargo workspace with two artifacts:
   tests on macOS as well as Linux.
 - **`openairplay2-receiver`** — the standalone Linux/ALSA receiver binary,
   built on the library's public API.
+- **`openairplay2-tui`** — a full-screen now-playing display (with cover art
+  in the terminal) that watches a receiver over a WebSocket, plus
+  `openairplay2-tui-protocol`, the wire format they share.
 
 It handles the full path end to end: mDNS/Bonjour discovery, HomeKit transient
 pairing, a ChaCha20-Poly1305-encrypted control channel, the FairPlay `fp-setup`
@@ -135,12 +138,58 @@ cargo install openairplay2-receiver
 | `--alsa-device NAME` | ALSA output device to play to | `default` |
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
-| `--tui-listen ADDR` | Serve the now-playing WebSocket (track, artwork, position) on this address, e.g. `127.0.0.1:7392` | off |
+| `--tui-listen ADDR` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
 | `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). The pincode is never logged. | transient `3939` |
 | `-h`, `--help` | Print usage and exit | — |
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real
 sender sends.
+
+## Now-playing display
+
+`openairplay2-tui` is a full-screen display of what is playing: title, artist
+and album centered on screen, the cover art as a **real image** on terminals
+that can draw one (Ghostty, Kitty, WezTerm, iTerm2), and a status line with the
+receiver's name, the sender's address, the stream format and the volume.
+
+Start the receiver with the endpoint on, and the display against it:
+
+```sh
+openairplay2-receiver --tui-listen 127.0.0.1:7392
+openairplay2-tui --connect ws://127.0.0.1:7392
+```
+
+```
+                      ┌──────────────┐
+                      │   artwork    │
+                      └──────────────┘
+                        Sonata No. 1
+                         Some Artist
+                         Some Album
+                   ━━━━━━━━━━━━━━━━━━━━━━━
+                      1:23 / 4:07  ⏸ paused
+      Living Room · 192.168.1.42 · 44100 Hz 2ch · -12.5 dB
+```
+
+The two programs are independent: either can be started, stopped and restarted
+without the other, the display reconnects by itself, and several displays can
+watch one receiver. A display that joins mid-track gets the full picture
+immediately, artwork included. It is **read-only** — it never sends the
+receiver anything.
+
+Because it talks to the receiver over a WebSocket rather than linking it, the
+display has no ALSA dependency and runs anywhere, macOS included: leave the
+receiver on a Pi and watch it from a laptop. The endpoint carries track
+metadata and cover art, so keep it on loopback (or behind an SSH tunnel) unless
+you mean otherwise; there is no authentication.
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--connect ws://HOST:PORT` | Receiver endpoint to watch | `ws://127.0.0.1:7392` |
+| `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
+| `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
+
+`q`, `Esc` or `Ctrl-C` quits.
 
 ## Embedding
 

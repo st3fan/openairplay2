@@ -2,6 +2,7 @@
 members = [
     "openairplay2",
     "openairplay2-receiver",
+    "openairplay2-tui",
     "openairplay2-tui-protocol",
 ]
 resolver = "2"
