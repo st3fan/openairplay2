@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Install a .deb into a throwaway Debian arm64 VM and check that it works.
+#
+#   ./testing/vm/vmtest path/to/openairplay2-receiver_X.Y.Z-1_arm64.deb
+#   ./testing/vm/vmtest --release v0.3.0        # test a published artifact
+#   ./testing/vm/vmtest --keep <deb>            # leave the VM up to poke at
+#
+# Boots Debian 13 (trixie) arm64 under QEMU, installs the package the way a
+# user would, and asserts the things that only break on a real install: the
+# systemd unit, the system user, the state directory, the conffile, and
+# whether the daemon actually answers. Exits non-zero on the first failed
+# assertion and always tears the VM down.
+#
+# Unprivileged from end to end — see lib/vm.sh — and the same script is what
+# CI runs. Why Debian and not Raspberry Pi OS: notes/vm-testing.md.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$HERE/../.." && pwd)
+VM_USER=oap
+KEEP=0
+DEB=
+RELEASE=
+
+info() { printf '\033[36m==>\033[0m %s\n' "$*" >&2; }
+pass() { printf '\033[32m  ok\033[0m %s\n' "$*" >&2; }
+fail() { printf '\033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    sed -n '2,14p' "$0" | sed 's/^# \?//'
+    exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --keep) KEEP=1 ;;
+        --release) RELEASE=${2:?--release needs a tag}; shift ;;
+        -h|--help) usage 0 ;;
+        -*) fail "unknown option $1" ;;
+        *) DEB=$1 ;;
+    esac
+    shift
+done
+
+# shellcheck source=lib/vm.sh
+. "$HERE/lib/vm.sh"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/openairplay2-vmtest.XXXXXX")
+cleanup() {
+    local rc=$?
+    if [ "$KEEP" = 1 ]; then
+        info "--keep: VM left running (pid ${QEMU_PID:-none}), work dir $WORK"
+        info "  ssh -i $WORK/id_vm -p ${SSH_PORT:-?} $VM_USER@127.0.0.1"
+    else
+        shutdown_vm
+        rm -rf "$WORK"
+    fi
+    exit $rc
+}
+trap cleanup EXIT INT TERM
+
+require_tools
+
+if [ -n "$RELEASE" ]; then
+    info "downloading the $RELEASE arm64 package"
+    gh release download "$RELEASE" --repo st3fan/openairplay2 \
+        --pattern '*arm64.deb' --dir "$WORK" --clobber
+    DEB=$(echo "$WORK"/*arm64.deb)
+fi
+[ -n "$DEB" ] || usage 1
+[ -f "$DEB" ] || fail "no such file: $DEB"
+case $(basename "$DEB") in
+    *_arm64.deb) ;;
+    *) fail "$(basename "$DEB") is not an arm64 package — this VM is aarch64" ;;
+esac
+info "package under test: $(basename "$DEB")"
+
+started=$SECONDS
+fetch_image
+prepare_disk
+prepare_seed
+boot_vm
+wait_for_ssh
+
+# Every test in tests/ runs against the booted VM, with ssh_vm/scp_vm and the
+# assertion helpers in scope. Adding a test is adding a file.
+for test in "$HERE"/tests/*.sh; do
+    info "running $(basename "$test")"
+    # shellcheck disable=SC1090
+    . "$test"
+done
+
+info "all tests passed in $((SECONDS - started))s"
