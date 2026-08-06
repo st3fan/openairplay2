@@ -70,13 +70,21 @@ impl Graphics {
         Graphics { protocol, tmux }
     }
 
-    /// What [`detect`] makes of the environment, carrying the tmux fact.
-    pub fn detect(
-        env: impl Fn(&str) -> Option<String>,
-        probe: Option<bool>,
-        tmux: bool,
-    ) -> Graphics {
-        Graphics::new(detect(env, probe), tmux)
+    /// What `protocol` is worth inside `mux`.
+    ///
+    /// tmux gets the protocol with wrapping switched on. **GNU screen gets
+    /// nothing**: its DCS passthrough is not tmux's — it forwards the body
+    /// as-is, literal `tmux;` and all — and its string buffer is 768 bytes
+    /// against our 4 KiB chunks, so the tail of an image would arrive as
+    /// literal text. That is base64 across the user's screen, which is the one
+    /// failure this module exists to prevent, so screen is text-only until
+    /// somebody implements and *tests* its own envelope.
+    pub fn in_multiplexer(protocol: Protocol, mux: Multiplexer) -> Graphics {
+        match mux {
+            Multiplexer::Tmux => Graphics::new(protocol, true),
+            Multiplexer::Screen => Graphics::new(Protocol::None, false),
+            Multiplexer::None => Graphics::new(protocol, false),
+        }
     }
 
     /// Are we inside tmux? The display needs to know beyond the escapes it
@@ -133,20 +141,42 @@ impl fmt::Display for Graphics {
     }
 }
 
-/// Are we inside tmux?
+/// Which terminal multiplexer we are running inside, if any — because each
+/// one means something different for whether an escape can reach the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Multiplexer {
+    /// Nothing in the way.
+    None,
+    /// tmux: escapes get through wrapped in its passthrough envelope.
+    Tmux,
+    /// GNU screen: no supported way through, see [`Graphics::in_multiplexer`].
+    Screen,
+}
+
+/// Read the multiplexer out of the environment.
 ///
-/// `$TMUX` is the signal that matters: `TERM` is whatever `default-terminal`
-/// says, which on this project's own workstation is `xterm-256color` and names
-/// no multiplexer at all. The `TERM` prefixes are a backstop for a pane that
-/// inherited an environment without `$TMUX`.
-///
-/// `screen` is included deliberately even though GNU screen's passthrough
-/// envelope is *not* tmux's: under real screen the wrapped sequence is
-/// discarded and the user gets no artwork, which is the right way to be wrong.
-pub fn under_tmux(env: impl Fn(&str) -> Option<String>) -> bool {
+/// `$TMUX` and `$STY` are the signals that matter, and they are checked first:
+/// `TERM` is whatever `default-terminal` says, which on this project's own
+/// workstation is `xterm-256color` and names no multiplexer at all — while
+/// tmux's *own* default is `screen-256color`, which names the wrong one. The
+/// `TERM` prefixes are only a backstop for a session that inherited neither
+/// variable.
+pub fn multiplexer(env: impl Fn(&str) -> Option<String>) -> Multiplexer {
     let var = |name: &str| env(name).filter(|v| !v.is_empty());
-    var("TMUX").is_some()
-        || var("TERM").is_some_and(|term| term.starts_with("tmux") || term.starts_with("screen"))
+    if var("TMUX").is_some() {
+        return Multiplexer::Tmux;
+    }
+    if var("STY").is_some() {
+        return Multiplexer::Screen;
+    }
+    let term = var("TERM").unwrap_or_default();
+    if term.starts_with("tmux") {
+        Multiplexer::Tmux
+    } else if term.starts_with("screen") {
+        Multiplexer::Screen
+    } else {
+        Multiplexer::None
+    }
 }
 
 /// What tmux will do with the escapes we hand it — the `allow-passthrough`
@@ -259,7 +289,7 @@ fn escape(bytes: Vec<u8>, tmux: bool) -> Vec<u8> {
 ///
 /// Pure so every terminal in the table is a test case; `env` is any lookup,
 /// which is [`std::env::var`] in practice.
-fn detect(env: impl Fn(&str) -> Option<String>, probe: Option<bool>) -> Protocol {
+pub fn detect(env: impl Fn(&str) -> Option<String>, probe: Option<bool>) -> Protocol {
     if probe == Some(true) {
         return Protocol::Kitty;
     }
@@ -683,28 +713,60 @@ mod tests {
     }
 
     #[test]
-    fn tmux_is_recognized_by_its_own_variable_first() {
-        // TERM is whatever default-terminal says; on this project's own
-        // workstation that is xterm-256color, which names no multiplexer.
-        for env in [
-            vec![("TMUX", "/tmp/tmux-1000/default,1234,0")],
-            vec![
-                ("TMUX", "/tmp/tmux-1000/default,1234,0"),
-                ("TERM", "xterm-256color"),
-            ],
-            vec![("TERM", "tmux-256color")],
-            vec![("TERM", "screen-256color")],
+    fn the_multiplexer_is_read_from_its_own_variable_first() {
+        // TERM is the unreliable one in both directions: this workstation's
+        // tmux says xterm-256color, and tmux's own default says screen.
+        for (env, expected) in [
+            (
+                vec![("TMUX", "/tmp/tmux-1000/default,1234,0")],
+                Multiplexer::Tmux,
+            ),
+            (
+                vec![
+                    ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+                    ("TERM", "xterm-256color"),
+                ],
+                Multiplexer::Tmux,
+            ),
+            // tmux's built-in default-terminal names screen; $TMUX decides.
+            (
+                vec![
+                    ("TMUX", "/tmp/tmux-1000/default,1234,0"),
+                    ("TERM", "screen-256color"),
+                ],
+                Multiplexer::Tmux,
+            ),
+            (vec![("TERM", "tmux-256color")], Multiplexer::Tmux),
+            (vec![("STY", "1234.pts-0.host")], Multiplexer::Screen),
+            (vec![("TERM", "screen-256color")], Multiplexer::Screen),
+            (vec![("TERM", "xterm-kitty")], Multiplexer::None),
+            (vec![("TERM", "xterm-256color")], Multiplexer::None),
+            // Unset, in the shape env(3) hands it over.
+            (vec![("TMUX", ""), ("STY", "")], Multiplexer::None),
+            (vec![], Multiplexer::None),
         ] {
-            assert!(under_tmux(env_of(&env)), "should be tmux: {env:?}");
+            assert_eq!(multiplexer(env_of(&env)), expected, "env: {env:?}");
         }
-        for env in [
-            vec![("TERM", "xterm-kitty")],
-            vec![("TERM", "xterm-256color")],
-            vec![("TMUX", "")], // unset, in the shape env(3) hands it over
-            vec![],
-        ] {
-            assert!(!under_tmux(env_of(&env)), "should not be tmux: {env:?}");
-        }
+    }
+
+    #[test]
+    fn gnu_screen_gets_no_images_at_all() {
+        // screen forwards a DCS body verbatim and its string buffer is 768
+        // bytes against our 4096-byte chunks, so the tail of an image would
+        // land as literal text — base64 across the screen, the one thing this
+        // module must never do. Nothing is drawn until somebody implements
+        // screen's own envelope and tests it.
+        let screen = Graphics::in_multiplexer(Protocol::Kitty, Multiplexer::Screen);
+        assert!(!screen.draws());
+        assert!(!screen.tmux(), "no tmux envelope under screen either");
+        assert!(screen.draw("image/png", PNG, placement()).is_none());
+        assert!(screen.clear().is_none());
+
+        // The other two are unchanged: tmux wraps, a bare terminal does not.
+        let tmux = Graphics::in_multiplexer(Protocol::Kitty, Multiplexer::Tmux);
+        assert!(tmux.draws() && tmux.tmux());
+        let bare = Graphics::in_multiplexer(Protocol::ITerm2, Multiplexer::None);
+        assert!(bare.draws() && !bare.tmux());
     }
 
     #[test]

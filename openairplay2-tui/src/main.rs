@@ -14,7 +14,7 @@ mod client;
 mod images;
 mod tui;
 
-use crate::images::{Graphics, Passthrough, Protocol};
+use crate::images::{Graphics, Multiplexer, Passthrough, Protocol};
 
 /// Where a receiver serves its now-playing endpoint by default.
 const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:7392";
@@ -100,11 +100,19 @@ async fn main() -> ExitCode {
     // because the probe's own query has to be wrapped to get out of a pane —
     // and a forced --images protocol needs the wrapping just as much.
     let env = |name: &str| std::env::var(name).ok();
-    let tmux = images::under_tmux(env);
-    let mut images = match args.images {
-        Some(protocol) => Graphics::new(protocol, tmux),
-        None => Graphics::detect(env, images::probe_kitty(PROBE_TIMEOUT, tmux), tmux),
+    let mux = images::multiplexer(env);
+    let tmux = mux == Multiplexer::Tmux;
+    let detected = match args.images {
+        Some(protocol) => protocol,
+        None => images::detect(env, images::probe_kitty(PROBE_TIMEOUT, tmux)),
     };
+    let mut images = Graphics::in_multiplexer(detected, mux);
+    if mux == Multiplexer::Screen && detected != Protocol::None {
+        warn!(
+            "running under GNU screen: cover art is disabled, because screen has no \
+             passthrough this display can use safely"
+        );
+    }
 
     // Every wrong `allow-passthrough` value fails silently — tmux drops the
     // escape and the screen just has no picture on it — so ask, and say so.
