@@ -78,8 +78,40 @@ gh attestation verify openairplay2-receiver_X.Y.Z-1_arm64.deb --repo st3fan/open
 
 ## Build & run
 
-Building links against nothing exotic (`libasound2-dev` for the receiver
-binary); a running `avahi-daemon` is needed for discovery.
+### System packages
+
+Building links against nothing exotic, but the receiver binary does need the
+ALSA headers — without them `cargo build` fails in `alsa-sys` with a
+`pkg-config` error along the lines of `The system library 'alsa' required by
+crate 'alsa-sys' was not found`.
+
+On Debian / Ubuntu / Raspberry Pi OS:
+
+```sh
+sudo apt-get install build-essential pkg-config libasound2-dev avahi-daemon
+```
+
+| Package | Why |
+| --- | --- |
+| `build-essential` | a C compiler and linker for the crates with build scripts |
+| `pkg-config` | how `alsa-sys` locates libasound at build time |
+| `libasound2-dev` | ALSA headers — the receiver's audio output |
+| `avahi-daemon` | mDNS/Bonjour advertisement, so senders can discover the receiver (runtime only — the receiver runs without it, it is just undiscoverable; `--no-avahi` skips advertising entirely) |
+
+On Fedora / RHEL the equivalents are `gcc`, `pkgconf-pkg-config`,
+`alsa-lib-devel` and `avahi`; on Arch, `base-devel`, `alsa-lib` and `avahi`.
+
+Rust itself comes from [rustup](https://rustup.rs); the workspace needs Rust
+1.88 or newer.
+
+The **library** alone (`cargo build -p openairplay2`) needs none of this — it
+has no audio-output dependency and builds on macOS too. Only
+`openairplay2-receiver` pulls in ALSA.
+
+The same package list is what `packaging/setup-build.sh` installs on a
+`.deb` build box (plus a cross toolchain with `./setup-build.sh cross`).
+
+### Build
 
 ```sh
 cargo build --release
