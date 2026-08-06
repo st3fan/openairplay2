@@ -227,6 +227,11 @@ tmux rather than the terminal you are looking at, so the display asks the
 terminal directly and falls back to whatever the outer environment left behind.
 If it guesses wrong, `--images kitty` or `--images iterm2` settles it.
 
+**GNU screen is not supported.** Its passthrough is not tmux's, and its string
+buffer is far smaller than the chunks an image is sent in, so the tail would
+arrive as literal text — base64 across your screen. Inside screen the display
+detects it and stays text-only.
+
 One honest caveat remains: window switching is handled, but tmux still does not
 track images, so a scroll, a copy-mode entry or an unrelated full redraw can
 leave a stale one behind until the next change. The display is a single
