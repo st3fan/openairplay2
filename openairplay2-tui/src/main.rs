@@ -14,10 +14,15 @@ mod client;
 mod images;
 mod tui;
 
-use crate::images::Protocol;
+use crate::images::{Graphics, Protocol};
 
 /// Where a receiver serves its now-playing endpoint by default.
 const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:7392";
+
+/// How long the Kitty probe waits for an answer. Long enough for a round trip
+/// (through tmux too, which costs microseconds), short enough that a terminal
+/// which ignores the query doesn't hold up the display visibly.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 struct Args {
     endpoint: String,
@@ -91,15 +96,22 @@ async fn main() -> ExitCode {
     }
 
     // Detection has to happen before ratatui owns the terminal: the probe
-    // writes a query and reads the answer itself.
-    let images = args.images.unwrap_or_else(|| {
-        let probe = images::probe_kitty(std::time::Duration::from_millis(100));
-        images::detect(|name| std::env::var(name).ok(), probe)
-    });
+    // writes a query and reads the answer itself. tmux-ness comes first
+    // because the probe's own query has to be wrapped to get out of a pane —
+    // and a forced --images protocol needs the wrapping just as much.
+    let env = |name: &str| std::env::var(name).ok();
+    let tmux = images::under_tmux(env);
+    let images = match args.images {
+        Some(protocol) => Graphics::new(protocol, tmux),
+        None => Graphics::detect(env, images::probe_kitty(PROBE_TIMEOUT, tmux), tmux),
+    };
     info!(
-        "connecting to {}, terminal graphics: {images:?}",
+        "connecting to {}, terminal graphics: {images}",
         args.endpoint
     );
+    if tmux && images.draws() {
+        info!("inside tmux: tmux needs `set -g allow-passthrough on` to forward the artwork");
+    }
 
     let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(client::run(args.endpoint.clone(), updates_tx));

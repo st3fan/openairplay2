@@ -23,7 +23,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::client::Update;
-use crate::images::{self, Placement, Protocol};
+use crate::images::{self, Graphics, Placement};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use openairplay2_tui_protocol::{Message, Snapshot};
@@ -83,10 +83,10 @@ pub struct Artwork {
 pub struct NowPlaying {
     /// Where we are connecting to, shown until a receiver answers.
     endpoint: String,
-    /// What this terminal can draw. A terminal with no graphics support gets
-    /// no artwork box at all — an empty gap above the text would just be a
-    /// hole where a picture isn't.
-    images: Protocol,
+    /// What this terminal can draw, and whether tmux is in the way. A
+    /// terminal with no graphics support gets no artwork box at all — an empty
+    /// gap above the text would just be a hole where a picture isn't.
+    images: Graphics,
     connection: Connection,
     /// The receiver's advertised name, from its snapshot.
     name: String,
@@ -103,7 +103,7 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    pub fn new(endpoint: String, images: Protocol) -> NowPlaying {
+    pub fn new(endpoint: String, images: Graphics) -> NowPlaying {
         NowPlaying {
             endpoint,
             images,
@@ -114,7 +114,7 @@ impl NowPlaying {
     /// Is there artwork *and* a way to draw it? Both halves matter: the box
     /// is only worth reserving if a picture will land in it.
     fn shows_artwork(&self) -> bool {
-        self.artwork.is_some() && self.images != Protocol::None
+        self.artwork.is_some() && self.images.draws()
     }
 
     /// Fold one client update into the display state.
@@ -428,13 +428,13 @@ pub enum Exit {
 /// the receiver, so the whole loop can be cancelled at an await point, and a
 /// missed restore leaves the user in raw mode with no cursor.
 struct TerminalGuard {
-    images: Protocol,
+    images: Graphics,
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Kitty images outlive the alternate screen, so drop ours explicitly.
-        if let Some(escape) = images::clear(self.images) {
+        if let Some(escape) = self.images.clear() {
             let _ = std::io::stdout().write_all(&escape);
         }
         ratatui::restore();
@@ -454,12 +454,12 @@ struct DrawnArtwork {
 /// Send (or remove) the artwork escape when what should be on screen and
 /// what is on screen have diverged.
 fn draw_artwork(
-    images: Protocol,
+    images: Graphics,
     state: &NowPlaying,
     area: Rect,
     drawn: &mut Option<DrawnArtwork>,
 ) -> std::io::Result<()> {
-    if images == Protocol::None {
+    if !images.draws() {
         return Ok(());
     }
     let wanted = state
@@ -476,7 +476,7 @@ fn draw_artwork(
 
     let mut out = std::io::stdout();
     if drawn.is_some() {
-        if let Some(escape) = images::clear(images) {
+        if let Some(escape) = images.clear() {
             out.write_all(&escape)?;
         }
     }
@@ -488,8 +488,7 @@ fn draw_artwork(
             cols: wanted.area.width,
             rows: wanted.area.height,
         };
-        match images::draw(
-            images,
+        match images.draw(
             &wanted.artwork.content_type,
             &wanted.artwork.data,
             placement,
@@ -516,7 +515,7 @@ fn draw_artwork(
 pub async fn run(
     mut updates: UnboundedReceiver<Update>,
     endpoint: String,
-    images: Protocol,
+    images: Graphics,
 ) -> std::io::Result<Exit> {
     // Cell size has to be read before ratatui takes the terminal over; it
     // doesn't change unless the font does.
@@ -530,7 +529,7 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     updates: &mut UnboundedReceiver<Update>,
     endpoint: String,
-    images: Protocol,
+    images: Graphics,
     cell_aspect: f32,
 ) -> std::io::Result<Exit> {
     let mut state = NowPlaying::new(endpoint, images);
@@ -577,8 +576,15 @@ async fn event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::images::Protocol;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// A terminal that can draw, for the layout tests: what these care about
+    /// is whether an artwork box is reserved, not how the bytes travel.
+    fn kitty() -> Graphics {
+        Graphics::new(Protocol::Kitty, false)
+    }
 
     fn draw(state: &NowPlaying, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -620,7 +626,7 @@ mod tests {
 
     /// Connected, with the receiver's snapshot but nothing playing.
     fn connected() -> NowPlaying {
-        let mut state = NowPlaying::new("ws://127.0.0.1:7392".into(), Protocol::Kitty);
+        let mut state = NowPlaying::new("ws://127.0.0.1:7392".into(), kitty());
         state.apply(Update::Connected);
         state.apply(msg(Message::Snapshot(
             openairplay2_tui_protocol::Snapshot {
@@ -663,7 +669,7 @@ mod tests {
     fn before_a_receiver_answers_the_screen_says_so() {
         // A stale screen must never be mistaken for live state, so the
         // connection state replaces the track entirely.
-        let state = NowPlaying::new("ws://127.0.0.1:7392".into(), Protocol::Kitty);
+        let state = NowPlaying::new("ws://127.0.0.1:7392".into(), kitty());
         let screen = draw(&state, 44, 10);
         assert!(screen.contains("ws://127.0.0.1:7392"), "{screen}");
         assert!(screen.contains("connecting"), "{screen}");
@@ -690,7 +696,7 @@ mod tests {
     fn a_snapshot_fills_the_screen_in_one_go() {
         // What a display started mid-track gets: everything at once.
         use openairplay2_tui_protocol as proto;
-        let mut state = NowPlaying::new("ws://host:7392".into(), Protocol::Kitty);
+        let mut state = NowPlaying::new("ws://host:7392".into(), kitty());
         state.apply(Update::Connected);
         state.apply(msg(Message::Snapshot(proto::Snapshot {
             receiver: proto::ReceiverInfo {
@@ -873,7 +879,7 @@ mod tests {
         // A terminal that can't draw images must not get a hole above the
         // text where a picture isn't.
         let mut state = playing();
-        state.images = Protocol::None;
+        state.images = Graphics::default();
         state.apply(msg(Message::Artwork {
             content_type: "image/jpeg".into(),
             data_base64: STANDARD.encode([1, 2, 3]),
@@ -897,13 +903,13 @@ mod tests {
         // The same state on a terminal that can draw: the picture's box comes
         // out of the space above, so the text sits lower.
         let mut state = playing();
-        state.images = Protocol::Kitty;
+        state.images = kitty();
         state.apply(msg(Message::Artwork {
             content_type: "image/jpeg".into(),
             data_base64: STANDARD.encode([1, 2, 3]),
         }));
         let with_art = text_rows(&draw(&state, 60, 21))[0];
-        state.images = Protocol::None;
+        state.images = Graphics::default();
         let without_art = text_rows(&draw(&state, 60, 21))[0];
         assert!(
             with_art > without_art,
@@ -1071,7 +1077,7 @@ mod tests {
         // A display started while the sender is paused must not claim to be
         // playing.
         use openairplay2_tui_protocol as proto;
-        let mut state = NowPlaying::new("ws://host:7392".into(), Protocol::Kitty);
+        let mut state = NowPlaying::new("ws://host:7392".into(), kitty());
         state.apply(Update::Connected);
         state.apply(msg(Message::Snapshot(proto::Snapshot {
             receiver: proto::ReceiverInfo {
