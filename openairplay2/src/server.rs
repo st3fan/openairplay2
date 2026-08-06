@@ -63,6 +63,7 @@ async fn handle_connection(
     let mut pair = PairSetup::new(context.config.pincode.as_deref());
     let mut session = Session::new(
         local_ip,
+        peer.ip(),
         context.sink_factory.clone(),
         context.events.clone(),
     );

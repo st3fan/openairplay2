@@ -184,8 +184,19 @@ async fn main() -> ExitCode {
                     debug!("volume {db} dB");
                     gain.set(volume_to_gain(db));
                 }
-                Event::SessionStarted { rate, channels } => {
-                    debug!("session started ({rate} Hz, {channels}ch)");
+                Event::SessionStarted {
+                    rate,
+                    channels,
+                    peer,
+                } => {
+                    debug!("session started from {peer} ({rate} Hz, {channels}ch)");
+                }
+                Event::Progress { elapsed, duration } => {
+                    debug!(
+                        "progress {:.0}s / {:.0}s",
+                        elapsed.as_secs_f32(),
+                        duration.as_secs_f32()
+                    );
                 }
                 Event::SessionEnded => debug!("session ended"),
                 Event::Metadata {

@@ -2,8 +2,10 @@
 //!
 //! Sent over an unbounded `tokio::sync::mpsc` channel so the host consumes
 //! them at its own pace; a dropped receiver is tolerated (events are then
-//! discarded). Wire concepts (plists, sequence numbers, `shk`) never appear
-//! here.
+//! discarded). Wire concepts (plists, sequence numbers, RTP timestamps,
+//! `shk`) never appear here — positions are [`std::time::Duration`]s.
+
+use std::net::IpAddr;
 
 /// What the host needs to know about the streaming session. Transport
 /// control (pause, seek) is already handled inside the library — those
@@ -17,6 +19,11 @@ pub enum Event {
         rate: u32,
         /// Channel count (currently always 2).
         channels: u8,
+        /// The address the sender's control connection arrived from. A
+        /// dual-stack listener reports IPv4 senders as v4-mapped IPv6
+        /// (`::ffff:192.168.1.42`); hosts that display it may want
+        /// [`std::net::Ipv6Addr::to_ipv4_mapped`].
+        peer: IpAddr,
     },
     /// `SET_PARAMETER volume`, in AirPlay dB (0 = full, −144 = mute). The
     /// library does not apply gain — the host maps this onto its own volume
@@ -48,6 +55,23 @@ pub enum Event {
         content_type: String,
         /// The image bytes, exactly as sent; empty means cleared.
         data: Vec<u8>,
+    },
+    /// Where playback is within the current track, reported about once a
+    /// second **from the audio actually being played** — not from the
+    /// sender's own position reports, which arrive at track start and then
+    /// essentially never (a real capture showed 250-second tracks with a
+    /// single report at 0.1 s).
+    ///
+    /// Because it follows the audio, a host displays it as-is and must not
+    /// extrapolate between reports: while playback is paused no audio is
+    /// consumed, so the reports stop and the last position stands. A seek is
+    /// followed by fresh reports, so [`Event::Flushed`] should not clear a
+    /// displayed position — it would only blink out.
+    Progress {
+        /// How far into the track playback has reached.
+        elapsed: std::time::Duration,
+        /// The track's total length, or zero while the sender hasn't said.
+        duration: std::time::Duration,
     },
     /// `SETRATEANCHORTIME` rate gate engaged (`true`) or released. The
     /// library already gates audio delivery itself.
