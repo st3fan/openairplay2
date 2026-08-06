@@ -712,7 +712,7 @@ mod tests {
         let (mut session, mut events) = session();
         let mut stream = Dictionary::new();
         stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
-        stream.insert("audioFormat".into(), Value::Integer(0x40000u64.into()));
+        stream.insert("audioFormat".into(), Value::Integer(0x400000u64.into()));
         stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
         let mut dict = Dictionary::new();
         dict.insert(

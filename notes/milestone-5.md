@@ -17,7 +17,7 @@ In:
   the format the Mac actually uses.)
 - **Block framing + decrypt** (`buffered.rs`): each block is
   `[u16 len (BE, includes the 2 length bytes)][packet]`; the packet is a
-  12-byte RTP-ish header (`seq&0x7FFFFF`, `timestamp`, `ssrc`) then the
+  12-byte RTP-ish header (`seq&0xFFFFFF`, `timestamp`, `ssrc`) then the
   encrypted payload. Decrypt with **ChaCha20-Poly1305 (IETF)**: key = `shk`,
   nonce = 4 zero bytes ‖ the last 8 bytes of the packet, AAD = `packet[4..12]`,
   ciphertext+tag = `packet[12 .. len-8]`. Yields a raw AAC-LC frame.
@@ -36,7 +36,7 @@ realtime-ALAC path; multi-channel/48 kHz beyond what the Mac sends.
 ## Wire details (from shairport-sync `ap2_buffered_audio_processor.c`)
 
 - Block: `[u16 data_len BE]` then `data_len-2` bytes.
-- Packet header: `[0..4]` seq (24-bit, mask `0x7FFFFF`), `[4..8]` timestamp,
+- Packet header: `[0..4]` seq (24-bit, mask `0xFFFFFF`), `[4..8]` timestamp,
   `[8..12]` SSRC (identifies the format).
 - Decrypt: `chacha20poly1305_ietf`, key=`shk`, nonce = `00 00 00 00` ‖
   `packet[len-8..len]`, AAD = `packet[4..12]` (8 bytes), ciphertext (with the

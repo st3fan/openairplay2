@@ -34,7 +34,7 @@ Two signals turn a pincode-protected receiver from "transient" into
    types on the sender (this is the **prompt**).
 3. **SRP with the code.** The sender then does `pair-setup` M1→M4, using the
    entered code as the **SRP password**. The receiver verifies it: a wrong
-   code fails SRP proof verification (`M3: SRP proof verification failed`), a
+   code fails SRP proof verification (`pair-setup M3: SRP proof verification failed`), a
    right one passes.
 4. **Encrypted channel at M4.** On M4 the receiver installs the encrypted
    control channel with the SRP session key `K` (the existing transient code
@@ -64,7 +64,11 @@ The iOS dialog is a **free-text "password"** entry, not a numeric PIN, so
   the rest. No pincode configured ⇒ advertise nothing special ⇒ transient
   `3939` (drop-in).
 - The pincode is **never** in the advertisement (only the boolean bit 7),
-  never in `GET /info`, and never logged.
+  never in `GET /info`, and never logged. Two places it *is* exposed, both
+  outside the wire protocol: `Config` holds it in the clear and derives
+  `Debug`, so an embedding host that `{:?}`-prints its config will leak it; and
+  the receiver binary takes it as `--pincode`, which any local user can read
+  from `ps` / `/proc/<pid>/cmdline`.
 
 ## Follow-up (separate, not part of the pincode)
 

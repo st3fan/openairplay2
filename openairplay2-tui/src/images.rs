@@ -41,7 +41,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    /// Parse the `--tui-images` argument.
+    /// Parse the `--images` argument.
     pub fn parse(value: &str) -> Option<Protocol> {
         match value {
             "kitty" => Some(Protocol::Kitty),
@@ -114,7 +114,9 @@ impl Graphics {
 
     /// The escape sequence that removes a previously drawn image. iTerm2
     /// images are part of the text grid and disappear when the cells are
-    /// redrawn, so only Kitty needs an explicit delete.
+    /// redrawn, so only Kitty needs an explicit delete. (Konsole, which we
+    /// route to the iTerm2 path, kept placements across a TUI redraw until a
+    /// 2026 fix — so a stale image there is Konsole's, not ours.)
     pub fn clear(self) -> Option<Vec<u8>> {
         match self.protocol {
             Protocol::Kitty => Some(escape(
@@ -252,8 +254,9 @@ impl Passthrough {
 ///
 /// tmux forwards nothing else — an unwrapped graphics escape is swallowed,
 /// which is why forcing the protocol cannot work around a tmux that was never
-/// detected. It also requires `set -g allow-passthrough on`, which is the
-/// user's half and cannot be arranged from here.
+/// detected. The user's half is `allow-passthrough`, which cannot be arranged
+/// from here: `on` is enough to draw, `all` is needed for the delete as well,
+/// because by then the pane is no longer visible (see [`Passthrough`]).
 fn passthrough(inner: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(inner.len() + 16);
     out.extend_from_slice(b"\x1bPtmux;");

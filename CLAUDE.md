@@ -13,8 +13,9 @@ A cargo workspace with four members:
 - **`openairplay2/`** — the embeddable library: network → PCM. Owns discovery advertisement,
   pairing, the encrypted channel, SETUP, decrypt, AAC decode, and the pause/seek/backpressure
   semantics. No ALSA dependency; builds and tests on macOS as well as Linux. Public surface:
-  `Receiver` + builder, `AudioSink`, `Event`, `Identity`, `Config`, `txt_records` — everything
-  else is private or `#[doc(hidden)]` (test-sender pieces: `srp`, `tlv`, `cipher`, `server`).
+  `Receiver` + `ReceiverBuilder`, `AudioSink`, `SinkFactory`, `Event`, `EventSender`, `Identity`,
+  `Config`, `txt_records` — everything else is private or `#[doc(hidden)]` (test-sender pieces:
+  `srp`, `tlv`, `cipher`, `server`).
 - **`openairplay2-receiver/`** — the standalone Linux-only binary: CLI + `AlsaSink`
   (ALSA output, prebuffer cushion, dB→linear gain). It consumes only the library's public API
   (it is embedder #1). It is also what `packaging/` packages: a `.deb` (systemd unit,
@@ -24,17 +25,19 @@ A cargo workspace with four members:
   then one message per change, over a bounded broadcast channel so a slow display can never
   stall the audio path.
 - **`openairplay2-tui/`** — the full-screen now-playing display (ratatui + crossterm, Kitty and
-  iTerm2 terminal graphics for cover art). It depends on neither the library nor ALSA — a
-  WebSocket client and a renderer — so it builds and runs on macOS as well, and CI enforces
-  that. **`openairplay2-tui-protocol/`** is the serde-only wire format both ends share; its
-  JSON is pinned by fixture tests because a published format that drifts silently is worse
-  than none.
+  iTerm2 terminal graphics for cover art, wrapped in tmux's DCS passthrough envelope when it runs
+  inside tmux). It depends on neither the library nor ALSA — a WebSocket client and a renderer —
+  so it builds and runs on macOS as well, and CI enforces
+  that. **`openairplay2-tui-protocol/`** is the serde-only wire format both ends share; every
+  message's exact JSON is asserted in its own tests, because a published format that drifts
+  silently is worse than none.
 
-Deliberate scope: **one sender → one stream → one output**. There is no PTP (UDP 319/320 is
-never bound, `SETUP` replies `timingPort: 0`) — PTP exists to align *multiple* outputs, and for
+Deliberate scope: **one sender → one stream → one output**. There is no PTP (the PTP ports
+319/320 are never bound — the control and realtime channels do bind ephemeral UDP sockets —
+and `SETUP` replies `timingPort: 0`) — PTP exists to align *multiple* outputs, and for
 a single output the sender's buffering plus our backpressure suffice. Multi-room grouping is out
 of scope. Also unimplemented: `pair-verify` / persistent (non-transient) pairing, ALAC, realtime
-(type 96) audio decode, 48 kHz / S24, metadata.
+(type 96) audio decode, 48 kHz / S24.
 
 ## Build, test, run
 
@@ -90,10 +93,14 @@ per-packet ChaCha20-Poly1305) → [decode.rs](openairplay2/src/decode.rs) (raw A
 via `symphonia`) → [player.rs](openairplay2/src/player.rs) (the library-side playback queue: a
 dedicated thread feeding the host's `AudioSink`).
 
+Track metadata and cover art arrive as DAAP/DMAP blobs on `SET_PARAMETER` and are walked by
+[dmap.rs](openairplay2/src/dmap.rs) into `Event::Metadata` / `Event::Artwork`.
+
 **The sink seam.** The library ends at PCM: at SETUP phase 2 it calls the host's sink factory
 `(rate, channels) → Box<dyn AudioSink>` and thereafter delivers only audio that should actually
-play — the pause gate and flush-generation dropping live in the library (they are session
-semantics), while the device, its pacing, and gain live in the sink.
+play — the pause gate and the flush boundary (each queued packet stamped with its sequence
+number) live in the library (they are session semantics), while the device, its pacing, and gain
+live in the sink.
 [openairplay2-receiver/src/player.rs](openairplay2-receiver/src/player.rs) is the binary's sink:
 `AlsaSink` (open, blocking `writei`, `drop`+`prepare` reset, ~0.5 s prebuffer cushion) plus
 `SharedGain`/`volume_to_gain`. Session milestones (`SessionStarted` with the sender's address,
@@ -108,7 +115,7 @@ thread from the RTP timestamp it is feeding the sink, against the track extent t
 extrapolate: a pause simply stops the reports, which is what freezes the clock.
 
 The embedding facade is [receiver.rs](openairplay2/src/receiver.rs): `Receiver::builder()`
-(name/port/mac/identity/advertise) → `build()` → `run(sink_factory, events)` on the caller's
+(name/port/mac/identity/pincode/advertise) → `build()` → `run(sink_factory, events)` on the caller's
 runtime. `advertise(false)` + `Receiver::txt_records()` supports hosts that own their mDNS.
 
 Timing is "soft": the sink prebuffers ~0.5 s and blocking ALSA writes pace playback, while the
@@ -135,11 +142,14 @@ TCP reader backpressures on `pending_samples()` so latency and memory stay bound
   after the plaintext M4 response is written.
 - **Every response needs `Content-Length` (even empty), the echoed `CSeq`, and the request's own
   protocol token** (`HTTP/1.1` vs `RTSP/1.0`). A `GET_PARAMETER volume` with an empty body makes a
-  real sender abort before `SETUP` phase 2.
+  real sender abort before `SETUP` phase 2 — an observation from hardware testing that was never
+  written down as a capture, unlike the pincode and metadata findings in `notes/`.
 - **The `features` bitmask `0x0001_8340_405F_CA00`** ([receiver.rs](openairplay2/src/receiver.rs))
-  is a known-good shairport-sync value. Getting it wrong makes senders offer AirPlay 1 or nothing.
-  Bits 15/16/17 are the metadata bits (covers, progress, DAAP text) — senders silently skip
-  sending track metadata/artwork unless these are advertised.
+  is shairport-sync's known-good value with bits 15/16/17 — the metadata bits (covers, progress,
+  DAAP text) — set on top; shairport's own value is `0x0001_8340_405C_4A00`. Getting the mask
+  wrong makes senders offer AirPlay 1 or nothing (per shairport-sync and pyatv; not tested here),
+  and senders silently skip sending track metadata/artwork unless the metadata bits are
+  advertised (observed against an iPhone — see plans/20260802-01-metadata-artwork.md).
 - **The identity (Ed25519 `pk` + `pi` UUID) must be stable across restarts** — senders remember a
   receiver by it. The builder therefore requires `identity` or `identity_path` (no ephemeral
   default); the receiver binary persists to `~/.config/openairplay2/identity`.
@@ -159,8 +169,9 @@ crate version and dispatches [cargo.yml](.github/workflows/cargo.yml) (crates.io
 [debian.yml](.github/workflows/debian.yml) (amd64 + arm64 + armhf `.deb`s, attached to the
 release) in
 parallel. The runbook also holds the failure procedure and the autopilot arrangement. CI
-([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux and the
-library on macOS for every PR — the macOS portability deliverable is enforced there.
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux, and the
+library, the protocol crate and the display on macOS, for every PR — the macOS portability
+deliverable is enforced there.
 
 ## Tests
 
@@ -182,7 +193,7 @@ real Mac; that hardware check is part of each milestone's acceptance criteria.
 ## Working conventions
 
 New features and changes start with a **plan** in `plans/YYYYMMDD-NN-slug.md` (`NN` is a
-per-day sequence number, e.g. `plans/20260731-01-alac-realtime.md`). A plan holds the high-level
+per-day sequence number, e.g. `plans/20260805-01-pincode.md`). A plan holds the high-level
 implementation details for one change: background, scope with explicit out-of-scope, module
 layout, test strategy, acceptance criteria — the shape the `notes/milestone-*.md` files already
 use.

@@ -1,5 +1,11 @@
 # Milestone 1 — Discovery & `/info`
 
+> **Note (2026-08-02).** The `features` value recorded below
+> (`0x00018340405C4A00`) is shairport-sync's. It was later changed to
+> `0x00018340405FCA00` — bits 15/16/17 set — because senders skip metadata and
+> artwork unless those are advertised. See
+> [`plans/20260802-01-metadata-artwork.md`](../plans/20260802-01-metadata-artwork.md).
+
 Goal (from [`../notes.md`](../notes.md)): a Mac / iPhone lists the receiver as
 an AirPlay **2** device and begins the pairing handshake against it — even
 though we don't complete pairing yet (that's milestone 2). Concretely: run the

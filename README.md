@@ -24,7 +24,8 @@ iOS device discovers it on the network, pairs with it, and streams to it, and
 audio comes out of an ALSA device with working transport controls — all verified
 against a real Mac.
 
-The repository is a cargo workspace with two artifacts:
+The repository is a cargo workspace of four crates — a library, two binaries,
+and the wire format the binaries share:
 
 - **`openairplay2`** — an embeddable library: network in, decoded PCM +
   session events out. The host application provides the audio output (an
@@ -48,13 +49,20 @@ outputs to a shared clock, and for a single output the sender's own buffering
 plus our backpressure are enough. Multi-room / grouped playback would require PTP
 and is out of scope.
 
+Also not implemented: **ALAC**, **realtime (type 96) audio**, **48 kHz / S24**
+(the decoder is fixed at 44.1 kHz stereo AAC-LC), and **`pair-verify` /
+persistent pairing** — pairing is transient, so a sender pairs afresh each
+session.
+
 The milestone-by-milestone development history is in
 [`notes/status.md`](https://github.com/st3fan/openairplay2/blob/main/notes/status.md).
 
 ## Install (Debian / Ubuntu)
 
 Every release carries a `.deb` for **amd64**, **arm64** and **armhf** (Debian's
-ARMv7 port — ARMv6 boards like the Pi Zero W are not supported). Download the one
+ARMv7 port — ARMv6 boards like the Pi Zero W are not supported). They are built
+on Debian 13 (trixie) and depend on `libasound2t64` and a glibc of at least
+2.39, so they install on **Debian 13+ / Ubuntu 24.04+**. Download the one
 for your machine from the
 [releases page](https://github.com/st3fan/openairplay2/releases) and install
 it — it brings a systemd service that starts at boot:
@@ -111,8 +119,10 @@ The **library** alone (`cargo build -p openairplay2`) needs none of this — it
 has no audio-output dependency and builds on macOS too. Only
 `openairplay2-receiver` pulls in ALSA.
 
-The same package list is what `packaging/setup-build.sh` installs on a
-`.deb` build box (plus a cross toolchain with `./setup-build.sh cross`).
+`packaging/setup-build.sh` installs the build half of this list on a `.deb`
+build box — everything except `avahi-daemon`, which is only needed at runtime —
+plus `git`, `curl` and `ca-certificates`, and a cross toolchain with
+`./setup-build.sh cross`.
 
 ### Build
 
@@ -121,7 +131,8 @@ cargo build --release
 ./target/release/openairplay2-receiver --name "Living Room"
 ```
 
-Or install the released binary straight from crates.io:
+Or build and install the released version from crates.io (this compiles from
+source, so it needs the same system packages as above):
 
 ```sh
 cargo install openairplay2-receiver
@@ -149,10 +160,18 @@ sender sends.
 
 `openairplay2-tui` is a full-screen display of what is playing: title, artist
 and album centered on screen, the cover art as a **real image** on terminals
-that can draw one (Ghostty, Kitty, WezTerm, iTerm2), and a status line with the
+that can draw one (Ghostty, Kitty, WezTerm, iTerm2, Konsole), and a status line
+with the
 receiver's name, the sender's address, the stream format and the volume.
 
-Start the receiver with the endpoint on, and the display against it:
+The display is not on crates.io and is not in the `.deb` yet — build it from
+this repository:
+
+```sh
+cargo build --release -p openairplay2-tui
+```
+
+Then start the receiver with the endpoint on, and the display against it:
 
 ```sh
 openairplay2-receiver --tui-listen 127.0.0.1:7392
@@ -175,7 +194,8 @@ The two programs are independent: either can be started, stopped and restarted
 without the other, the display reconnects by itself, and several displays can
 watch one receiver. A display that joins mid-track gets the full picture
 immediately, artwork included. It is **read-only** — it never sends the
-receiver anything.
+receiver a command (only WebSocket pong frames, which the library answers for
+it).
 
 Because it talks to the receiver over a WebSocket rather than linking it, the
 display has no ALSA dependency and runs anywhere, macOS included: leave the
@@ -188,6 +208,7 @@ you mean otherwise; there is no authentication.
 | `--connect ws://HOST:PORT` | Receiver endpoint to watch | `ws://127.0.0.1:7392` |
 | `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
 | `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
+| `-h`, `--help` | Print usage and exit | — |
 
 `q`, `Esc` or `Ctrl-C` quits.
 
@@ -195,7 +216,8 @@ you mean otherwise; there is no authentication.
 
 tmux forwards a graphics escape only when it is wrapped in its passthrough
 envelope — which the display does automatically — **and** when passthrough is
-switched on, which it is not by default:
+switched on, which it is not by default. This needs **tmux 3.4 or newer**: the
+`all` setting below arrived there (plain `allow-passthrough` arrived in 3.3).
 
 ```sh
 tmux set -g allow-passthrough all         # now, in the running server
@@ -218,9 +240,10 @@ what `all` lets it say, since by then the pane is no longer visible. While it
 is not being looked at the display transmits nothing at all, so `all` cannot
 turn it into the thing drawing over your other windows.
 
-Without any of this the text display works and the artwork box simply stays
-empty; nothing is ever sprayed across the screen. `--log-file PATH` says which
-protocol was detected and whether it is wrapping (`kitty (wrapped for tmux)`).
+Without any of this the display falls back to text only — it reserves no
+artwork box rather than leaving a hole, and nothing is ever sprayed across the
+screen. `--log-file PATH` says which protocol was detected, whether it is
+wrapping (`kitty (wrapped for tmux)`), and what tmux will do with the escapes.
 
 Detection has less to go on inside a pane: `TERM` and `TERM_PROGRAM` describe
 tmux rather than the terminal you are looking at, so the display asks the
@@ -276,6 +299,7 @@ async fn main() -> std::io::Result<()> {
 
 The library keeps the session semantics (pairing, decrypt, AAC decode, the
 pause gate, seek flushing, backpressure); the host sees only PCM and events —
-`SessionStarted`, `Volume` (in AirPlay dB), `Paused`, `Flushed`,
-`SessionEnded`. A host that owns its mDNS registration builds with
+`SessionStarted`, `Volume` (in AirPlay dB), `Metadata`, `Artwork`, `Progress`,
+`Paused`, `Flushed`, `SessionEnded` (the enum is `#[non_exhaustive]`). A host
+that owns its mDNS registration builds with
 `.advertise(false)` and publishes `receiver.txt_records()` itself.

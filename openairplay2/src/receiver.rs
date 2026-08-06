@@ -19,11 +19,14 @@ const DEFAULT_NAME: &str = "OpenAirPlay2";
 const DEFAULT_PORT: u16 = 7000;
 const DEFAULT_MODEL: &str = "OpenAirPlay2,1";
 const DEFAULT_SOURCE_VERSION: &str = "366.0";
-/// shairport-sync's known-good AirPlay 2 features: transient pairing (bit 48)
-/// plus AirPlay 2 audio, plus the metadata bits 15/16/17 (covers, progress,
-/// DAAP text) — senders only push track metadata and artwork when these are
-/// advertised. Getting this wrong makes senders offer AirPlay 1 or nothing
-/// at all.
+/// shairport-sync's known-good AirPlay 2 features (`0x0001_8340_405C_4A00`):
+/// transient pairing (bit 48) plus AirPlay 2 audio — with the metadata bits
+/// 15/16/17 (covers, progress, DAAP text) set on top here, because senders
+/// only push track metadata and artwork when those are advertised (observed
+/// against an iPhone: a first capture with the bits clear showed zero
+/// metadata `SET_PARAMETER`s). Getting the mask wrong makes senders offer
+/// AirPlay 1 or nothing at all — per shairport-sync and pyatv; not tested
+/// here.
 const DEFAULT_FEATURES: u64 = 0x0001_8340_405F_CA00;
 const DEFAULT_STATUS_FLAGS: u32 = 0x4;
 /// Status-flag bit 7 ("Password required"), which makes Apple senders prompt

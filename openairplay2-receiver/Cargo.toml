@@ -10,10 +10,12 @@ readme = "../README.md"
 keywords = ["airplay", "airplay2", "audio", "receiver", "alsa"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
-# .deb packaging for amd64/arm64 via ../packaging/build-deb.sh (native builds
-# only). Depends are pinned to trixie's package names — identical on both
-# architectures — rather than left to cargo-deb's shlibdeps guess, so the two
-# release legs produce identical metadata.
+# .deb packaging via ../packaging/build-deb.sh: amd64/arm64 natively, armhf
+# cross-compiled. Depends are pinned to trixie's package names — identical on
+# all three architectures — rather than left to cargo-deb's shlibdeps guess, so
+# every release leg produces identical metadata. (The flip side: nothing pins a
+# libc6 minimum, so the packages are Debian 13+ / Ubuntu 24.04+ by convention
+# rather than by dependency.)
 [package.metadata.deb]
 name = "openairplay2-receiver"
 maintainer = "Stefan Arentz <stefan.arentz@gmail.com>"

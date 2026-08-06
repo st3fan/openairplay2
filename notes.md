@@ -1,11 +1,20 @@
 # OpenAirPlay 2 — AirPlay 2 receiver, design & plan
 
+> **Historical.** This is the pre-implementation protocol research and the
+> original milestone plan, kept as a record of what was known before anything
+> was built. It is *not* a description of the receiver as it stands — several
+> things here were superseded by what the hardware actually did (the buffered
+> data channel turned out to be TCP, not UDP; pair-verify, ALAC, realtime audio
+> and PTP were never implemented). For what exists today see
+> [`notes/status.md`](notes/status.md), the [README](README.md) and
+> [`CLAUDE.md`](CLAUDE.md).
+
 ## Goal
 
 A minimal **AirPlay 2 audio receiver** for Linux that stock Apple clients
 (iPhone, iPad, Mac from macOS 10.15+, Apple TV, HomePod as a sender) can
 discover and stream audio to, played to an ALSA device — the AirPlay 2
-counterpart of the working AirPlay 1 receiver in `../openairplay`.
+counterpart of the working AirPlay 1 receiver in `../openairplay1`.
 
 Scope, in rough order of ambition, is to reach shairport-sync's "Basic" tier:
 **ALAC / S16 / 44100 / stereo realtime audio**, then **AAC buffered audio**.
@@ -189,7 +198,7 @@ compensation — so first sound does not require perfect timing.
 | mDNS | Avahi over D-Bus with `zbus` (reused from v1) |
 | PTP | hand-rolled minimal slave (milestone 5) |
 
-Reusable from `../openairplay` almost verbatim: the ALSA player (prebuffer,
+Reusable from `../openairplay1` almost verbatim: the ALSA player (prebuffer,
 timed start, drift), the ALAC decoder wrapper, the jitter buffer, the NTP
 clock model, and the Avahi D-Bus registration.
 
@@ -254,4 +263,4 @@ Optional later: FairPlay `fp-setup` (v3), persistent (non-transient) pairing
 - [ckdo/airplay2-receiver](https://github.com/ckdo/airplay2-receiver) — the original of the above.
 - [pyatv protocols](https://pyatv.dev/documentation/protocols/) — cross-check on pairing and the `features` flags.
 - FairPlay/HAP background: [AirPlayAuth](https://github.com/funtax/AirPlayAuth), Apple's HomeKit Accessory Protocol (HAP) TLV8 + pairing.
-- Reused precedent: `../openairplay` (this project's AirPlay 1 receiver) for the ALSA player, ALAC decoder, jitter buffer, NTP clock model, and Avahi D-Bus registration.
+- Reused precedent: `../openairplay1` (this project's AirPlay 1 receiver) for the ALSA player, ALAC decoder, jitter buffer, NTP clock model, and Avahi D-Bus registration.

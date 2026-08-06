@@ -3,7 +3,7 @@
 //!
 //! Frame on the wire: `[u16 len (BE, includes the 2 length bytes)][packet]`.
 //! The packet is a 12-byte RTP-ish header — `[0..4]` seq (24-bit, mask
-//! `0x7FFFFF`), `[4..8]` timestamp, `[8..12]` SSRC — followed by the encrypted
+//! `0xFFFFFF`), `[4..8]` timestamp, `[8..12]` SSRC — followed by the encrypted
 //! payload. Decrypt (from shairport's `ap2_buffered_audio_processor.c`):
 //! key = `shk`, nonce = 4 zero bytes ‖ the packet's last 8 bytes, AAD =
 //! `packet[4..12]`, ciphertext+tag = `packet[12 .. len-8]`.
