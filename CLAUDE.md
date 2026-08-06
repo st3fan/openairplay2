@@ -204,6 +204,16 @@ one below it:
 
 **All changes land through pull requests. Never commit directly to `main`** — always branch first.
 
+**Anything not being done now goes in a GitHub issue.** Work deliberately skipped, an
+out-of-scope item that still deserves to exist, a limitation found while testing, a proposed
+enhancement, an idea worth keeping — file it (`gh issue create`) rather than leaving it in a PR
+description or a conversation. Write it so it stands alone: what was observed, why it happens if
+that is known, and the shape of a fix.
+
+**Every issue gets exactly one of `bug` or `enhancement`.** `bug` = something does not work as
+documented or intended; `enhancement` = something that never existed. Add `documentation` as a
+second label when the fix is only prose. Set it at creation: `gh issue create --label bug …`.
+
 **Never assume the status of a pull request.** Whether a PR is open, merged, closed, approved, or
 green in CI is only knowable by asking: run `gh pr view <n>` / `gh pr status` / `gh pr checks <n>`
 before acting on that status or reporting it.
