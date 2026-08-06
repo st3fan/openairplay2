@@ -198,12 +198,28 @@ envelope — which the display does automatically — **and** when passthrough i
 switched on, which it is not by default:
 
 ```sh
-tmux set -g allow-passthrough on          # now, in the running server
-echo 'set -g allow-passthrough on' >> ~/.tmux.conf   # and next time
+tmux set -g allow-passthrough all         # now, in the running server
+tmux set -g focus-events on
 ```
 
-Without it the text display works and the artwork box simply stays empty;
-nothing is ever sprayed across the screen. `--log-file PATH` says which
+```sh
+# and next time
+cat >> ~/.tmux.conf <<'EOF'
+set -g allow-passthrough all
+set -g focus-events on
+EOF
+```
+
+`allow-passthrough on` is enough to *draw* the artwork, but tmux does not know
+the image exists, so nothing takes it down when you switch windows and it hangs
+over whatever you switched to. The display removes it itself the moment its
+pane stops being the visible one — which is what `focus-events on` tells it and
+what `all` lets it say, since by then the pane is no longer visible. While it
+is not being looked at the display transmits nothing at all, so `all` cannot
+turn it into the thing drawing over your other windows.
+
+Without any of this the text display works and the artwork box simply stays
+empty; nothing is ever sprayed across the screen. `--log-file PATH` says which
 protocol was detected and whether it is wrapping (`kitty (wrapped for tmux)`).
 
 Detection has less to go on inside a pane: `TERM` and `TERM_PROGRAM` describe
@@ -211,10 +227,11 @@ tmux rather than the terminal you are looking at, so the display asks the
 terminal directly and falls back to whatever the outer environment left behind.
 If it guesses wrong, `--images kitty` or `--images iterm2` settles it.
 
-One honest caveat: tmux does not track images, so a pane redraw or a scroll can
-leave a stale one behind. The display is a single in-place frame that deletes
-its image when it exits, which is the friendly case, but the limitation is
-real — and it is tmux's, not something this program can fix.
+One honest caveat remains: window switching is handled, but tmux still does not
+track images, so a scroll, a copy-mode entry or an unrelated full redraw can
+leave a stale one behind until the next change. The display is a single
+in-place frame that deletes its image when it exits, which is the friendly
+case, but the limitation is real.
 
 ## Embedding
 

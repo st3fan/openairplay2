@@ -79,6 +79,12 @@ impl Graphics {
         Graphics::new(detect(env, probe), tmux)
     }
 
+    /// Are we inside tmux? The display needs to know beyond the escapes it
+    /// emits: tmux is also the only reason to care about losing focus.
+    pub fn tmux(self) -> bool {
+        self.tmux
+    }
+
     /// Can this terminal draw an image at all? The artwork box is only worth
     /// reserving if a picture will land in it.
     pub fn draws(self) -> bool {
@@ -141,6 +147,74 @@ pub fn under_tmux(env: impl Fn(&str) -> Option<String>) -> bool {
     let var = |name: &str| env(name).filter(|v| !v.is_empty());
     var("TMUX").is_some()
         || var("TERM").is_some_and(|term| term.starts_with("tmux") || term.starts_with("screen"))
+}
+
+/// What tmux will do with the escapes we hand it — the `allow-passthrough`
+/// option, which decides whether any of this works at all.
+///
+/// Worth asking, because every wrong value fails *silently*: tmux drops the
+/// sequence and there is nothing on screen and nothing in any log to say why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Passthrough {
+    /// `all` — forwarded even from a pane that is not on screen. The only
+    /// value under which the display can take its artwork down when you switch
+    /// windows: by then it is the invisible pane.
+    Always,
+    /// `on` — forwarded only while the pane is visible. Artwork draws, and
+    /// then stays on screen over whatever you switch to.
+    WhenVisible,
+    /// `off`, the tmux default — nothing gets through, so nothing is drawn.
+    Never,
+    /// tmux didn't answer: not on `PATH`, or too old to know the option.
+    Unknown,
+}
+
+impl Passthrough {
+    fn parse(value: &str) -> Passthrough {
+        match value.trim() {
+            "all" => Passthrough::Always,
+            "on" => Passthrough::WhenVisible,
+            "off" => Passthrough::Never,
+            _ => Passthrough::Unknown,
+        }
+    }
+
+    /// Ask the tmux server what it will do for *this* pane —
+    /// `display-message` resolves the pane, window and global settings the way
+    /// tmux itself does, which `show -gv` does not.
+    pub fn query(pane: Option<String>) -> Passthrough {
+        let mut command = std::process::Command::new("tmux");
+        command.arg("display-message").arg("-p");
+        if let Some(pane) = pane {
+            command.arg("-t").arg(pane);
+        }
+        match command.arg("#{allow-passthrough}").output() {
+            Ok(output) if output.status.success() => {
+                Passthrough::parse(&String::from_utf8_lossy(&output.stdout))
+            }
+            _ => Passthrough::Unknown,
+        }
+    }
+
+    /// What to tell the user about it, or `None` when there is nothing to say.
+    pub fn advice(self) -> Option<&'static str> {
+        match self {
+            Passthrough::Always => None,
+            Passthrough::WhenVisible => Some(
+                "tmux allow-passthrough is `on`: cover art draws, but tmux drops the escape \
+                 that removes it, so it will stay on screen when you switch windows — \
+                 `tmux set -g allow-passthrough all` fixes that",
+            ),
+            Passthrough::Never => Some(
+                "tmux allow-passthrough is off, so no cover art can be drawn — \
+                 `tmux set -g allow-passthrough all` turns it on",
+            ),
+            Passthrough::Unknown => Some(
+                "could not ask tmux about allow-passthrough; cover art needs \
+                 `tmux set -g allow-passthrough all`",
+            ),
+        }
+    }
 }
 
 /// Wrap one escape sequence in tmux's DCS passthrough envelope: `ESC P tmux ;`,
@@ -931,6 +1005,29 @@ mod tests {
         assert!(kitty(true).draws());
         assert!(Graphics::new(Protocol::ITerm2, false).draws());
         assert!(!Graphics::new(Protocol::None, true).draws());
+    }
+
+    #[test]
+    fn every_passthrough_value_has_something_to_say_except_the_right_one() {
+        // The failure is silent in tmux itself — no artwork, no complaint —
+        // so this is the only place a user finds out what is wrong.
+        assert_eq!(Passthrough::parse("all"), Passthrough::Always);
+        assert_eq!(Passthrough::parse("on\n"), Passthrough::WhenVisible);
+        assert_eq!(Passthrough::parse("off"), Passthrough::Never);
+        assert_eq!(Passthrough::parse(""), Passthrough::Unknown);
+
+        assert!(Passthrough::Always.advice().is_none(), "nothing to fix");
+        for state in [
+            Passthrough::WhenVisible,
+            Passthrough::Never,
+            Passthrough::Unknown,
+        ] {
+            let advice = state.advice().unwrap_or_default();
+            assert!(
+                advice.contains("allow-passthrough all"),
+                "{state:?} should name the fix: {advice:?}"
+            );
+        }
     }
 
     #[test]

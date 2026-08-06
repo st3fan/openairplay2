@@ -8,13 +8,13 @@
 
 use std::process::ExitCode;
 
-use log::info;
+use log::{info, warn};
 
 mod client;
 mod images;
 mod tui;
 
-use crate::images::{Graphics, Protocol};
+use crate::images::{Graphics, Passthrough, Protocol};
 
 /// Where a receiver serves its now-playing endpoint by default.
 const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:7392";
@@ -101,17 +101,29 @@ async fn main() -> ExitCode {
     // and a forced --images protocol needs the wrapping just as much.
     let env = |name: &str| std::env::var(name).ok();
     let tmux = images::under_tmux(env);
-    let images = match args.images {
+    let mut images = match args.images {
         Some(protocol) => Graphics::new(protocol, tmux),
         None => Graphics::detect(env, images::probe_kitty(PROBE_TIMEOUT, tmux), tmux),
     };
+
+    // Every wrong `allow-passthrough` value fails silently — tmux drops the
+    // escape and the screen just has no picture on it — so ask, and say so.
+    if tmux && images.draws() {
+        let passthrough = Passthrough::query(env("TMUX_PANE"));
+        if let Some(advice) = passthrough.advice() {
+            warn!("{advice}");
+        }
+        // Nothing can get through at all: better an honest text-only layout
+        // than a box reserved for a picture that will never arrive.
+        if passthrough == Passthrough::Never && args.images.is_none() {
+            images = Graphics::new(Protocol::None, tmux);
+        }
+    }
+
     info!(
         "connecting to {}, terminal graphics: {images}",
         args.endpoint
     );
-    if tmux && images.draws() {
-        info!("inside tmux: tmux needs `set -g allow-passthrough on` to forward the artwork");
-    }
 
     let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(client::run(args.endpoint.clone(), updates_tx));
