@@ -87,9 +87,16 @@ play — the pause gate and flush-generation dropping live in the library (they 
 semantics), while the device, its pacing, and gain live in the sink.
 [openairplay2-receiver/src/player.rs](openairplay2-receiver/src/player.rs) is the binary's sink:
 `AlsaSink` (open, blocking `writei`, `drop`+`prepare` reset, ~0.5 s prebuffer cushion) plus
-`SharedGain`/`volume_to_gain`. Session milestones (`SessionStarted`, `Volume` in dB, `Paused`,
-`Flushed`, `SessionEnded`) reach the host over an unbounded event channel; the library does
-**not** apply volume — the host does ([events.rs](openairplay2/src/events.rs)).
+`SharedGain`/`volume_to_gain`. Session milestones (`SessionStarted` with the sender's address,
+`Volume` in dB, `Metadata`, `Artwork`, `Progress`, `Paused`, `Flushed`, `SessionEnded`) reach the
+host over an unbounded event channel; the library does **not** apply volume — the host does
+([events.rs](openairplay2/src/events.rs)).
+
+**`Progress` follows the audio, not the sender.** A sender's `progress:` line arrives at track
+start and essentially never again, so the position is reported once a second by the playback
+thread from the RTP timestamp it is feeding the sink, against the track extent that line named
+([player.rs](openairplay2/src/player.rs) `Position`). Hosts display it as-is and must not
+extrapolate: a pause simply stops the reports, which is what freezes the clock.
 
 The embedding facade is [receiver.rs](openairplay2/src/receiver.rs): `Receiver::builder()`
 (name/port/mac/identity/advertise) → `build()` → `run(sink_factory, events)` on the caller's

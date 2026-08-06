@@ -48,8 +48,8 @@ const FLUSH_NONE: u64 = 0;
 const FLUSH_ALL: u64 = u64::MAX;
 
 enum Command {
-    /// (packet sequence number, interleaved samples).
-    Pcm(u64, Vec<i16>),
+    /// (packet sequence number, RTP timestamp, interleaved samples).
+    Pcm(u64, u32, Vec<i16>),
     /// Nudge the loop to re-check the paused flag / flush request (used when
     /// the queue is idle so control is still noticed promptly).
     Wake,
@@ -71,10 +71,11 @@ pub struct PlayerSender {
 }
 
 impl PlayerSender {
-    /// Queue a decoded packet, stamped with its packet sequence number.
-    pub fn play(&self, seq: u64, pcm: Vec<i16>) {
+    /// Queue a decoded packet, stamped with its packet sequence number (what
+    /// a flush names) and its RTP timestamp (where it sits in the track).
+    pub fn play(&self, seq: u64, timestamp: u32, pcm: Vec<i16>) {
         self.pending.fetch_add(pcm.len(), Ordering::Relaxed);
-        let _ = self.tx.send(Command::Pcm(seq, pcm));
+        let _ = self.tx.send(Command::Pcm(seq, timestamp, pcm));
     }
 
     /// Engage/release the pause gate. While paused the queue holds all audio;
@@ -117,7 +118,10 @@ pub struct Player {
 
 impl Player {
     /// Spawn the playback thread feeding `sink`.
-    pub fn spawn(sink: Box<dyn AudioSink>) -> Player {
+    ///
+    /// `position` reports where playback is (see [`Position`]); pass `None`
+    /// to play without reporting.
+    pub fn spawn(sink: Box<dyn AudioSink>, position: Option<Position>) -> Player {
         let (tx, rx) = std::sync::mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicUsize::new(0));
@@ -131,7 +135,7 @@ impl Player {
         };
         let handle = std::thread::Builder::new()
             .name("audio-player".into())
-            .spawn(move || run(sink, rx, ctx))
+            .spawn(move || run(sink, rx, ctx, position))
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -166,6 +170,97 @@ impl Drop for Player {
     }
 }
 
+/// Where the current track starts and ends on the RTP timeline, as the
+/// sender's `progress:` line reported it. Shared with the RTSP task, which
+/// updates it whenever the sender says so.
+pub type TrackAnchor = Arc<std::sync::Mutex<Option<Track>>>;
+
+/// A track's extent on the RTP timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Track {
+    /// RTP timestamp of the track's first frame.
+    pub start: u32,
+    /// RTP timestamp one past its last.
+    pub end: u32,
+}
+
+/// Reports where playback is, from the audio itself.
+///
+/// The sender's own `progress:` line arrives about once per track, so a
+/// display that wants a running clock has to get it from somewhere else. The
+/// somewhere else is here: every packet carries the RTP timestamp of the
+/// audio being played, and the sender told us where the track starts and ends
+/// on that same timeline.
+///
+/// It falls out of this that **a paused sender freezes the clock**: no audio
+/// is consumed, so there is nothing to report and the last position stands
+/// until playback resumes. Nothing has to detect the pause.
+pub struct Position {
+    rate: u32,
+    events: crate::events::EventSender,
+    track: TrackAnchor,
+    /// Whole seconds last reported, so this is one event per second rather
+    /// than one per ~23 ms packet.
+    reported: Option<u64>,
+}
+
+impl Position {
+    /// Report positions for a stream at `rate`, against `track`.
+    pub fn new(rate: u32, events: crate::events::EventSender, track: TrackAnchor) -> Position {
+        Position {
+            rate,
+            events,
+            track,
+            reported: None,
+        }
+    }
+
+    /// Note that the audio at `ts` is playing, and report the position when
+    /// the displayed second changes.
+    fn played(&mut self, ts: u32) {
+        let Some(track) = *self.track.lock().unwrap() else {
+            return; // the sender hasn't said where the track starts
+        };
+        let Some((elapsed, duration)) = extent(track, ts, self.rate) else {
+            return;
+        };
+        let second = elapsed.as_secs();
+        if self.reported == Some(second) {
+            return;
+        }
+        self.reported = Some(second);
+        let _ = self
+            .events
+            .send(crate::events::Event::Progress { elapsed, duration });
+    }
+}
+
+/// Where `ts` sits within `track`, or `None` if it sits outside it — which
+/// happens between a track change and the sender's next `progress:`, when the
+/// audio has moved on but the anchor hasn't.
+fn extent(track: Track, ts: u32, rate: u32) -> Option<(std::time::Duration, std::time::Duration)> {
+    if rate == 0 {
+        return None;
+    }
+    // RTP timestamps wrap; wrapping subtraction gives the real distance as
+    // long as we are inside the track, and a nonsense one otherwise — which
+    // the bounds check below rejects.
+    let played = ts.wrapping_sub(track.start);
+    let total = track.end.wrapping_sub(track.start);
+    if played > total {
+        return None;
+    }
+    Some((
+        frames_to_duration(played, rate),
+        frames_to_duration(total, rate),
+    ))
+}
+
+/// Frame count → duration at `rate`.
+pub fn frames_to_duration(frames: u32, rate: u32) -> std::time::Duration {
+    std::time::Duration::from_nanos(u64::from(frames) * 1_000_000_000 / u64::from(rate))
+}
+
 /// Shared state the playback thread watches for out-of-band control.
 struct RunCtx {
     stop: Arc<AtomicBool>,
@@ -174,12 +269,17 @@ struct RunCtx {
     paused: Arc<AtomicBool>,
 }
 
-fn run(mut sink: Box<dyn AudioSink>, rx: Receiver<Command>, ctx: RunCtx) {
+fn run(
+    mut sink: Box<dyn AudioSink>,
+    rx: Receiver<Command>,
+    ctx: RunCtx,
+    mut position: Option<Position>,
+) {
     // Audio taken off the channel but not yet played or discarded: everything
     // parked during a pause, and anything retained across a flush. Samples in
     // here are still counted in `pending` — held audio must keep the reader
     // backpressured.
-    let mut held: VecDeque<(u64, Vec<i16>)> = VecDeque::new();
+    let mut held: VecDeque<(u64, u32, Vec<i16>)> = VecDeque::new();
     let mut was_paused = false;
     let mut packets: u64 = 0;
     'outer: while let Ok(command) = rx.recv() {
@@ -206,7 +306,7 @@ fn run(mut sink: Box<dyn AudioSink>, rx: Receiver<Command>, ctx: RunCtx) {
         match command {
             Command::Stop => break,
             Command::Wake => {}
-            Command::Pcm(seq, pcm) => held.push_back((seq, pcm)),
+            Command::Pcm(seq, ts, pcm) => held.push_back((seq, ts, pcm)),
         }
 
         if flush != FLUSH_NONE {
@@ -214,14 +314,14 @@ fn run(mut sink: Box<dyn AudioSink>, rx: Receiver<Command>, ctx: RunCtx) {
             // the flush names: stamps below the boundary (or all of it).
             loop {
                 match rx.try_recv() {
-                    Ok(Command::Pcm(seq, pcm)) => held.push_back((seq, pcm)),
+                    Ok(Command::Pcm(seq, ts, pcm)) => held.push_back((seq, ts, pcm)),
                     Ok(Command::Wake) => {}
                     Ok(Command::Stop) => break 'outer,
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
             }
             let before = held.len();
-            held.retain(|(seq, pcm)| {
+            held.retain(|(seq, _, pcm)| {
                 let keep = flush != FLUSH_ALL && seq.saturating_add(1) >= flush;
                 if !keep {
                     ctx.pending.fetch_sub(pcm.len(), Ordering::Relaxed);
@@ -241,13 +341,18 @@ fn run(mut sink: Box<dyn AudioSink>, rx: Receiver<Command>, ctx: RunCtx) {
 
         // Deliver held audio in order; blocking writes pace playback. Break
         // out between writes if out-of-band control arrives.
-        while let Some((_, pcm)) = held.pop_front() {
+        while let Some((_, ts, pcm)) = held.pop_front() {
             ctx.pending.fetch_sub(pcm.len(), Ordering::Relaxed);
             packets += 1;
             if packets <= 3 || packets.is_multiple_of(250) {
                 debug!("player: {packets} packets");
             }
             sink.write(&pcm);
+            // Reported from the audio just handed over, so the position
+            // follows playback rather than wall time.
+            if let Some(position) = position.as_mut() {
+                position.played(ts);
+            }
             if ctx.stop.load(Ordering::Relaxed) {
                 break 'outer;
             }
@@ -343,11 +448,11 @@ mod tests {
     fn delivers_packets_in_order() {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
-        let player = Player::spawn(Box::new(recorder));
+        let player = Player::spawn(Box::new(recorder), None);
         let sender = player.sender();
-        sender.play(1, vec![1i16; 4]);
-        sender.play(2, vec![2i16; 4]);
-        sender.play(3, vec![3i16; 4]);
+        sender.play(1, 0, vec![1i16; 4]);
+        sender.play(2, 0, vec![2i16; 4]);
+        sender.play(3, 0, vec![3i16; 4]);
         settle(&sender);
         drop(player);
         assert_eq!(
@@ -361,13 +466,13 @@ mod tests {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
         let flushes = recorder.flushes.clone();
-        let player = Player::spawn(Box::new(recorder));
+        let player = Player::spawn(Box::new(recorder), None);
         let sender = player.sender();
 
         sender.set_paused(true);
         assert!(sender.is_paused());
-        sender.play(1, vec![1i16; 4]);
-        sender.play(2, vec![2i16; 4]);
+        sender.play(1, 0, vec![1i16; 4]);
+        sender.play(2, 0, vec![2i16; 4]);
 
         // The audio is held, not dropped: pending stays up (the backpressure
         // signal) and nothing reaches the sink.
@@ -384,7 +489,7 @@ mod tests {
         // Resume: the held audio plays from where playback stopped, then new
         // audio continues.
         sender.set_paused(false);
-        sender.play(3, vec![3i16; 4]);
+        sender.play(3, 0, vec![3i16; 4]);
         settle(&sender);
         drop(player);
         assert_eq!(
@@ -400,21 +505,24 @@ mod tests {
         let flushes = recorder.flushes.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let player = Player::spawn(Box::new(GatedRecorder {
-            recorder,
-            entered: entered_tx,
-            release: release_rx,
-        }));
+        let player = Player::spawn(
+            Box::new(GatedRecorder {
+                recorder,
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            None,
+        );
         let sender = player.sender();
 
         // Hold the thread inside write(seq 10) while 11/12/13 queue behind it.
-        sender.play(10, vec![1i16; 4]);
+        sender.play(10, 0, vec![1i16; 4]);
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("thread entered write");
-        sender.play(11, vec![2i16; 4]);
-        sender.play(12, vec![3i16; 4]);
-        sender.play(13, vec![4i16; 4]);
+        sender.play(11, 0, vec![2i16; 4]);
+        sender.play(12, 0, vec![3i16; 4]);
+        sender.play(13, 0, vec![4i16; 4]);
 
         // Seek: discard exactly seq < 13, retain seq 13.
         sender.flush(Some(13));
@@ -439,19 +547,22 @@ mod tests {
         let writes = recorder.writes.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let player = Player::spawn(Box::new(GatedRecorder {
-            recorder,
-            entered: entered_tx,
-            release: release_rx,
-        }));
+        let player = Player::spawn(
+            Box::new(GatedRecorder {
+                recorder,
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            None,
+        );
         let sender = player.sender();
 
-        sender.play(1, vec![1i16; 4]);
+        sender.play(1, 0, vec![1i16; 4]);
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("thread entered write");
-        sender.play(2, vec![2i16; 4]);
-        sender.play(3, vec![3i16; 4]);
+        sender.play(2, 0, vec![2i16; 4]);
+        sender.play(3, 0, vec![3i16; 4]);
 
         sender.flush(None);
         release_tx.send(()).unwrap();
@@ -465,13 +576,13 @@ mod tests {
     fn flush_during_pause_discards_held_below_boundary_only() {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
-        let player = Player::spawn(Box::new(recorder));
+        let player = Player::spawn(Box::new(recorder), None);
         let sender = player.sender();
 
         sender.set_paused(true);
-        sender.play(5, vec![5i16; 4]);
-        sender.play(6, vec![6i16; 4]);
-        sender.play(7, vec![7i16; 4]);
+        sender.play(5, 0, vec![5i16; 4]);
+        sender.play(6, 0, vec![6i16; 4]);
+        sender.play(7, 0, vec![7i16; 4]);
         assert_pending_holds_at(&sender, 12);
 
         // A pause-with-flush names a boundary; held audio below it goes,
@@ -490,21 +601,24 @@ mod tests {
         let recorder = Recorder::default();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let player = Player::spawn(Box::new(GatedRecorder {
-            recorder,
-            entered: entered_tx,
-            release: release_rx,
-        }));
+        let player = Player::spawn(
+            Box::new(GatedRecorder {
+                recorder,
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            None,
+        );
         let sender = player.sender();
 
-        sender.play(1, vec![0i16; 100]);
+        sender.play(1, 0, vec![0i16; 100]);
         entered_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("thread entered write");
         // The first packet was taken and decremented before its write; the
         // rest are pending while the sink blocks.
-        sender.play(2, vec![0i16; 100]);
-        sender.play(3, vec![0i16; 100]);
+        sender.play(2, 0, vec![0i16; 100]);
+        sender.play(3, 0, vec![0i16; 100]);
         assert_eq!(sender.pending_samples(), 200);
 
         // Release all writes; the queue drains back to zero.
@@ -513,5 +627,177 @@ mod tests {
         }
         settle(&sender);
         drop(player);
+    }
+
+    /// A position reporter over a fresh anchor and event channel.
+    fn position(
+        rate: u32,
+        track: Option<Track>,
+    ) -> (
+        Position,
+        TrackAnchor,
+        tokio::sync::mpsc::UnboundedReceiver<crate::events::Event>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let anchor: TrackAnchor = Arc::new(Mutex::new(track));
+        (Position::new(rate, tx, anchor.clone()), anchor, rx)
+    }
+
+    #[test]
+    fn frames_convert_to_durations_at_the_stream_rate() {
+        assert_eq!(frames_to_duration(44100, 44100), Duration::from_secs(1));
+        assert_eq!(frames_to_duration(22050, 44100), Duration::from_millis(500));
+        assert_eq!(frames_to_duration(0, 44100), Duration::ZERO);
+    }
+
+    #[test]
+    fn extent_places_a_timestamp_within_the_track() {
+        let track = Track {
+            start: 1000,
+            end: 1000 + 44100 * 60,
+        };
+        let (elapsed, duration) = extent(track, 1000 + 44100 * 5, 44100).unwrap();
+        assert_eq!(elapsed, Duration::from_secs(5));
+        assert_eq!(duration, Duration::from_secs(60));
+
+        // Exactly at the start and exactly at the end are both inside.
+        assert_eq!(extent(track, 1000, 44100).unwrap().0, Duration::ZERO);
+        assert_eq!(
+            extent(track, track.end, 44100).unwrap().0,
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn extent_rejects_audio_outside_the_anchored_track() {
+        let track = Track {
+            start: 1000,
+            end: 1000 + 44100 * 60,
+        };
+        // Past the end: a track change the sender has not yet announced.
+        assert!(extent(track, track.end + 1, 44100).is_none());
+        // Before the start, which wrapping subtraction turns into a huge
+        // distance rather than a negative one.
+        assert!(extent(track, 999, 44100).is_none());
+        // A rate of zero would divide by zero.
+        assert!(extent(track, 1000, 0).is_none());
+    }
+
+    #[test]
+    fn extent_survives_a_track_that_wraps_the_rtp_timeline() {
+        // A two-second track starting shortly before the counter wraps, so
+        // `end` is numerically *below* `start` and the audio we ask about
+        // sits on the far side of the wrap.
+        let start = u32::MAX - 20_000;
+        let track = Track {
+            start,
+            end: start.wrapping_add(44_100 * 2),
+        };
+        assert!(track.end < track.start, "the track must span the wrap");
+        let (elapsed, duration) = extent(track, start.wrapping_add(44_100), 44100).unwrap();
+        assert_eq!(elapsed, Duration::from_secs(1));
+        assert_eq!(duration, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn position_reports_once_per_second_of_audio() {
+        let track = Track {
+            start: 0,
+            end: 44100 * 10,
+        };
+        let (mut position, _anchor, mut rx) = position(44100, Some(track));
+
+        // Several packets inside the same second report once.
+        for ts in [0, 1024, 2048, 44_099] {
+            position.played(ts);
+        }
+        assert_eq!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress {
+                elapsed: Duration::ZERO,
+                duration: Duration::from_secs(10),
+            })
+        );
+        assert!(rx.try_recv().is_err(), "one report per displayed second");
+
+        // Crossing into the next second reports again.
+        position.played(44_100);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress {
+                elapsed: Duration::from_secs(1),
+                duration: Duration::from_secs(10),
+            })
+        );
+    }
+
+    #[test]
+    fn position_stays_quiet_until_the_sender_anchors_the_track() {
+        let (mut position, anchor, mut rx) = position(44100, None);
+        position.played(44_100);
+        assert!(
+            rx.try_recv().is_err(),
+            "no anchor, no position — never a guess"
+        );
+
+        *anchor.lock().unwrap() = Some(Track {
+            start: 0,
+            end: 44100 * 10,
+        });
+        position.played(44_100);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress { .. })
+        ));
+    }
+
+    #[test]
+    fn silence_freezes_the_position() {
+        // Pause needs no detection: no audio is consumed, so nothing is
+        // reported and the last position stands.
+        let track = Track {
+            start: 0,
+            end: 44100 * 10,
+        };
+        let (mut position, _anchor, mut rx) = position(44100, Some(track));
+        position.played(44_100 * 3);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress { .. })
+        ));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(rx.try_recv().is_err(), "no audio played, no report");
+    }
+
+    #[test]
+    fn player_reports_the_position_of_the_audio_it_plays() {
+        let track = Track {
+            start: 0,
+            end: 44100 * 10,
+        };
+        let (position_reporter, _anchor, mut rx) = position(44100, Some(track));
+        let recorder = Recorder::default();
+        let player = Player::spawn(Box::new(recorder), Some(position_reporter));
+        let sender = player.sender();
+
+        sender.play(1, 0, vec![0i16; 4]);
+        sender.play(2, 44_100 * 2, vec![0i16; 4]);
+        settle(&sender);
+        drop(player);
+
+        assert_eq!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress {
+                elapsed: Duration::ZERO,
+                duration: Duration::from_secs(10),
+            })
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(crate::events::Event::Progress {
+                elapsed: Duration::from_secs(2),
+                duration: Duration::from_secs(10),
+            })
+        );
     }
 }

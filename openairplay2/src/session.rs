@@ -20,7 +20,7 @@ use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
 use crate::decode::AacDecoder;
 use crate::dmap;
 use crate::events::{Event, EventSender};
-use crate::player::{Player, PlayerSender};
+use crate::player::{frames_to_duration, Player, PlayerSender, Position, Track, TrackAnchor};
 use crate::sink::{AudioSink, SinkFactory};
 
 /// Stream type constants from the SETUP `streams` array.
@@ -34,6 +34,9 @@ pub struct Session {
     /// The address the control connection arrived on — what we bind to and
     /// report back so the sender can reach our channels.
     local_ip: IpAddr,
+    /// The address the sender connected *from*, reported to the host with
+    /// `SessionStarted` (a display shows it; nothing else uses it).
+    peer_ip: IpAddr,
     tasks: Vec<JoinHandle<()>>,
     /// Captured at SETUP phase 2, for audio decrypt/decode.
     stream_key: Option<Vec<u8>>,
@@ -62,12 +65,22 @@ pub struct Session {
     /// seek/skip. Self-clearing (consumed when the stream reaches it) and
     /// reset at stream setup — a stale boundary discards wanted audio.
     flush_until_seq: Arc<AtomicU64>,
+    /// The current track's extent on the RTP timeline, from the sender's
+    /// `progress:` line. Shared with the playback thread, which turns it into
+    /// a position that follows the audio.
+    track: TrackAnchor,
 }
 
 impl Session {
-    pub fn new(local_ip: IpAddr, sink_factory: SinkFactory, events: EventSender) -> Session {
+    pub fn new(
+        local_ip: IpAddr,
+        peer_ip: IpAddr,
+        sink_factory: SinkFactory,
+        events: EventSender,
+    ) -> Session {
         Session {
             local_ip,
+            peer_ip,
             tasks: Vec::new(),
             stream_key: None,
             audio_format: None,
@@ -81,6 +94,7 @@ impl Session {
             player: None,
             player_control: None,
             flush_until_seq: Arc::new(AtomicU64::new(0)),
+            track: TrackAnchor::default(),
         }
     }
 
@@ -222,7 +236,11 @@ impl Session {
         match (decryptor, AacDecoder::new(rate, channels)) {
             (Some(decryptor), Ok(decoder)) => {
                 self.session_active = true;
-                self.send_event(Event::SessionStarted { rate, channels });
+                self.send_event(Event::SessionStarted {
+                    rate,
+                    channels,
+                    peer: self.peer_ip,
+                });
                 // Replay metadata/artwork that arrived before the session
                 // started, so they land inside it.
                 let latched = [self.pending_metadata.take(), self.pending_artwork.take()];
@@ -230,7 +248,12 @@ impl Session {
                     self.send_event(event);
                 }
                 let sink: Box<dyn AudioSink> = (self.sink_factory)(rate, channels);
-                let player = Player::spawn(sink);
+                // A new stream is a new track timeline: drop any extent the
+                // previous one left behind, so no position is reported until
+                // the sender says where this track starts.
+                *self.track.lock().unwrap() = None;
+                let position = Position::new(rate, self.events.clone(), self.track.clone());
+                let player = Player::spawn(sink, Some(position));
                 let sender = player.sender();
                 self.player_control = Some(player.sender());
                 self.player = Some(player);
@@ -327,20 +350,57 @@ impl Session {
         }
     }
 
-    /// The `text/parameters` flavor — currently just the volume line. The
-    /// volume (dB) is recorded (to answer `GET_PARAMETER`) and reported to
-    /// the host, which owns the gain path.
+    /// The `text/parameters` flavor: the volume line, and the sender's
+    /// position report. The volume (dB) is recorded (to answer
+    /// `GET_PARAMETER`) and reported to the host, which owns the gain path.
     fn set_text_parameters(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
-            if let Some(v) = line.trim().strip_prefix("volume:") {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("volume:") {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     self.volume = db;
                     debug!("SET_PARAMETER volume {db} dB");
                     self.send_event(Event::Volume { db });
                 }
+            } else if let Some(v) = line.strip_prefix("progress:") {
+                self.set_progress(v.trim());
             }
         }
+    }
+
+    /// `progress: <start>/<current>/<end>` — three RTP timestamps naming the
+    /// current track's extent and the sender's idea of the position.
+    ///
+    /// The extent is what matters: it is handed to the playback thread, which
+    /// turns the audio it plays into a running position. The sender's own
+    /// `current` is reported once here (it is right at track start, which is
+    /// essentially the only time this line arrives) and never extrapolated
+    /// from.
+    fn set_progress(&mut self, value: &str) {
+        let mut parts = value.split('/').map(|p| p.trim().parse::<u32>());
+        let (Some(Ok(start)), Some(Ok(current)), Some(Ok(end)), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            debug!("SET_PARAMETER progress: unparseable value {value:?}");
+            return;
+        };
+        *self.track.lock().unwrap() = Some(Track { start, end });
+        if !self.session_active {
+            return; // a position without a stream means nothing
+        }
+        let (rate, _) = aac_params(self.audio_format);
+        // A seek can put `current` before `start`, and the timestamps wrap;
+        // saturating subtraction keeps both readings sane rather than
+        // reporting a position of ~27 hours.
+        let elapsed = frames_to_duration(current.saturating_sub(start), rate);
+        let duration = frames_to_duration(end.saturating_sub(start), rate);
+        debug!(
+            "SET_PARAMETER progress {:.1}s / {:.1}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        );
+        self.send_event(Event::Progress { elapsed, duration });
     }
 
     /// DMAP track metadata. Metadata is decoration: an unparseable payload
@@ -551,7 +611,9 @@ async fn buffered_audio(
                         continue;
                     };
                     match decoder.decode(&audio.payload) {
-                        Ok(pcm) if !pcm.is_empty() => player.play(u64::from(audio.seq), pcm),
+                        Ok(pcm) if !pcm.is_empty() => {
+                            player.play(u64::from(audio.seq), audio.timestamp, pcm)
+                        }
                         Ok(_) => {}
                         Err(e) => debug!("buffered audio: decode error: {e}"),
                     }
@@ -610,6 +672,11 @@ mod tests {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
     }
 
+    /// The address a test "sender" connects from.
+    fn peer() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))
+    }
+
     struct TestSink;
 
     impl AudioSink for TestSink {
@@ -621,7 +688,7 @@ mod tests {
     fn session() -> (Session, UnboundedReceiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
-        (Session::new(local(), factory, tx), rx)
+        (Session::new(local(), peer(), factory, tx), rx)
     }
 
     #[tokio::test]
@@ -678,7 +745,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: peer(),
             })
         );
 
@@ -834,6 +902,117 @@ mod tests {
         // The session itself is unharmed — the volume path still works.
         session.set_parameter(Some("text/parameters"), b"volume: -6.0\r\n");
         assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
+    }
+
+    #[tokio::test]
+    async fn progress_anchors_the_track_and_reports_the_senders_position() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        while events.try_recv().is_ok() {} // drain SessionStarted
+
+        // A minute-long track, the sender five seconds in.
+        let start = 1_000u32;
+        let end = start + 44_100 * 60;
+        let current = start + 44_100 * 5;
+        session.set_parameter(
+            Some("text/parameters"),
+            format!("progress: {start}/{current}/{end}\r\n").as_bytes(),
+        );
+
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Progress {
+                elapsed: Duration::from_secs(5),
+                duration: Duration::from_secs(60),
+            })
+        );
+        // The extent is what the playback thread needs: it turns the audio it
+        // plays into a running position without another word from the sender.
+        assert_eq!(
+            *session.track.lock().unwrap(),
+            Some(Track { start, end }),
+            "the track extent must reach the playback thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_before_a_stream_anchors_but_reports_nothing() {
+        let (mut session, mut events) = session();
+        session.set_parameter(Some("text/parameters"), b"progress: 0/44100/441000\r\n");
+        assert!(
+            events.try_recv().is_err(),
+            "a position without a stream means nothing"
+        );
+        assert!(session.track.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_progress_is_ignored() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        while events.try_recv().is_ok() {}
+        for body in [
+            &b"progress: 1000/2000\r\n"[..],      // too few fields
+            b"progress: 1000/2000/3000/4000\r\n", // too many
+            b"progress: a/b/c\r\n",               // not numbers
+            b"progress:\r\n",                     // empty
+        ] {
+            session.set_parameter(Some("text/parameters"), body);
+            assert!(
+                events.try_recv().is_err(),
+                "unparseable progress must not report: {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_after_a_seek_clamps_instead_of_reporting_27_hours() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        while events.try_recv().is_ok() {}
+        // `current` before `start`: the subtraction would wrap.
+        session.set_parameter(Some("text/parameters"), b"progress: 44100/0/441000\r\n");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Progress {
+                elapsed: Duration::ZERO,
+                duration: Duration::from_secs(9),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_stream_drops_the_previous_tracks_extent() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        session.set_parameter(Some("text/parameters"), b"progress: 0/0/441000\r\n");
+        assert!(session.track.lock().unwrap().is_some());
+
+        // A second stream on the same connection is a fresh timeline; a stale
+        // extent would place the new audio inside the old track.
+        start_stream(&mut session).await;
+        assert_eq!(*session.track.lock().unwrap(), None);
+        while events.try_recv().is_ok() {}
+    }
+
+    #[tokio::test]
+    async fn volume_and_progress_travel_in_one_body() {
+        let (mut session, mut events) = session();
+        start_stream(&mut session).await;
+        while events.try_recv().is_ok() {}
+        session.set_parameter(
+            Some("text/parameters"),
+            b"volume: -6.0\r\nprogress: 0/44100/441000\r\n",
+        );
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Progress {
+                elapsed: Duration::from_secs(1),
+                duration: Duration::from_secs(10),
+            })
+        );
     }
 
     #[test]
