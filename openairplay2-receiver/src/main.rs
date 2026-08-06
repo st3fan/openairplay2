@@ -9,6 +9,7 @@ use log::{debug, info};
 use tokio::signal::unix::SignalKind;
 
 mod player;
+mod tui;
 
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay2::{AudioSink, Event, Receiver};
@@ -26,12 +27,15 @@ struct Args {
     alsa_device: Option<String>,
     /// Require this pincode to pair; `None` → transient `3939`.
     pincode: Option<String>,
+    /// Address to serve the now-playing WebSocket on; off when `None`.
+    tui_listen: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay2-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio] [--pincode CODE]"
+         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio] [--pincode CODE] \
+         [--tui-listen ADDR]"
     );
     std::process::exit(2);
 }
@@ -55,6 +59,7 @@ fn parse_args() -> Args {
         avahi: true,
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
         pincode: None,
+        tui_listen: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -82,6 +87,7 @@ fn parse_args() -> Args {
             "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
             "--no-audio" => args.alsa_device = None,
             "--pincode" => args.pincode = Some(it.next().unwrap_or_else(|| usage())),
+            "--tui-listen" => args.tui_listen = Some(it.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("unknown argument: {other}");
@@ -176,9 +182,33 @@ async fn main() -> ExitCode {
             None => Box::new(NullSink),
         }
     };
+    // The now-playing endpoint, if asked for. Bound before streaming starts so
+    // a bad address fails at startup rather than mid-session.
+    let publisher = match &args.tui_listen {
+        Some(addr) => {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("cannot listen for displays on {addr}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            info!("now-playing endpoint: ws://{addr}");
+            let publisher = tui::Publisher::new(receiver.config().name.clone());
+            tokio::spawn(tui::serve(listener, publisher.clone()));
+            Some(publisher)
+        }
+        None => None,
+    };
+
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            // Events drive our gain (always) and the display socket (when
+            // serving). The publisher never blocks on a slow display.
+            if let Some(publisher) = &publisher {
+                publisher.publish(&event);
+            }
             match event {
                 Event::Volume { db } => {
                     debug!("volume {db} dB");

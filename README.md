@@ -135,6 +135,7 @@ cargo install openairplay2-receiver
 | `--alsa-device NAME` | ALSA output device to play to | `default` |
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
+| `--tui-listen ADDR` | Serve the now-playing WebSocket (track, artwork, position) on this address, e.g. `127.0.0.1:7392` | off |
 | `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). The pincode is never logged. | transient `3939` |
 | `-h`, `--help` | Print usage and exit | — |
 

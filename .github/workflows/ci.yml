@@ -26,10 +26,13 @@ jobs:
       - run: cargo fmt --check
 
   macos:
-    name: macOS (library)
+    name: macOS (library + tui crates)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p openairplay2
-      - run: cargo clippy -p openairplay2 --all-targets -- -D warnings
+      # The library's macOS portability is a deliverable; so is the display's,
+      # which is why it depends on neither the library nor ALSA — you run it on
+      # a laptop watching a Linux receiver.
+      - run: cargo test -p openairplay2 -p openairplay2-tui-protocol
+      - run: cargo clippy -p openairplay2 -p openairplay2-tui-protocol --all-targets -- -D warnings
