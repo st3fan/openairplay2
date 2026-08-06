@@ -1,0 +1,22 @@
+[package]
+name = "openairplay2-tui-protocol"
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Wire format for the openairplay2 receiver's now-playing WebSocket"
+license = "MIT"
+repository = "https://github.com/st3fan/openairplay2"
+readme = "../README.md"
+keywords = ["airplay", "airplay2", "tui", "websocket", "protocol"]
+categories = ["multimedia::audio", "encoding"]
+# Not on crates.io yet: the receiver and the TUI are the only clients, and a
+# published wire format is a promise worth making deliberately.
+publish = false
+
+# Types only — no serde_json, no tokio: whatever a client uses to move the
+# bytes is its own business.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

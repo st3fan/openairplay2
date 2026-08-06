@@ -9,6 +9,10 @@
 #                             device on the network can pair
 #   --no-avahi                do not advertise over mDNS
 #   --no-audio                decode but do not open ALSA (silent test run)
+#   --tui-listen ADDR         serve the now-playing WebSocket that
+#                             openairplay2-tui renders, e.g. 127.0.0.1:7392.
+#                             It carries track metadata and cover art, so keep
+#                             it on loopback unless you mean otherwise
 #
 # --identity-file is set by the systemd unit and should not be repeated here.
 #
