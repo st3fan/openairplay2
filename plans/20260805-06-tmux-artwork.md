@@ -242,6 +242,11 @@ returns. That is what makes `all` safe to recommend.
   on focus gained.
 - README: recommend `allow-passthrough all` and `focus-events on`, and say what
   each buys.
+- Ask tmux what `allow-passthrough` actually is
+  (`display-message -p '#{allow-passthrough}'`, which resolves pane, window and
+  global settings the way tmux does) and log what that means. Every wrong value
+  fails identically and silently — no picture, no complaint — and `on` is the
+  value anyone who followed the first draft of this plan already has.
 
 The complete fix for this whole class — stale images after a scroll, a redraw,
 or copy-mode, with no tmux options at all — is Kitty's **unicode placeholder**
@@ -278,7 +283,14 @@ than bolted onto this one.
 5. Outside tmux, every terminal that drew artwork before draws it unchanged.
 6. With `allow-passthrough all`, switching tmux windows away from the display
    leaves no image behind, and switching back brings it straight up. With `on`
-   it still draws, and the stale image is what the README says it is.
+   it still draws, and the log says why the image stayed behind.
+
+Verified for 6 against a throwaway tmux server (its own socket, a client
+attached through `script(1)` so everything tmux writes is recorded): with
+`allow-passthrough on` the pane *is* told it lost focus and the delete escape
+is swallowed; with `all` the same delete comes out the other side. That
+separates the two halves — tmux's focus reporting works, the option is what
+decides whether the cleanup lands — without needing anyone to watch a screen.
 
 ## Phases
 
