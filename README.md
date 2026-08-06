@@ -150,7 +150,7 @@ cargo install openairplay2-receiver
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
 | `--tui-listen ADDR` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
-| `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). The pincode is never logged. | transient `3939` |
+| `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged, but note it is a command-line argument, so any local user can read it from `ps`. | transient `3939` |
 | `-h`, `--help` | Print usage and exit | — |
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real
@@ -161,8 +161,8 @@ sender sends.
 `openairplay2-tui` is a full-screen display of what is playing: title, artist
 and album centered on screen, the cover art as a **real image** on terminals
 that can draw one (Ghostty, Kitty, WezTerm, iTerm2, Konsole), and a status line
-with the
-receiver's name, the sender's address, the stream format and the volume.
+with the receiver's name, the sender's address, the stream format and the
+volume.
 
 The display is not on crates.io and is not in the `.deb` yet — build it from
 this repository:
