@@ -12,7 +12,10 @@
 use std::io::Write;
 use std::time::Duration;
 
-use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableFocusChange, EnableFocusChange, Event as TermEvent, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
+};
 use futures_util::StreamExt;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -433,9 +436,13 @@ struct TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let mut out = std::io::stdout();
         // Kitty images outlive the alternate screen, so drop ours explicitly.
         if let Some(escape) = self.images.clear() {
-            let _ = std::io::stdout().write_all(&escape);
+            let _ = out.write_all(&escape);
+        }
+        if self.images.tmux() {
+            let _ = crossterm::execute!(out, DisableFocusChange);
         }
         ratatui::restore();
     }
@@ -451,60 +458,108 @@ struct DrawnArtwork {
     area: Rect,
 }
 
-/// Send (or remove) the artwork escape when what should be on screen and
-/// what is on screen have diverged.
-fn draw_artwork(
+/// The artwork as the terminal currently has it.
+///
+/// Also whether the pane is the one being *looked at*, which under tmux is not
+/// the same question as whether we are running. tmux knows nothing about
+/// images, so it neither erases ours when you switch windows nor redraws it
+/// when you come back: without this the cover art hangs over whatever window
+/// you switched to. Focus is therefore a gate, not just a trigger — while
+/// unfocused nothing at all is transmitted, because with
+/// `allow-passthrough all` a background pane's escapes reach the screen you
+/// are actually using.
+struct ArtworkOnScreen {
     images: Graphics,
-    state: &NowPlaying,
-    area: Rect,
-    drawn: &mut Option<DrawnArtwork>,
-) -> std::io::Result<()> {
-    if !images.draws() {
-        return Ok(());
-    }
-    let wanted = state
-        .artwork
-        .as_ref()
-        .filter(|_| area.width > 0 && area.height > 0)
-        .map(|artwork| DrawnArtwork {
-            artwork: artwork.clone(),
-            area,
-        });
-    if wanted == *drawn {
-        return Ok(());
+    drawn: Option<DrawnArtwork>,
+    focused: bool,
+}
+
+impl ArtworkOnScreen {
+    fn new(images: Graphics) -> ArtworkOnScreen {
+        // We are started in the pane the user is looking at; terminals that
+        // report focus at all will correct us soon enough if not.
+        ArtworkOnScreen {
+            images,
+            drawn: None,
+            focused: true,
+        }
     }
 
-    let mut out = std::io::stdout();
-    if drawn.is_some() {
-        if let Some(escape) = images.clear() {
-            out.write_all(&escape)?;
+    /// Send (or remove) the artwork escape when what should be on screen and
+    /// what is on screen have diverged.
+    fn sync(
+        &mut self,
+        state: &NowPlaying,
+        area: Rect,
+        out: &mut impl Write,
+    ) -> std::io::Result<()> {
+        if !self.images.draws() || !self.focused {
+            return Ok(());
         }
-    }
-    if let Some(wanted) = &wanted {
-        let placement = Placement {
-            // Escape sequences count from 1; ratatui rects from 0.
-            col: wanted.area.x + 1,
-            row: wanted.area.y + 1,
-            cols: wanted.area.width,
-            rows: wanted.area.height,
-        };
-        match images.draw(
-            &wanted.artwork.content_type,
-            &wanted.artwork.data,
-            placement,
-        ) {
-            Some(escape) => out.write_all(&escape)?,
-            // Undecodable artwork: leave the screen text-only rather than
-            // retrying it on every redraw.
-            None => {
-                *drawn = None;
-                return Ok(());
+        let wanted = state
+            .artwork
+            .as_ref()
+            .filter(|_| area.width > 0 && area.height > 0)
+            .map(|artwork| DrawnArtwork {
+                artwork: artwork.clone(),
+                area,
+            });
+        if wanted == self.drawn {
+            return Ok(());
+        }
+
+        if self.drawn.is_some() {
+            if let Some(escape) = self.images.clear() {
+                out.write_all(&escape)?;
             }
         }
+        if let Some(wanted) = &wanted {
+            let placement = Placement {
+                // Escape sequences count from 1; ratatui rects from 0.
+                col: wanted.area.x + 1,
+                row: wanted.area.y + 1,
+                cols: wanted.area.width,
+                rows: wanted.area.height,
+            };
+            match self.images.draw(
+                &wanted.artwork.content_type,
+                &wanted.artwork.data,
+                placement,
+            ) {
+                Some(escape) => out.write_all(&escape)?,
+                // Undecodable artwork: leave the screen text-only rather than
+                // retrying it on every redraw.
+                None => {
+                    self.drawn = None;
+                    return Ok(());
+                }
+            }
+        }
+        out.flush()?;
+        self.drawn = wanted;
+        Ok(())
     }
-    out.flush()?;
-    *drawn = wanted;
-    Ok(())
+
+    /// The pane stopped being the visible one. Take the image down while we
+    /// still can — tmux forwards this only under `allow-passthrough all`,
+    /// which is exactly why the README asks for `all`.
+    fn focus_lost(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        self.focused = false;
+        if self.drawn.take().is_none() {
+            return Ok(());
+        }
+        if let Some(escape) = self.images.clear() {
+            out.write_all(&escape)?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Being looked at again. Nothing is drawn now — the next redraw
+    /// re-transmits, because `drawn` was cleared on the way out.
+    fn focus_gained(&mut self) {
+        self.focused = true;
+    }
 }
 
 /// Run the full-screen display until the user quits or the receiver stops.
@@ -522,6 +577,12 @@ pub async fn run(
     let cell_aspect = images::cell_aspect();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard { images };
+    // Only under tmux: elsewhere losing focus means another window is in front
+    // of ours, where there is nothing to clean up and taking the image down
+    // would only make it flicker back on return.
+    if images.tmux() {
+        crossterm::execute!(std::io::stdout(), EnableFocusChange)?;
+    }
     event_loop(&mut terminal, &mut updates, endpoint, images, cell_aspect).await
 }
 
@@ -538,14 +599,15 @@ async fn event_loop(
     // Raw mode means the terminal sends no SIGINT, but `kill` and systemd
     // still send SIGTERM — catch it so the screen is handed back.
     let mut terminate = signal(SignalKind::terminate())?;
-    let mut drawn: Option<DrawnArtwork> = None;
+    let mut artwork = ArtworkOnScreen::new(images);
+    let mut out = std::io::stdout();
 
     loop {
         let mut box_area = Rect::ZERO;
         terminal.draw(|frame| {
             box_area = state.render(frame, cell_aspect);
         })?;
-        draw_artwork(images, &state, box_area, &mut drawn)?;
+        artwork.sync(&state, box_area, &mut out)?;
 
         tokio::select! {
             // The receiver's messages: the display state.
@@ -562,6 +624,10 @@ async fn event_loop(
                         return Ok(Exit::Quit);
                     }
                 }
+                // Under tmux these mean the pane stopped (or started) being
+                // the one on screen — see ArtworkOnScreen.
+                Some(Ok(TermEvent::FocusLost)) => artwork.focus_lost(&mut out)?,
+                Some(Ok(TermEvent::FocusGained)) => artwork.focus_gained(),
                 Some(Ok(_)) => {}          // resize and the rest: redraw
                 Some(Err(e)) => return Err(e),
                 None => return Ok(Exit::Quit),
@@ -584,6 +650,96 @@ mod tests {
     /// is whether an artwork box is reserved, not how the bytes travel.
     fn kitty() -> Graphics {
         Graphics::new(Protocol::Kitty, false)
+    }
+
+    /// A display with artwork in hand, for the on-screen tests.
+    fn with_artwork(images: Graphics) -> NowPlaying {
+        let mut state = NowPlaying::new("ws://host:7392".into(), images);
+        state.artwork = Some(Artwork {
+            content_type: "image/png".into(),
+            data: b"\x89PNG\r\n\x1a\nfake".to_vec(),
+        });
+        state
+    }
+
+    fn box_area() -> Rect {
+        Rect::new(2, 1, 10, 5)
+    }
+
+    /// Everything the display would have sent the terminal.
+    fn transmitted(f: impl FnOnce(&mut Vec<u8>)) -> String {
+        let mut out = Vec::new();
+        f(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn losing_focus_takes_the_image_down() {
+        // tmux erases neither our image nor its memory of it, so switching
+        // windows used to leave the cover art floating over the next window.
+        let state = with_artwork(kitty());
+        let mut screen = ArtworkOnScreen::new(kitty());
+
+        let drawn = transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        assert!(drawn.contains("\x1b_Ga=T,i=7332"), "the image goes out");
+
+        let cleared = transmitted(|out| screen.focus_lost(out).unwrap());
+        assert_eq!(cleared, "\x1b_Ga=d,d=I,i=7332\x1b\\", "and comes back down");
+    }
+
+    #[test]
+    fn nothing_is_transmitted_while_the_pane_is_not_being_looked_at() {
+        // With `allow-passthrough all` — which is what lets the delete above
+        // get out — anything we send lands on the window the user is actually
+        // looking at. So while unfocused we send nothing at all, not even for
+        // a track change.
+        let mut state = with_artwork(kitty());
+        let mut screen = ArtworkOnScreen::new(kitty());
+        transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        transmitted(|out| screen.focus_lost(out).unwrap());
+
+        state.artwork = Some(Artwork {
+            content_type: "image/png".into(),
+            data: b"\x89PNG\r\n\x1a\ndifferent".to_vec(),
+        });
+        let while_away = transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        assert_eq!(while_away, "", "not a byte while another window is up");
+
+        // Back on screen: the new artwork is transmitted, without a delete
+        // first — focus_lost already took the old one down.
+        screen.focus_gained();
+        let on_return = transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        assert!(
+            on_return.contains("\x1b_Ga=T,i=7332"),
+            "redrawn: {on_return:?}"
+        );
+        assert!(
+            !on_return.contains("a=d"),
+            "nothing to delete: {on_return:?}"
+        );
+    }
+
+    #[test]
+    fn losing_focus_with_nothing_drawn_says_nothing() {
+        // A display with no artwork yet has nothing to take down, and an
+        // unprompted delete would remove an image that isn't ours.
+        let state = NowPlaying::new("ws://host:7392".into(), kitty());
+        let mut screen = ArtworkOnScreen::new(kitty());
+        transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        assert_eq!(transmitted(|out| screen.focus_lost(out).unwrap()), "");
+    }
+
+    #[test]
+    fn an_unchanged_screen_is_left_alone() {
+        // The redraw runs every second; re-transmitting the image each time
+        // would flicker it and waste the terminal's time.
+        let state = with_artwork(kitty());
+        let mut screen = ArtworkOnScreen::new(kitty());
+        transmitted(|out| screen.sync(&state, box_area(), out).unwrap());
+        assert_eq!(
+            transmitted(|out| screen.sync(&state, box_area(), out).unwrap()),
+            ""
+        );
     }
 
     fn draw(state: &NowPlaying, width: u16, height: u16) -> String {

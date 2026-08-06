@@ -79,6 +79,12 @@ impl Graphics {
         Graphics::new(detect(env, probe), tmux)
     }
 
+    /// Are we inside tmux? The display needs to know beyond the escapes it
+    /// emits: tmux is also the only reason to care about losing focus.
+    pub fn tmux(self) -> bool {
+        self.tmux
+    }
+
     /// Can this terminal draw an image at all? The artwork box is only worth
     /// reserving if a picture will land in it.
     pub fn draws(self) -> bool {
