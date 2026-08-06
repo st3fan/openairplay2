@@ -196,13 +196,67 @@ or a scroll can leave a stale image behind. Our screen is a single in-place
 frame that deletes its image on exit, which is the friendly case, but the
 limitation is real.
 
+## Found while testing: the image outlives the window
+
+*Added after phase 1 was on screen.* Draw the artwork, switch tmux windows, and
+the image stays where it was — floating over whatever window you switched to.
+The plan called this "a pane redraw or a scroll can leave a stale image behind"
+and filed it under caveats. That was too generous: it happens on every window
+switch, which is not a caveat but the display scribbling on other people's
+windows.
+
+tmux does not track images, so nobody deletes ours. But tmux does say when the
+pane stops being the visible one: with `focus-events on` it sends the pane a
+FocusOut as the active pane or window changes. So the display can delete its
+own image the moment it stops being looked at, and re-transmit it on FocusIn.
+
+The catch is the same option as before, one value further along:
+
+```
+allow-passthrough [on | off | all]
+    If set to on, passthrough sequences will be allowed only if the pane is
+    visible.  If set to all, they will be allowed even if the pane is invisible.
+```
+
+The delete is sent *after* we stop being visible, so under `on` tmux drops the
+very sequence that would clean up. **`all` is therefore the setting the README
+should recommend**, with `on` still enough to draw.
+
+`all` also makes the opposite mistake possible — a background display
+transmitting artwork over the window you are actually looking at, every time
+the track changes. So focus is a gate, not just a trigger: while unfocused the
+display transmits **nothing**, and the pending artwork is drawn when focus
+returns. That is what makes `all` safe to recommend.
+
+### Phase 2
+
+- Enable focus reporting under tmux only (`EnableFocusChange` on the way in,
+  `DisableFocusChange` on the way out). Outside tmux, focus loss just means
+  another window is in front and there is nothing to clean up; leaving the
+  terminal untouched keeps that path exactly as it is today.
+- FocusLost → send the delete, forget what is drawn, and stop drawing.
+  FocusGained → start drawing again; the normal redraw re-transmits.
+- `draw_artwork` takes a writer instead of reaching for stdout, so the byte
+  stream can be asserted in tests: the delete goes out on focus loss, nothing
+  at all goes out while unfocused (the `all` footgun), and the image comes back
+  on focus gained.
+- README: recommend `allow-passthrough all` and `focus-events on`, and say what
+  each buys.
+
+The complete fix for this whole class — stale images after a scroll, a redraw,
+or copy-mode, with no tmux options at all — is Kitty's **unicode placeholder**
+placement, where the image becomes text cells tmux itself redraws. That is a
+different way of drawing, Kitty-only, and it belongs in its own issue rather
+than bolted onto this one.
+
 ## Out of scope
 
 - **GNU screen** and its own passthrough envelope. Detected only so that it
   fails quietly.
 - **Sixel**, which is what a terminal without either protocol would need.
-- **Repairing stale images** after a tmux redraw — there is no event to hang it
-  on and no way to ask tmux.
+- **Repairing stale images** after a scroll, a pane redraw or copy-mode. Phase 2
+  handles the window switch, which is the case that happens constantly; the
+  rest needs placeholder placement.
 - **Interrogating the tmux server's environment** (`tmux show-environment -g`)
   to recover a `KITTY_WINDOW_ID` the pane never inherited. Shelling out to
   tmux for a hint the probe already provides is not worth it.
@@ -222,9 +276,15 @@ limitation is real.
 4. With `allow-passthrough` off: no garbage on screen, and `--images none`
    still gives a clean text-only display.
 5. Outside tmux, every terminal that drew artwork before draws it unchanged.
+6. With `allow-passthrough all`, switching tmux windows away from the display
+   leaves no image behind, and switching back brings it straight up. With `on`
+   it still draws, and the stale image is what the README says it is.
 
 ## Phases
 
-One implementation PR on top of this plan: the `Graphics`/`passthrough` work,
-its tests, and the README note together — they are one change and splitting
-them would leave a commit that wraps escapes nobody documents.
+1. The `Graphics`/`passthrough` work, its tests, and the README note together —
+   they are one change and splitting them would leave a commit that wraps
+   escapes nobody documents.
+2. Focus as a gate: delete the image when the pane stops being the visible one,
+   transmit nothing while it isn't, redraw when it is again. Found by testing
+   phase 1 on screen; see above.
