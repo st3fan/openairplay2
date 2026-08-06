@@ -93,6 +93,17 @@ re-pair. Publishing a GitHub Release is now the only event that ships anything:
 `cargo.yml` (crates.io) and `debian.yml` (the architecture matrix) in parallel.
 The binary also handles SIGTERM, which is how systemd stops it.
 
+**Now-playing display ([plan](../plans/20260805-05-tui.md)) — implemented;
+hardware validation pending.** `openairplay2-tui` shows what is playing —
+title/artist/album centered, cover art as a real image in terminals that can
+draw one, position, volume, format and the sender's address — driven by a
+WebSocket the receiver serves with `--tui-listen`. Ported from openairplay1's
+dashboard, with the difference AirPlay 2 allows: pause is on the wire
+(`SETRATEANCHORTIME rate=0`), so the display says "paused" rather than leaving
+a frozen clock unexplained. The library gained the two things it was missing:
+the sender's address on `SessionStarted`, and `Event::Progress` reported by the
+playback thread from the RTP timestamp it is feeding the sink.
+
 ## Design: no PTP, by intent
 
 This receiver targets **one Mac → one stream → one output** and does **not**
