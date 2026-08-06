@@ -1,5 +1,14 @@
 # Milestone 6 — Soft timing: pause/resume, seek, bounded latency (no PTP)
 
+> **Superseded in part (2026-08-01).** The pause design below — "the player
+> drops **all** audio and holds silence" — was wrong on hardware and was
+> replaced by a *hold*: pause parks audio, backpressure freezes the sender, and
+> resume plays from the held buffer. The `flush_gen` generation counter
+> described here does not exist either; each queued packet is stamped with its
+> sequence number and `FLUSHBUFFERED` discards exactly the range it names. See
+> [`plans/20260801-02-pause-resume-hold.md`](../plans/20260801-02-pause-resume-hold.md).
+> The no-PTP rationale in this document still stands.
+
 Goal: make single-stream playback **correct and robust** — honor transport
 control (pause/resume, seek) and bound latency — **without** implementing PTP.
 

@@ -6,7 +6,7 @@
 # parallel and can also be run on their own:
 #
 #   cargo.yml    publish both crates to crates.io
-#   debian.yml   build the .debs (amd64 + arm64, in parallel) and attach them
+#   debian.yml   build the .debs (amd64 + arm64 + armhf, in parallel) and attach them
 #
 # The filename matters: crates.io Trusted Publishing is configured for
 # release.yml, so the crates.io job must keep being reached from here.

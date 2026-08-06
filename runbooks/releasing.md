@@ -41,7 +41,8 @@ exists, so the very first publish is manual:
      `cargo.yml`)
 3. Revoke the API token — it is no longer needed.
 
-*(Done: both crates were published by hand at 0.2.0.)*
+*(Done: both crates were published by hand at 0.1.0 and 0.2.0; 0.3.0 was the
+first automated release.)*
 
 ## Releasing a version
 
@@ -52,17 +53,28 @@ version line for everything — library, binary, and `.deb`.
 
 ### 2. Version-bump PR against main
 
-- Bump `version` in `openairplay2/Cargo.toml` and
-  `openairplay2-receiver/Cargo.toml` (including the `openairplay2 = { version
-  = … }` dependency line), and the library version the receiver depends on.
+- Bump `version` in **all four** manifests — `openairplay2/Cargo.toml`,
+  `openairplay2-receiver/Cargo.toml`, `openairplay2-tui/Cargo.toml`,
+  `openairplay2-tui-protocol/Cargo.toml` — and the `openairplay2 = { version
+  = … }` dependency line in the receiver. (The two `tui` crates are
+  `publish = false`, but the versions are one line for everything.)
+- Bump the `openairplay2 = "X.Y"` line in the README's Embedding section — it
+  is the one version outside a manifest and it has been missed before.
 - Update `notes/status.md` and the README if behavior changed.
 - Run `cargo test --workspace` (this also refreshes `Cargo.lock`).
 - Verify the packages build:
 
   ```sh
   cargo publish --dry-run -p openairplay2
+  cargo publish --dry-run -p openairplay2-receiver
   ./packaging/build-deb.sh              # native (this machine's architecture)
   ```
+
+  **Dry-run every publishable crate, not just the library.** `cargo.yml`
+  publishes the library first, and a crates.io version is immutable — so a
+  receiver that fails to publish leaves the release half-shipped with nothing
+  to undo. Checking only the library is exactly how
+  [#65](https://github.com/st3fan/openairplay2/issues/65) went unnoticed.
 
   Building armhf locally needs the cross toolchain once
   (`./packaging/setup-build.sh cross` on an amd64 box), after which
@@ -97,7 +109,8 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 
 - <https://crates.io/crates/openairplay2> shows the new version, and
   <https://docs.rs/openairplay2> builds and renders (a few minutes).
-- The release page carries both `.deb`s and `SHA256SUMS`.
+- The release page carries all three `.deb`s (amd64, arm64, armhf) and
+  `SHA256SUMS`.
 - Install on a real Linux box and pair from a real Mac:
 
   ```sh
@@ -131,7 +144,7 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 ## If a release goes wrong
 
 A published crates.io version is immutable — it cannot be replaced or deleted.
-Fix forward: `cargo yank --version X.Y.Z -p openairplay2` stops new projects
+Fix forward: `cargo yank openairplay2@X.Y.Z` stops new projects
 resolving the bad version (never breaking existing `Cargo.lock` users), then
 release a patch version.
 

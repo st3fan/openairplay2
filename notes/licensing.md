@@ -10,14 +10,16 @@ matters, get a real legal opinion, particularly regarding FairPlay.**
 
 | Project | How it was used | Nature |
 |---|---|---|
-| **shairport-sync** (James Laird, Mike Brady) | Primary protocol reference: `rtsp.c`, `ap2_buffered_audio_processor.c`, the `_airplay._tcp` TXT-record layout, the `get_info` template, and the `features` bitmask constant (`0x00018340405C4A00`). The buffered block framing and the ChaCha20-Poly1305 nonce/AAD construction were **translated into Rust** — protocol logic, not verbatim C. | Reference + translated logic + one magic constant |
+| **shairport-sync** (James Laird, Mike Brady) | Primary protocol reference: `rtsp.c`, `ap2_buffered_audio_processor.c`, the `_airplay._tcp` TXT-record layout, the `get_info` template, and the `features` bitmask constant (`0x00018340405C4A00`) — which this project then **modified** to `0x00018340405FCA00`, setting metadata bits 15/16/17 (see [`plans/20260802-01`](../plans/20260802-01-metadata-artwork.md)). The buffered block framing and the ChaCha20-Poly1305 nonce/AAD construction were **translated into Rust** — protocol logic, not verbatim C. | Reference + translated logic + one magic constant, modified |
 | **openairplay/airplay2-receiver** (Python) | Cited as a co-source of the FairPlay `fp-setup` tables and referenced conceptually for buffered-audio behaviour. Its FairPlay *decryption* code was **not** used or translated. | Reference only |
-| **FairPlay `fp-setup` tables** (`src/fairplay.rs`: `REPLY0..3`, 4×142 bytes, + the 12-byte phase-2 header) | **Copied verbatim** as binary constants. | Third-party, Apple-derived data (see caveat) |
-| Rust crates: `chacha20poly1305`, `hkdf`, `sha2`, `ed25519-dalek`, `num-bigint`, `symphonia`, `alsa`, `plist`, `zbus`, `tokio`, … | Normal dependencies (crypto, AAC decode, ALSA, mDNS/D-Bus, async). | Dependencies, permissive licenses |
+| **FairPlay `fp-setup` tables** (`openairplay2/src/fairplay.rs`: `REPLY0..3`, 4×142 bytes, + the 12-byte phase-2 header) | **Copied verbatim** as binary constants. | Third-party, Apple-derived data (see caveat) |
+| **openairplay1** (this author) | `openairplay2-tui` is a port of its now-playing dashboard — the screen, the layout maths and the terminal-graphics approach ([plan](../plans/20260805-05-tui.md)). Same author, MIT. | Own prior work |
+| Rust crates: `chacha20poly1305`, `hkdf`, `sha2`, `ed25519-dalek`, `num-bigint`, `alsa`, `plist`, `zbus`, `tokio`, `ratatui`, `crossterm`, … | Normal dependencies (crypto, ALSA, mDNS/D-Bus, async, terminal UI). | Dependencies, permissive licenses (MIT / Apache-2.0 / BSD / Zlib) |
+| **`symphonia`** (AAC decode) | Normal dependency, but the only non-permissive license in the tree. | **MPL-2.0** — weak, file-level copyleft: modifications to symphonia's *own* files would have to be published. We make none, and merely linking it imposes nothing on this project's code. |
 
 Everything else is original Rust written for this project, informed by the
 protocol but not copied: the server/session structure, the pairing/SRP/cipher
-wiring, the pause-gate + generation-flush transport model, the queue-depth
+wiring, the pause-hold + sequence-boundary flush transport model, the queue-depth
 backpressure, and the software-volume path.
 
 ## Verified upstream licenses
@@ -41,7 +43,7 @@ backpressure, and the software-volume path.
 
 ## The FairPlay caveat (matters more than MIT-vs-GPL)
 
-The `fp-setup` tables in `src/fairplay.rs` are **Apple-derived, reverse-
+The `fp-setup` tables in `openairplay2/src/fairplay.rs` are **Apple-derived, reverse-
 engineered material**. Their real legal exposure is Apple's copyright and the
 DMCA §1201 anti-circumvention provisions — **not** which open-source license
 this project picks. A license only governs *our* code; it cannot grant rights to
@@ -71,15 +73,18 @@ MIT for this project's own code is the natural, defensible choice: it matches
 shairport-sync (the primary reference) and the Rust crates, and `Cargo.toml`
 already declares `license = "MIT"`.
 
-To make that real and honest, the repo should carry:
+To make that real and honest, the repo carries — as of the packaging work —
+both of the things this section used to ask for:
 
-1. A top-level **`LICENSE`** file with the MIT text (currently missing — the
-   `Cargo.toml` field alone is not the license grant).
-2. A **`NOTICE.md`** that:
+1. A top-level [**`LICENSE`**](../LICENSE) with the MIT text (© 2026 Stefan
+   Arentz). The `Cargo.toml` field alone is not the license grant; the file is.
+2. A [**`NOTICE.md`**](../NOTICE.md) that:
    - attributes protocol reference to shairport-sync (MIT, Laird/Brady);
    - quarantines the FairPlay `fp-setup` tables as third-party, reverse-
      engineered, Apple-derived interop data — not original to this project,
      included solely for interoperability, with the caveat above.
+
+All four workspace crates declare `license = "MIT"`.
 
 ## Copyright status of AI-assisted code
 
@@ -103,8 +108,11 @@ openairplay2 was written with heavy AI assistance under human direction.
 
 ## Summary
 
-- **Project license:** MIT (add a `LICENSE` file + `NOTICE.md`).
-- **shairport-sync:** MIT — protocol reference and one constant; MIT-compatible.
+- **Project license:** MIT — `LICENSE` and `NOTICE.md` are both in place.
+- **shairport-sync:** MIT — protocol reference and one constant (modified
+  here); MIT-compatible.
+- **`symphonia`:** MPL-2.0 — the one non-permissive dependency; weak file-level
+  copyleft, and we modify none of its files.
 - **airplay2-receiver FairPlay code:** GPLv2 — *not* used/translated here.
 - **FairPlay `fp-setup` tables:** third-party Apple-derived interop data; the
   real caveat is Apple/DMCA, independent of the OSS license chosen.
