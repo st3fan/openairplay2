@@ -191,6 +191,31 @@ you mean otherwise; there is no authentication.
 
 `q`, `Esc` or `Ctrl-C` quits.
 
+### Inside tmux
+
+tmux forwards a graphics escape only when it is wrapped in its passthrough
+envelope — which the display does automatically — **and** when passthrough is
+switched on, which it is not by default:
+
+```sh
+tmux set -g allow-passthrough on          # now, in the running server
+echo 'set -g allow-passthrough on' >> ~/.tmux.conf   # and next time
+```
+
+Without it the text display works and the artwork box simply stays empty;
+nothing is ever sprayed across the screen. `--log-file PATH` says which
+protocol was detected and whether it is wrapping (`kitty (wrapped for tmux)`).
+
+Detection has less to go on inside a pane: `TERM` and `TERM_PROGRAM` describe
+tmux rather than the terminal you are looking at, so the display asks the
+terminal directly and falls back to whatever the outer environment left behind.
+If it guesses wrong, `--images kitty` or `--images iterm2` settles it.
+
+One honest caveat: tmux does not track images, so a pane redraw or a scroll can
+leave a stale one behind. The display is a single in-place frame that deletes
+its image when it exits, which is the friendly case, but the limitation is
+real — and it is tmux's, not something this program can fix.
+
 ## Embedding
 
 The library's public API is small: build a `Receiver`, hand it a sink factory
