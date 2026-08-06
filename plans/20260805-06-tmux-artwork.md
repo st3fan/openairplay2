@@ -12,8 +12,8 @@
 ## Background
 
 `openairplay2-tui` draws cover art with the Kitty graphics protocol or iTerm2
-inline images. Run inside tmux (reported on `bee`) the text layout appears and
-the artwork does not, for two independent reasons:
+inline images. Run inside tmux the text layout appears and the artwork does
+not, for two independent reasons:
 
 1. **Detection is blind through tmux.** `TERM` becomes `tmux-256color` /
    `screen-256color`, so the `TERM` tests in `images::detect` no longer match,
@@ -31,6 +31,28 @@ the artwork does not, for two independent reasons:
 Both halves are ours. The user's half is `set -g allow-passthrough on`: tmux
 3.3+ gates passthrough behind that option and it defaults to off. Necessary,
 not sufficient — hence this plan.
+
+### What skynet actually looks like
+
+The development workstation is the reported case, which makes it the test rig
+as well as the target — Debian trixie, tmux 3.5a, Ghostty 1.3.1 outside. Inside
+a pane:
+
+```
+TMUX=/tmp/tmux-1000/default,…    TERM=xterm-256color    TERM_PROGRAM=tmux
+GHOSTTY_RESOURCES_DIR=/usr/share/ghostty    GHOSTTY_BIN_DIR=/usr/bin
+$ tmux show -gv allow-passthrough
+off
+```
+
+Three things to take from that. `TERM` is **not** `tmux-*` here (tmux's
+`default-terminal` is set to `xterm-256color`), so `$TMUX` is the signal that
+actually fires and the `TERM` prefix test is only a backstop — worth having,
+never load-bearing. The `GHOSTTY_*` variables *did* leak in, so `detect`
+already returns `Kitty` and the escapes already go out: this is the empty-box
+half of the issue, not the no-box half. And `allow-passthrough` is off, so the
+first thing to verify after the change is that turning it on is what flips the
+artwork on.
 
 ## The envelope
 
@@ -189,11 +211,14 @@ limitation is real.
 
 1. `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check` clean; the
    tui crate still builds on macOS (CI enforces it).
-2. Inside tmux on `bee` with `allow-passthrough on`, in a Kitty-protocol
-   terminal: cover art appears, changes with the track, and is gone after `q`.
+2. On skynet, in tmux inside Ghostty, with `allow-passthrough on`: cover art
+   appears, changes with the track, and is gone after `q`. Toggling
+   `allow-passthrough` off and on is what turns the artwork off and on — that
+   is the proof the envelope is what carried it.
 3. The same with `--images kitty` forced, and with the probe the only signal
-   (no `KITTY_WINDOW_ID` in the pane) — `--log-file` shows the protocol and the
-   tmux fact.
+   (`env -u GHOSTTY_RESOURCES_DIR -u GHOSTTY_BIN_DIR`, so nothing about the
+   outer terminal survives into the pane) — `--log-file` shows the protocol and
+   the tmux fact.
 4. With `allow-passthrough` off: no garbage on screen, and `--images none`
    still gives a clean text-only display.
 5. Outside tmux, every terminal that drew artwork before draws it unchanged.
