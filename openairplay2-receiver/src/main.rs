@@ -45,6 +45,8 @@ struct Args {
     tui_listen: Option<String>,
     /// Require this password on the now-playing WebSocket; `None` → open.
     tui_password: Option<String>,
+    /// Log verbosity (`error`/`warn`/`info`/`debug`/`trace`); `None` → `info`.
+    log_level: Option<String>,
 }
 
 /// The device to open after flags and environment have merged: `None` is
@@ -103,6 +105,10 @@ options:
                             one, anyone who can reach the address connects.
                             Prefer the OPENAIRPLAY2_TUI_PASSWORD variable —
                             like --pincode, a flag is visible in ps
+  --log-level LEVEL         error, warn, info, debug or trace (default info);
+                            debug logs every request a sender makes and
+                            hex-dumps the bodies
+  --debug                   shorthand for --log-level debug
   --list-devices            list the audio outputs (one per sound card) and
                             exit — pass one to --alsa-device
   --list-all-devices        list every ALSA playback device, including
@@ -112,11 +118,13 @@ options:
 
 Each option can also come from the environment — OPENAIRPLAY2_NAME, _PORT,
 _MAC, _IDENTITY_FILE, _PINCODE, _AVAHI (on/off), _AUDIO (on/off),
-_ALSA_DEVICE, _TUI_LISTEN, _TUI_PASSWORD — which is how /etc/default/openairplay2-receiver
-configures the service. A flag wins over its variable; an empty variable is
-unset. %h in the name becomes this machine's hostname.
+_ALSA_DEVICE, _TUI_LISTEN, _TUI_PASSWORD, _LOG_LEVEL — which is how
+/etc/default/openairplay2-receiver configures the service. A flag wins over its
+variable; an empty variable is unset. %h in the name becomes this machine's
+hostname.
 
-RUST_LOG=debug logs every request a sender makes and hex-dumps the bodies.
+RUST_LOG overrides --log-level for per-module control, e.g.
+RUST_LOG=openairplay2::session=trace.
 ";
 
 /// Parse the `--mac` argument, e.g. `aa:bb:cc:dd:ee:ff`.
@@ -143,6 +151,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         pincode: None,
         tui_listen: None,
         tui_password: None,
+        log_level: None,
     };
     let value = |flag: &str, it: &mut dyn Iterator<Item = String>| {
         it.next().ok_or_else(|| format!("{flag} needs a value"))
@@ -172,6 +181,12 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
             "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
+            "--log-level" => {
+                let v = value("--log-level", &mut it)?;
+                args.log_level = Some(log_level_value(&v).map_err(|e| format!("--log-level {e}"))?);
+            }
+            // Sugar for the common case; later-flag-wins with --log-level.
+            "--debug" => args.log_level = Some("debug".to_string()),
             "--list-devices" => return Ok(Action::ListDevices),
             "--list-all-devices" => return Ok(Action::ListAllDevices),
             "--version" => return Ok(Action::Version),
@@ -192,6 +207,18 @@ fn port_value(v: &str) -> Result<u16, String> {
 
 fn mac_value(v: &str) -> Result<[u8; 6], String> {
     parse_mac(v).ok_or_else(|| format!("needs AA:BB:CC:DD:EE:FF, not \"{v}\""))
+}
+
+/// Normalize a log level, so `--log-level DEBUG` and `debug` are the same, and
+/// a nonsense level is rejected rather than silently disabling logging.
+fn log_level_value(v: &str) -> Result<String, String> {
+    let level = v.to_ascii_lowercase();
+    match level.as_str() {
+        "error" | "warn" | "info" | "debug" | "trace" => Ok(level),
+        _ => Err(format!(
+            "must be error, warn, info, debug or trace, not \"{v}\""
+        )),
+    }
 }
 
 fn on_off_value(v: &str) -> Result<bool, String> {
@@ -246,6 +273,12 @@ fn resolve(mut args: Args, env: impl Fn(&str) -> Option<String>) -> Result<Args,
     }
     if args.tui_password.is_none() {
         args.tui_password = get("OPENAIRPLAY2_TUI_PASSWORD");
+    }
+    if args.log_level.is_none() {
+        if let Some(v) = get("OPENAIRPLAY2_LOG_LEVEL") {
+            args.log_level =
+                Some(log_level_value(&v).map_err(|e| format!("OPENAIRPLAY2_LOG_LEVEL {e}"))?);
+        }
     }
     Ok(args)
 }
@@ -372,7 +405,6 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = match parse(std::env::args().skip(1)) {
         Ok(Action::Run(args)) => args,
         Ok(Action::Help) => {
@@ -407,6 +439,13 @@ async fn main() -> ExitCode {
             return ExitCode::from(EXIT_CONFIG);
         }
     };
+    // Initialize logging now that the level is known: --log-level / --debug /
+    // OPENAIRPLAY2_LOG_LEVEL set the default, and RUST_LOG still overrides it
+    // (for per-module control like `openairplay2::session=trace`). Argument
+    // errors above went to stderr, so nothing was logged before this.
+    let level = args.log_level.as_deref().unwrap_or("info");
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+
     if let Some(msg) = legacy_args_notice(|k| std::env::var(k).ok()) {
         error!("{msg}");
     }
@@ -629,6 +668,7 @@ mod tests {
         assert_eq!(args.alsa_device, None);
         assert_eq!(args.pincode, None);
         assert_eq!(args.tui_listen, None);
+        assert_eq!(args.log_level, None);
         // The effective outcome: audio on, default device.
         assert_eq!(
             effective_device(&args).as_deref(),
@@ -654,6 +694,8 @@ mod tests {
             "4821",
             "--tui-listen",
             "127.0.0.1:7392",
+            "--log-level",
+            "DEBUG",
         ]);
         assert_eq!(args.name.as_deref(), Some("Kitchen"));
         assert_eq!(args.port, Some(7100));
@@ -666,6 +708,26 @@ mod tests {
         assert_eq!(effective_device(&args).as_deref(), Some("hw:1"));
         assert_eq!(args.pincode.as_deref(), Some("4821"));
         assert_eq!(args.tui_listen.as_deref(), Some("127.0.0.1:7392"));
+        // Normalized to lowercase.
+        assert_eq!(args.log_level.as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn debug_is_shorthand_and_later_flag_wins() {
+        assert_eq!(run_args(&["--debug"]).log_level.as_deref(), Some("debug"));
+        // Later flag wins between the two spellings.
+        assert_eq!(
+            run_args(&["--debug", "--log-level", "warn"])
+                .log_level
+                .as_deref(),
+            Some("warn")
+        );
+        assert_eq!(
+            run_args(&["--log-level", "warn", "--debug"])
+                .log_level
+                .as_deref(),
+            Some("debug")
+        );
     }
 
     #[test]
@@ -695,6 +757,7 @@ mod tests {
             ("OPENAIRPLAY2_ALSA_DEVICE", "hw:1"),
             ("OPENAIRPLAY2_TUI_LISTEN", "0.0.0.0:7392"),
             ("OPENAIRPLAY2_TUI_PASSWORD", "sekrit"),
+            ("OPENAIRPLAY2_LOG_LEVEL", "Debug"),
         ];
         let args = resolve(run_args(&[]), env_of(&env)).unwrap();
         assert_eq!(args.name.as_deref(), Some("Kitchen %h"));
@@ -708,7 +771,8 @@ mod tests {
         assert_eq!(args.avahi, Some(false));
         assert_eq!(args.tui_listen.as_deref(), Some("0.0.0.0:7392"));
         assert_eq!(args.tui_password.as_deref(), Some("sekrit"));
-        // The audio switch dominates the device name.
+        assert_eq!(args.log_level.as_deref(), Some("debug")); // normalized
+                                                              // The audio switch dominates the device name.
         assert_eq!(effective_device(&args), None);
     }
 
@@ -743,6 +807,7 @@ mod tests {
             ("OPENAIRPLAY2_MAC", "not-a-mac"),
             ("OPENAIRPLAY2_AVAHI", "yes"),
             ("OPENAIRPLAY2_AUDIO", "1"),
+            ("OPENAIRPLAY2_LOG_LEVEL", "loud"),
         ];
         for (var, value) in cases {
             let env = [(var, value)];
@@ -833,6 +898,8 @@ mod tests {
             &["--no-audio"],
             &["--tui-listen", "x"],
             &["--tui-password", "x"],
+            &["--log-level", "info"],
+            &["--debug"],
             &["--list-devices"],
             &["--list-all-devices"],
             &["--version"],

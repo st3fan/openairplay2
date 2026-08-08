@@ -40,8 +40,14 @@
 # who can reach the address connects.
 #OPENAIRPLAY2_TUI_PASSWORD=
 
+# Log verbosity: error, warn, info, debug or trace. debug is the full
+# protocol trace (every request, bodies hex-dumped — very chatty while
+# playing).
+#OPENAIRPLAY2_LOG_LEVEL=info
+
 # OPENAIRPLAY2_IDENTITY_FILE is set by the systemd unit (--identity-file,
 # which wins) and should not be set here.
 
-# Set RUST_LOG=debug for the full protocol trace (very chatty while playing).
-#RUST_LOG=debug
+# RUST_LOG overrides OPENAIRPLAY2_LOG_LEVEL for per-module control, e.g.
+# RUST_LOG=openairplay2::session=trace.
+#RUST_LOG=
