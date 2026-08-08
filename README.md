@@ -150,7 +150,7 @@ cargo install openairplay2-receiver
 
 | Option | Environment variable | Description | Default |
 | --- | --- | --- | --- |
-| `--name NAME` | `OPENAIRPLAY2_NAME` | Name advertised to senders (mDNS + `GET /info`); `%h` becomes the hostname | `OpenAirPlay2` |
+| `--name NAME` | `OPENAIRPLAY2_NAME` | Name advertised to senders (mDNS + `GET /info`); `%h` becomes the hostname | `OpenAirPlay2 (%h)` |
 | `--port PORT` | `OPENAIRPLAY2_PORT` | TCP port for the HTTP/RTSP control server | `7000` |
 | `--mac AA:BB:CC:DD:EE:FF` | `OPENAIRPLAY2_MAC` | Device ID (`deviceid`) reported to senders | discovered from a network interface, else a fixed fallback |
 | `--identity-file PATH` | `OPENAIRPLAY2_IDENTITY_FILE` | Where the Ed25519 identity keypair is stored | `~/.config/openairplay2/identity` |

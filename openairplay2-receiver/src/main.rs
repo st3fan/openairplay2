@@ -21,7 +21,8 @@ const DEFAULT_ALSA_DEVICE: &str = "default";
 /// built-in defaults apply.
 #[derive(Debug, PartialEq)]
 struct Args {
-    /// `None` → the library's defaults (name "OpenAirPlay2", port 7000).
+    /// `None` → [`DEFAULT_NAME`] (`display_name`); port falls back to the
+    /// library default (7000).
     name: Option<String>,
     port: Option<u16>,
     mac: Option<[u8; 6]>,
@@ -69,8 +70,9 @@ openairplay2-receiver — standalone AirPlay 2 audio receiver (ALSA)
 usage: openairplay2-receiver [options]
 
 options:
-  --name NAME               name senders see in the AirPlay menu
-                            (default \"OpenAirPlay2\")
+  --name NAME               name senders see in the AirPlay menu; %h in it
+                            becomes the hostname
+                            (default \"OpenAirPlay2 (%h)\")
   --port PORT               control port (default 7000)
   --mac AA:BB:CC:DD:EE:FF   device id in the advertisement (default: taken
                             from a real network interface)
@@ -254,6 +256,25 @@ fn legacy_args_notice(env: impl Fn(&str) -> Option<String>) -> Option<String> {
         })
 }
 
+/// The advertised name when none is configured. `%h` expands to the hostname
+/// (see [`display_name`]), so out of the box each receiver is distinguishable
+/// on a network of several — "OpenAirPlay2 (kitchen-pi)", not a wall of
+/// identical "OpenAirPlay2".
+const DEFAULT_NAME: &str = "OpenAirPlay2 (%h)";
+
+/// The name to advertise: the configured name, or [`DEFAULT_NAME`], with `%h`
+/// expanded to `hostname`. With no hostname to expand, the default drops to a
+/// bare "OpenAirPlay2" rather than showing literal "(%h)", while an explicit
+/// name is left exactly as the user wrote it.
+fn display_name(configured: Option<String>, hostname: Option<String>) -> String {
+    match (configured, hostname) {
+        (Some(name), Some(host)) => substitute(&name, &host),
+        (Some(name), None) => name,
+        (None, Some(host)) => substitute(DEFAULT_NAME, &host),
+        (None, None) => "OpenAirPlay2".to_string(),
+    }
+}
+
 /// `%h` → this machine's hostname, `%%` → a literal `%`; anything else passes
 /// through. One options file can then be deployed unedited across machines.
 fn substitute(name: &str, hostname: &str) -> String {
@@ -373,15 +394,9 @@ async fn main() -> ExitCode {
     let mut builder = Receiver::builder()
         .identity_path(&identity_path)
         .advertise(args.avahi.unwrap_or(true));
-    if let Some(name) = args.name {
-        // %h in a name becomes the hostname (skipped if there is none to be
-        // had — a literal %h beats losing the name).
-        let name = match hostname() {
-            Some(host) => substitute(&name, &host),
-            None => name,
-        };
-        builder = builder.name(name);
-    }
+    // Always set the name: the default itself carries the hostname now, so the
+    // library's plain fallback is never what a receiver advertises.
+    builder = builder.name(display_name(args.name, hostname()));
     if let Some(port) = args.port {
         builder = builder.port(port);
     }
@@ -716,6 +731,26 @@ mod tests {
         assert_eq!(substitute("100%% %h", "pi"), "100% pi");
         assert_eq!(substitute("50%", "pi"), "50%");
         assert_eq!(substitute("%x", "pi"), "%x");
+    }
+
+    #[test]
+    fn default_name_carries_the_hostname() {
+        // No name configured → the default template, hostname filled in.
+        assert_eq!(
+            display_name(None, Some("kitchen-pi".into())),
+            "OpenAirPlay2 (kitchen-pi)"
+        );
+        // No hostname either → a bare name, never a literal "(%h)".
+        assert_eq!(display_name(None, None), "OpenAirPlay2");
+        // A configured name wins and still gets %h expansion.
+        assert_eq!(
+            display_name(Some("Studio %h".into()), Some("pi".into())),
+            "Studio pi"
+        );
+        assert_eq!(
+            display_name(Some("Living Room".into()), Some("pi".into())),
+            "Living Room"
+        );
     }
 
     #[test]
