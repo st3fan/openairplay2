@@ -59,6 +59,7 @@ enum Action {
     Help,
     Version,
     ListDevices,
+    ListAllDevices,
 }
 
 const USAGE: &str = "usage: openairplay2-receiver [options] — run with --help for the list";
@@ -92,7 +93,10 @@ options:
                             one, anyone who can reach the address connects.
                             Prefer the OPENAIRPLAY2_TUI_PASSWORD variable —
                             like --pincode, a flag is visible in ps
-  --list-devices            list the ALSA playback devices and exit
+  --list-devices            list the audio outputs (one per sound card) and
+                            exit — pass one to --alsa-device
+  --list-all-devices        list every ALSA playback device, including
+                            hardware sub-devices and plugins, and exit
   --version                 print the version and exit
   -h, --help                print this help
 
@@ -159,6 +163,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
             "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
             "--list-devices" => return Ok(Action::ListDevices),
+            "--list-all-devices" => return Ok(Action::ListAllDevices),
             "--version" => return Ok(Action::Version),
             "-h" | "--help" => return Ok(Action::Help),
             other => return Err(format!("unknown argument: {other}")),
@@ -299,6 +304,17 @@ fn sigpipe_default() {
     }
 }
 
+/// Turn a device-listing result into a process exit.
+fn list_result(result: Result<(), alsa::Error>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: cannot list ALSA devices: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn default_identity_path() -> PathBuf {
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(".config/openairplay2/identity"),
@@ -341,13 +357,11 @@ async fn main() -> ExitCode {
         }
         Ok(Action::ListDevices) => {
             sigpipe_default();
-            return match player::list_devices() {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: cannot list ALSA devices: {e}");
-                    ExitCode::FAILURE
-                }
-            };
+            return list_result(player::list_devices());
+        }
+        Ok(Action::ListAllDevices) => {
+            sigpipe_default();
+            return list_result(player::list_all_devices());
         }
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -724,6 +738,10 @@ mod tests {
         assert_eq!(parse_strs(&["-h"]), Ok(Action::Help));
         assert_eq!(parse_strs(&["--version"]), Ok(Action::Version));
         assert_eq!(parse_strs(&["--list-devices"]), Ok(Action::ListDevices));
+        assert_eq!(
+            parse_strs(&["--list-all-devices"]),
+            Ok(Action::ListAllDevices)
+        );
     }
 
     #[test]
@@ -758,6 +776,7 @@ mod tests {
             &["--tui-listen", "x"],
             &["--tui-password", "x"],
             &["--list-devices"],
+            &["--list-all-devices"],
             &["--version"],
             &["--help"],
         ];

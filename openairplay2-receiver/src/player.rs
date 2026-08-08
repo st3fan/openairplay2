@@ -59,56 +59,50 @@ fn triage(device: &str, e: alsa::Error) -> Probe {
     }
 }
 
-/// Whether a device name is worth offering as an `--alsa-device` target.
+/// The short device list: `default`, then one friendly entry per sound card —
+/// the way a desktop's sound settings show "Built-in Audio", "USB DAC", "HDMI"
+/// rather than ALSA's wall of plugin definitions.
 ///
-/// ALSA's hint list is dominated by plugin definitions — the null sink,
-/// software mixers (`dmix`/`dsnoop`), channel-layout plugins (`surround*`,
-/// `front`, …) and rate/channel converters — that are either irrelevant to a
-/// plain stereo receiver or a worse pick than the card's own
-/// `default`/`plughw`/`hw`/`sysdefault` and its digital/HDMI outputs. Keep the
-/// real outputs, drop the plumbing. This is a denylist by plugin family (the
-/// token before the first `:`), so an unfamiliar real device is still shown.
-fn is_listable_device(name: &str) -> bool {
-    let family = name.split(':').next().unwrap_or(name);
-    const DROP_EXACT: &[&str] = &[
-        "null",
-        "front",
-        "rear",
-        "side",
-        "center_lfe",
-        "oss",
-        "modem",
-        "phoneline",
-    ];
-    const DROP_PREFIX: &[&str] = &[
-        "dmix",       // shared software mixing — the default already uses it
-        "dsnoop",     // shared capture
-        "dshare",     // shared output plumbing
-        "surround",   // multichannel profiles; this receiver is stereo
-        "samplerate", // rate converters
-        "speexrate",
-        "lavrate",
-        "upmix",     // channel converters
-        "vdownmix",  //
-        "usbstream", // raw USB gadget stream
-    ];
-    !DROP_EXACT.contains(&family) && !DROP_PREFIX.iter().any(|p| family.starts_with(p))
+/// Each card becomes `plughw:CARD=<id>` (stable across reboots, and the `plug`
+/// layer converts to whatever the hardware wants, so this receiver's 44.1 kHz
+/// stereo always plays) labelled with the card's human name. `--list-all-devices`
+/// is the escape hatch for a specific sub-device or a raw/plugin PCM.
+pub fn list_devices() -> Result<(), alsa::Error> {
+    println!("default");
+    println!("    System default output");
+
+    // Only cards that actually expose a playback PCM (skip capture-only ones
+    // like a webcam mic). Derived from the playback hints, which every
+    // playable card contributes a `…:CARD=<id>` entry to.
+    let playback = playback_card_ids();
+
+    for card in alsa::card::Iter::new() {
+        let card = card?;
+        let Ok(info) = alsa::ctl::Ctl::from_card(&card, false).and_then(|c| c.card_info()) else {
+            continue;
+        };
+        let Ok(id) = info.get_id() else { continue };
+        if !playback.contains(id) {
+            continue;
+        }
+        let name = info.get_name().unwrap_or(id);
+        println!("plughw:CARD={id}");
+        println!("    {name}");
+    }
+    Ok(())
 }
 
-/// Print the playback devices, `aplay -L` style: the name to give
-/// `--alsa-device`, with ALSA's description indented beneath it. Plugin
-/// definitions that aren't real outputs are filtered out — see
-/// [`is_listable_device`].
-pub fn list_devices() -> Result<(), alsa::Error> {
+/// The full device list: every playback PCM ALSA offers, `aplay -L` style —
+/// named devices, hardware sub-devices, and the plugin definitions
+/// (`dmix`, `surround*`, converters, `null`, …). For when the short list from
+/// [`list_devices`] doesn't name the exact device you need.
+pub fn list_all_devices() -> Result<(), alsa::Error> {
     for hint in alsa::device_name::HintIter::new_str(None, "pcm")? {
         // Capture-only devices can never be the output.
         if hint.direction == Some(Direction::Capture) {
             continue;
         }
         let Some(name) = hint.name else { continue };
-        if !is_listable_device(&name) {
-            continue;
-        }
         println!("{name}");
         if let Some(desc) = hint.desc {
             for line in desc.lines() {
@@ -117,6 +111,31 @@ pub fn list_devices() -> Result<(), alsa::Error> {
         }
     }
     Ok(())
+}
+
+/// The card ids (`CARD=<id>`) that appear among the playback hints.
+fn playback_card_ids() -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(hints) = alsa::device_name::HintIter::new_str(None, "pcm") {
+        for hint in hints {
+            if hint.direction == Some(Direction::Capture) {
+                continue;
+            }
+            if let Some(id) = hint.name.as_deref().and_then(card_id_of) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The card id in a hint or device name — the `<id>` of `CARD=<id>`, e.g.
+/// `NVidia` in `plughw:CARD=NVidia,DEV=3`. `None` for names without a card
+/// (`default`, `pulse`, `null`).
+fn card_id_of(name: &str) -> Option<String> {
+    let after = name.split("CARD=").nth(1)?;
+    let id: String = after.chars().take_while(|&c| c != ',').collect();
+    (!id.is_empty()).then_some(id)
 }
 
 /// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
@@ -386,34 +405,19 @@ mod tests {
     }
 
     #[test]
-    fn list_filter_keeps_real_outputs_and_drops_plumbing() {
-        for keep in [
-            "default",
-            "pipewire",
-            "pulse",
-            "jack",
-            "sysdefault:CARD=Generic",
-            "hw:CARD=S2,DEV=0",
-            "plughw:CARD=S2,DEV=0",
-            "hdmi:CARD=NVidia,DEV=0",
-            "iec958:CARD=Generic,DEV=0",
-        ] {
-            assert!(is_listable_device(keep), "should keep {keep}");
-        }
-        for drop in [
-            "null",
-            "dmix:CARD=NVidia,DEV=3",
-            "dsnoop:CARD=S2,DEV=0",
-            "surround51:CARD=Generic,DEV=0",
-            "surround21:CARD=S2,DEV=0",
-            "front:CARD=S2,DEV=0",
-            "samplerate",
-            "speexrate",
-            "upmix",
-            "vdownmix",
-            "usbstream",
-        ] {
-            assert!(!is_listable_device(drop), "should drop {drop}");
-        }
+    fn card_id_parsing() {
+        assert_eq!(
+            card_id_of("plughw:CARD=NVidia,DEV=3").as_deref(),
+            Some("NVidia")
+        );
+        assert_eq!(
+            card_id_of("sysdefault:CARD=Generic").as_deref(),
+            Some("Generic")
+        );
+        assert_eq!(card_id_of("hw:CARD=S2,DEV=0").as_deref(), Some("S2"));
+        // Names without a card have no id.
+        assert_eq!(card_id_of("default"), None);
+        assert_eq!(card_id_of("pulse"), None);
+        assert_eq!(card_id_of("null"), None);
     }
 }
