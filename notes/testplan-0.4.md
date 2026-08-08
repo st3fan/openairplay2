@@ -107,7 +107,8 @@ Must have: the service fails to start; journal shows an error naming
 Must have: the control server is listening on 7010. Set it back / remove it.
 
 **3.8** Leave a line empty, e.g. `OPENAIRPLAY2_NAME=`, restart.
-Must have: the default name (`OpenAirPlay2`) is used — empty means unset, not blank.
+Must have: the default name `OpenAirPlay2 (<hostname>)` is used — empty means
+unset (fall back to the default), not a blank name.
 
 ---
 
