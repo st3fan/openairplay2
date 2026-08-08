@@ -30,7 +30,10 @@ Must have: `OK` for both `openairplay2-receiver_0.4.0-1_ARCH.deb` and
 `openairplay2-tui_0.4.0-1_ARCH.deb`.
 
 **1.2** `sudo apt-get install -y ./openairplay2-receiver_0.4.0-1_ARCH.deb`
-Must have: install succeeds, no dependency errors.
+Must have: install succeeds, no dependency errors. (Installing from a home
+directory also prints a harmless `N: Download is performed unsandboxed …
+Permission denied` note — that is apt's sandbox falling back, not a failure.
+Install from `/tmp` to avoid it.)
 
 **1.3** `systemctl is-enabled openairplay2-receiver && systemctl is-active openairplay2-receiver`
 Must have: `enabled` then `active`.
@@ -38,14 +41,17 @@ Must have: `enabled` then `active`.
 **1.4** `id openairplay2`
 Must have: the user exists and is in the `audio` group.
 
-**1.5** `sudo apt-get install -y ./openairplay2-tui_0.4.0-1_ARCH.deb`
-Must have: install succeeds; pulls in `libc6` only (no ALSA/Avahi).
+**1.5** `sudo apt-get install -y ./openairplay2-tui_0.4.0-1_ARCH.deb` then
+`dpkg-deb -f openairplay2-tui_0.4.0-1_ARCH.deb Depends`
+Must have: install succeeds; `Depends` is `libc6` only (no ALSA/Avahi).
 
 **1.6** `dpkg -L openairplay2-tui | grep bin`
 Must have: `/usr/bin/openairplay2-tui` is present.
 
-**1.7** `apt-get install --dry-run ./openairplay2-receiver_0.4.0-1_ARCH.deb 2>&1 | grep -i suggest`
-Must have: `openairplay2-tui` listed as a suggestion.
+**1.7** `dpkg-deb -f openairplay2-receiver_0.4.0-1_ARCH.deb Suggests`
+Must have: prints `openairplay2-tui`. (Reads the field straight from the
+`.deb`, so it works whether or not the package is already installed — a
+dry-run only prints "Suggested packages" when it actually plans an install.)
 
 **1.8** `gh attestation verify openairplay2-receiver_0.4.0-1_ARCH.deb --repo st3fan/openairplay2`
 Must have: verification succeeds (a signed build-provenance attestation).
