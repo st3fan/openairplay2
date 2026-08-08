@@ -159,6 +159,7 @@ cargo install openairplay2-receiver
 | `--no-audio` | `OPENAIRPLAY2_AUDIO=off` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | `OPENAIRPLAY2_AVAHI=off` | Don't advertise over Avahi / mDNS | advertising on |
 | `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
+| `--tui-password PASS` | `OPENAIRPLAY2_TUI_PASSWORD` | Require this password on the now-playing WebSocket (`openairplay2-tui --password`). Prefer the variable — a flag is visible in `ps`. | open |
 | `--pincode CODE` | `OPENAIRPLAY2_PINCODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged. Prefer the environment variable (the service's options file): a `--pincode` argument is visible to any local user in `ps`, an environment variable is not. | transient `3939` |
 
 Every option falls back to its environment variable when the flag is absent —
@@ -224,6 +225,7 @@ you mean otherwise; there is no authentication.
 | `--connect ws://HOST:PORT` | Receiver endpoint to watch | `ws://127.0.0.1:7392` |
 | `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
 | `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
+| `--password PASS` | Password for a receiver whose endpoint requires one; falls back to `OPENAIRPLAY2_TUI_PASSWORD`, which unlike a flag is not visible in `ps` | none |
 | `-h`, `--help` | Print usage and exit | — |
 
 `q`, `Esc` or `Ctrl-C` quits.

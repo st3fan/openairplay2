@@ -59,6 +59,8 @@ enum Connection {
     Connecting,
     Connected,
     Lost,
+    /// The receiver wants a password we don't have (or ours is wrong).
+    Unauthorized,
 }
 
 /// Where playback is, as last reported.
@@ -125,6 +127,7 @@ impl NowPlaying {
         match update {
             Update::Connected => self.connection = Connection::Connected,
             Update::Disconnected => self.connection = Connection::Lost,
+            Update::Unauthorized => self.connection = Connection::Unauthorized,
             Update::Message(message) => self.apply_message(*message),
         }
     }
@@ -234,6 +237,9 @@ impl NowPlaying {
             lines.push(Line::from(
                 match self.connection {
                     Connection::Lost => "connection lost, retrying…",
+                    Connection::Unauthorized => {
+                        "the receiver wants a password — start with --password"
+                    }
                     _ => "connecting…",
                 }
                 .dim(),
@@ -846,6 +852,15 @@ mod tests {
             !screen.contains("0:01 / 0:02"),
             "the clock must stop: {screen}"
         );
+    }
+
+    #[test]
+    fn a_refused_password_says_so_instead_of_looking_dead() {
+        let mut state = playing();
+        state.apply(Update::Unauthorized);
+        let screen = draw(&state, 60, 12);
+        assert!(screen.contains("wants a password"), "{screen}");
+        assert!(screen.contains("--password"), "{screen}");
     }
 
     #[test]

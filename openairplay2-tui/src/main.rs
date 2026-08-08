@@ -32,6 +32,8 @@ struct Args {
     /// Where log output goes. The display owns the screen, so logs are
     /// dropped unless this names a file.
     log_file: Option<String>,
+    /// Password for a receiver that requires one on its endpoint.
+    password: Option<String>,
 }
 
 /// What the command line asks for; everything but `Run` prints and exits.
@@ -59,6 +61,10 @@ options:
                             (default auto)
   --log-file PATH           append logs here; the display owns the screen,
                             so without this logs are dropped
+  --password PASS           password for a receiver whose endpoint requires
+                            one (--tui-password on the receiver); falls back
+                            to the OPENAIRPLAY2_TUI_PASSWORD variable, which
+                            unlike a flag is not visible in ps
   --version                 print the version and exit
   -h, --help                print this help
 ";
@@ -70,6 +76,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         endpoint: DEFAULT_ENDPOINT.to_string(),
         images: None,
         log_file: None,
+        password: None,
     };
     let value = |flag: &str, it: &mut dyn Iterator<Item = String>| {
         it.next().ok_or_else(|| format!("{flag} needs a value"))
@@ -87,6 +94,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
                 };
             }
             "--log-file" => args.log_file = Some(value("--log-file", &mut it)?),
+            "--password" => args.password = Some(value("--password", &mut it)?),
             "--version" => return Ok(Action::Version),
             "-h" | "--help" => return Ok(Action::Help),
             other => return Err(format!("unknown argument: {other}")),
@@ -180,8 +188,28 @@ async fn main() -> ExitCode {
         args.endpoint
     );
 
+    // The flag wins; the variable is the ps-safe way to hand it over.
+    let password = args.password.clone().or_else(|| {
+        std::env::var("OPENAIRPLAY2_TUI_PASSWORD")
+            .ok()
+            .filter(|v| !v.is_empty())
+    });
+    if let Some(p) = &password {
+        // Validate once, so the client can rely on it: a password must be
+        // able to travel in an HTTP header.
+        if format!("Bearer {p}")
+            .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
+            .is_err()
+        {
+            eprintln!(
+                "error: the password contains characters that cannot travel in an HTTP header"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+
     let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(client::run(args.endpoint.clone(), updates_tx));
+    tokio::spawn(client::run(args.endpoint.clone(), password, updates_tx));
 
     match tui::run(updates_rx, args.endpoint, images).await {
         Ok(_) => ExitCode::SUCCESS,
@@ -268,6 +296,7 @@ mod tests {
             &["--connect", "x"],
             &["--images", "none"],
             &["--log-file", "x"],
+            &["--password", "x"],
             &["--version"],
             &["--help"],
         ];

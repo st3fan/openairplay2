@@ -133,14 +133,23 @@ fn display_addr(addr: std::net::IpAddr) -> String {
     }
 }
 
-/// Accept display connections until the listener fails.
-pub async fn serve(listener: TcpListener, publisher: Publisher) -> std::io::Result<()> {
+/// Accept display connections until the listener fails. With a `password`,
+/// a client must present it before the WebSocket upgrade; without one,
+/// anyone who can reach the port connects (the options file's advice to
+/// keep the address on loopback stands either way).
+pub async fn serve(
+    listener: TcpListener,
+    publisher: Publisher,
+    password: Option<String>,
+) -> std::io::Result<()> {
+    let password = Arc::new(password);
     loop {
         let (stream, peer) = listener.accept().await?;
         let publisher = publisher.clone();
+        let password = password.clone();
         tokio::spawn(async move {
             debug!("tui [{peer}] connected");
-            if let Err(e) = serve_client(stream, peer, publisher).await {
+            if let Err(e) = serve_client(stream, peer, publisher, password.as_deref()).await {
                 debug!("tui [{peer}] ended: {e}");
             }
             debug!("tui [{peer}] disconnected");
@@ -148,15 +157,66 @@ pub async fn serve(listener: TcpListener, publisher: Publisher) -> std::io::Resu
     }
 }
 
+/// Constant-time equality: fold over the longer length, so neither a
+/// matching prefix nor the length short-circuits. Not that a LAN timing
+/// oracle is likely — it costs nothing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= usize::from(x ^ y);
+    }
+    diff == 0
+}
+
+// The auth callback's `Result<Response, ErrorResponse>` is tungstenite's
+// signature, not a choice — its Err carries a whole HTTP response by design.
+#[allow(clippy::result_large_err)]
 async fn serve_client(
     stream: TcpStream,
     peer: SocketAddr,
     publisher: Publisher,
+    password: Option<&str>,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     // Subscribe before sending the snapshot: a change that lands in between is
     // then queued rather than lost.
     let mut changes = publisher.subscribe();
-    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+    let mut socket = match password {
+        None => tokio_tungstenite::accept_async(stream).await?,
+        // The password travels as `Authorization: Bearer <password>` on the
+        // upgrade request — a handshake header, not a protocol message, so
+        // the published wire format is untouched.
+        Some(password) => {
+            use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Response};
+            use tokio_tungstenite::tungstenite::http;
+
+            let expected = format!("Bearer {password}");
+            let mut authorized = false;
+            let result = tokio_tungstenite::accept_hdr_async(
+                stream,
+                |request: &http::Request<()>, response: Response| {
+                    let presented = request
+                        .headers()
+                        .get(http::header::AUTHORIZATION)
+                        .map(|v| v.as_bytes())
+                        .unwrap_or_default();
+                    if constant_time_eq(presented, expected.as_bytes()) {
+                        authorized = true;
+                        return Ok(response);
+                    }
+                    let mut refusal = ErrorResponse::new(Some("password required".into()));
+                    *refusal.status_mut() = http::StatusCode::UNAUTHORIZED;
+                    Err(refusal)
+                },
+            )
+            .await;
+            if !authorized {
+                warn!("tui [{peer}] rejected: wrong or missing password");
+            }
+            result?
+        }
+    };
     socket.send(encode(&publisher.snapshot())).await?;
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -201,10 +261,18 @@ mod tests {
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     async fn start() -> (SocketAddr, Publisher) {
+        start_with_password(None).await
+    }
+
+    async fn start_with_password(password: Option<&str>) -> (SocketAddr, Publisher) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let publisher = Publisher::new("Living Room".into());
-        tokio::spawn(serve(listener, publisher.clone()));
+        tokio::spawn(serve(
+            listener,
+            publisher.clone(),
+            password.map(str::to_string),
+        ));
         (addr, publisher)
     }
 
@@ -400,5 +468,72 @@ mod tests {
             to_message(&Event::Paused(false)),
             Some(Message::Paused { paused: false })
         );
+    }
+
+    /// Connect presenting an Authorization header.
+    async fn connect_with_auth(
+        addr: SocketAddr,
+        auth: &str,
+    ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error>
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{addr}").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", auth.parse().unwrap());
+        tokio_tungstenite::connect_async(request)
+            .await
+            .map(|(s, _)| s)
+    }
+
+    fn assert_unauthorized(err: tokio_tungstenite::tungstenite::Error) {
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 401, "expected 401")
+            }
+            other => panic!("expected an HTTP 401 rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_password_gates_the_upgrade() {
+        let (addr, _publisher) = start_with_password(Some("sekrit")).await;
+
+        // No header, and a wrong password: refused before the upgrade.
+        let err = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect_err("a connection without the password must be refused");
+        assert_unauthorized(err);
+        let err = connect_with_auth(addr, "Bearer wrong")
+            .await
+            .expect_err("a wrong password must be refused");
+        assert_unauthorized(err);
+
+        // The right password: upgraded, snapshot delivered.
+        let socket = connect_with_auth(addr, "Bearer sekrit")
+            .await
+            .expect("the right password must connect");
+        let (_, mut rx) = socket.split();
+        match next(&mut rx).await {
+            Message::Snapshot(snapshot) => assert_eq!(snapshot.receiver.name, "Living Room"),
+            other => panic!("the first message must be a snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_password_a_plain_client_still_connects() {
+        // The compatibility case: no password configured, no header sent.
+        let (addr, _publisher) = start().await;
+        let (_, mut rx) = connect(addr).await.split();
+        assert!(matches!(next(&mut rx).await, Message::Snapshot(_)));
+    }
+
+    #[test]
+    fn constant_time_eq_is_correct() {
+        assert!(constant_time_eq(b"Bearer x", b"Bearer x"));
+        assert!(!constant_time_eq(b"Bearer x", b"Bearer y"));
+        assert!(!constant_time_eq(b"Bearer x", b"Bearer xx"));
+        assert!(!constant_time_eq(b"", b"Bearer x"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

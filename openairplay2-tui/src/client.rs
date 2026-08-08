@@ -30,20 +30,37 @@ pub enum Update {
     Message(Box<Message>),
     /// The socket went away; the client is retrying.
     Disconnected,
+    /// The receiver said 401: it wants a password we don't have (or ours is
+    /// wrong). Retrying slowly — the answer will not change until someone
+    /// changes a configuration.
+    Unauthorized,
 }
 
 /// Connect to `url` and forward everything to `updates`, reconnecting for as
 /// long as the display is listening. Returns when the display is gone.
-pub async fn run(url: String, updates: UnboundedSender<Update>) {
+pub async fn run(url: String, password: Option<String>, updates: UnboundedSender<Update>) {
     let mut backoff = FIRST_BACKOFF;
     loop {
-        match session(&url, &updates).await {
+        let update = match session(&url, password.as_deref(), &updates).await {
             // A connection that worked earns a fresh backoff.
-            Ok(true) => backoff = FIRST_BACKOFF,
+            Ok(true) => {
+                backoff = FIRST_BACKOFF;
+                Update::Disconnected
+            }
             Ok(false) => return, // the display hung up
-            Err(e) => debug!("connection to {url} failed: {e}"),
-        }
-        if updates.send(Update::Disconnected).is_err() {
+            Err(e) => {
+                debug!("connection to {url} failed: {e}");
+                if is_unauthorized(&e) {
+                    // Don't hammer a receiver that said no: the answer is a
+                    // configuration, not a transient.
+                    backoff = MAX_BACKOFF;
+                    Update::Unauthorized
+                } else {
+                    Update::Disconnected
+                }
+            }
+        };
+        if updates.send(update).is_err() {
             return;
         }
         tokio::time::sleep(backoff).await;
@@ -51,13 +68,35 @@ pub async fn run(url: String, updates: UnboundedSender<Update>) {
     }
 }
 
+fn is_unauthorized(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    matches!(
+        e,
+        tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+    )
+}
+
 /// One connection attempt. `Ok(true)` means it connected and later dropped;
 /// `Ok(false)` means the display is gone and we should stop.
 async fn session(
     url: &str,
+    password: Option<&str>,
     updates: &UnboundedSender<Update>,
 ) -> Result<bool, tokio_tungstenite::tungstenite::Error> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await?;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    // The password travels as an Authorization header on the upgrade
+    // request — a handshake detail, not a protocol message. `main` validated
+    // that it can be a header, so the parse cannot fail here.
+    let mut request = url.into_client_request()?;
+    if let Some(password) = password {
+        if let Ok(header) = format!("Bearer {password}").parse() {
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
+                header,
+            );
+        }
+    }
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await?;
     debug!("connected to {url}");
     if updates.send(Update::Connected).is_err() {
         return Ok(false);
