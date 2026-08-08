@@ -8,13 +8,14 @@ not scheduled is a [GitHub issue](https://github.com/st3fan/openairplay2/issues)
 The through-line from here: **0.4 makes the project safe to hand to a stranger,
 0.5 tells that stranger it exists and how to install it.** Everything else waits.
 
-## 0.4.0 — installable by someone who isn't us (unreleased)
+## 0.4.0 — installable by someone who isn't us (feature-complete, unreleased)
 
 The first release aimed at people other than its author. The bar is not new
 protocol features; it is that someone who has never seen the source can install
-the package, start it, and understand what happened.
+the package, start it, and understand what happened. **Everything below has
+landed on `main`; 0.4 is feature-complete and awaiting a release.**
 
-### Already landed on `main`
+### The now-playing display
 
 - **Position that follows the audio.** A sender's `progress:` line arrives at
   track start and essentially never again, so `Event::Progress` is reported once
@@ -35,64 +36,67 @@ the package, start it, and understand what happened.
   its image down when the pane stops being visible — tmux tracks no images and
   would otherwise leave the artwork floating over the next window. It draws
   nothing at all under GNU screen rather than emitting garbage. (#61, #63, #67)
+
+### Installable and configurable by a stranger
+
+- **The release is publishable again.**
+  [#65](https://github.com/st3fan/openairplay2/issues/65) was a hard blocker:
+  `openairplay2-receiver` depended on `openairplay2-tui-protocol` by path with
+  no version, so `cargo publish` failed its manifest check — and `cargo.yml`
+  publishes the library *first*, so tagging 0.4.0 would have immutably published
+  `openairplay2 0.4.0` to crates.io and then failed on the binary. Fixed by
+  publishing the protocol crate (its JSON was already a fixture-pinned public
+  format), a `cargo package --workspace` gate that verifies every publishable
+  crate before any upload, and per-crate publishes that skip versions already on
+  the index — so the release is idempotent and safe to re-run. The gate also
+  runs in CI, so a manifest that cannot publish fails a PR, not a release.
+  (#73, #74)
+- **`openairplay2-tui` is packaged as a `.deb`** for amd64, arm64 and armhf —
+  an interactive terminal program, so no unit or system user, `libc6` its only
+  dependency, with the ARMv6 guard. A release now attaches six `.deb`s; the
+  receiver `Suggests` the display. So "install the package" gets you the screen,
+  not just the daemon. (#76, #77)
+- **Command-line table stakes.** Both binaries gained `--version` and a real
+  `--help` (stdout, exit 0, every flag with its default); the receiver gained
+  `--list-devices` and a startup ALSA probe that turns a typo'd `--alsa-device`
+  into a named error pointing at `--list-devices` (it used to start silently
+  decode-only — music on the phone, silence in the room), plus a clearer
+  address-in-use message. The hand-rolled parsers became `parse → Result`, so
+  they are tested, with a help-drift guard. (#79, #80)
+- **Every option configurable from `/etc/default/openairplay2-receiver`** by its
+  own named `OPENAIRPLAY2_*` variable, validated with the same validators as the
+  flags, a flag still winning over its variable; `%h` in the name becomes the
+  hostname, so one file deploys unedited across machines. This is a security fix
+  too: options used to travel on the command line, where `/proc/<pid>/cmdline`
+  is world-readable and leaked a `--pincode` to `ps`; `/proc/<pid>/environ` is
+  owner-and-root only. The opaque `OPENAIRPLAY2_ARGS` blob was **removed**, and
+  the upgrade announces itself three ways so a preserved conffile that silently
+  stops working can't surprise anyone — `NEWS.Debian`, a postinst notice in the
+  apt output, and an error from the daemon that keeps running on defaults.
+  (#82, #83)
+- **A password on the now-playing endpoint** — new functionality, since the
+  WebSocket had no authentication at all. With `OPENAIRPLAY2_TUI_PASSWORD` (or
+  `--tui-password`) set, the receiver requires `Authorization: Bearer` before
+  the upgrade, compared in constant time; `openairplay2-tui` presents it with
+  `--password`. It is a handshake header, so the published protocol crate is
+  untouched. (#84)
 - **Docs corrected against the code** by an audit, the "skipped work goes in a
   labeled issue" convention, and the Linux build dependencies written down.
   (#66, #59, #57)
 
-### Planned
+### Safe to run on a stranger's network
 
-- **Make the release publishable again.**
-  [#65](https://github.com/st3fan/openairplay2/issues/65) is a hard blocker:
-  `openairplay2-receiver` depends on `openairplay2-tui-protocol` by path with no
-  version, so `cargo publish` fails its manifest check — and `cargo.yml`
-  publishes the library *first*, so tagging 0.4.0 today would immutably publish
-  `openairplay2 0.4.0` to crates.io and then fail on the binary. The fix is to
-  publish the protocol crate: drop its `publish = false`, version the receiver's
-  dependency, and publish it first in `cargo.yml`. Its JSON is already treated
-  as a public format and pinned by fixtures, so this is arguably what it should
-  have been. `runbooks/releasing.md` must then dry-run **every** publishable
-  crate — checking only the library is exactly why this was invisible.
-- **Package `openairplay2-tui`.** The display is the most visible thing in the
-  project and the only way to get it is `cargo install`, which means a Rust
-  toolchain. Anyone following "install the `.deb`" today gets the daemon and no
-  screen.
-- **Command-line table stakes.** There is no `--version`, and `--help` prints a
-  single usage line to stderr and exits 2. Choosing an ALSA device is also the
-  first thing a new user gets wrong on a Pi, so: a way to list the devices, and
-  startup errors that name the actual problem (device missing or busy, port
-  already bound, no Avahi) instead of leaving someone to guess.
-- **Configure everything from `/etc/default/openairplay2-receiver`.** Today that
-  file holds one opaque `OPENAIRPLAY2_ARGS` blob of command-line flags. Every
-  option gets its own named environment variable instead — name, ALSA device,
-  port, pincode, mDNS on or off, the now-playing endpoint's enable, address and
-  password — read by the binary itself, with a command-line flag still winning
-  over an environment variable so interactive runs are unchanged. `--name` also
-  learns hostname substitutions (`%h`), so one file can be deployed unedited
-  across several machines.
-
-  This is a security fix and not only ergonomics. The systemd unit already
-  admits the problem: options are passed on the command line, `/proc/<pid>/cmdline`
-  is world-readable, so any local user can read a `--pincode` out of `ps`, and
-  the conffile's 0640 protects the file and nothing else. `/proc/<pid>/environ`
-  is readable only by the process owner and root, so moving secrets into the
-  environment closes that hole.
-
-  `OPENAIRPLAY2_ARGS` is **removed** rather than kept alongside. A preserved
-  conffile would then silently stop taking effect — an upgraded box would come
-  back up with its name and audio device reset to defaults and nothing in the
-  log to explain it — so the upgrade has to announce itself: a `NEWS.Debian`
-  entry, and the daemon logging an error when it finds `OPENAIRPLAY2_ARGS` set
-  in its environment and ignored.
-- **A password on the now-playing endpoint.** This is new functionality, not
-  configuration: the WebSocket has no authentication of any kind today, so
-  anyone who can reach the port gets track metadata and cover art, and the only
-  present mitigation is a comment in the options file suggesting loopback. A
-  shared secret from the config file, sent by `openairplay2-tui` and compared in
-  constant time before the WebSocket upgrade.
-- **A security review** before strangers run this on their own networks. The
-  attack surface is a daemon that listens on a well-known port and speaks
-  pairing, an encrypted channel, and a media decoder to anything that connects —
-  in a release we are actively encouraging people to install.
+- **A security review** of the whole network surface, written up in
+  [`notes/security-review-0.4.md`](security-review-0.4.md). No memory-safety
+  defect or remote-code-execution path; the crypto (SRP-6a, the AEAD audio
+  path) is correct and `cargo audit` is clean. Two availability/disclosure
+  findings were fixed with regression tests — an unauthenticated
+  connection/memory DoS ([#87](https://github.com/st3fan/openairplay2/issues/87):
+  a connection cap and a handshake timeout) and the identity private key written
+  world-readable ([#88](https://github.com/st3fan/openairplay2/issues/88): now
+  0600) — one hardening gap (pincode brute-force lockout,
+  [#89](https://github.com/st3fan/openairplay2/issues/89)) was deferred as not
+  blocking, and `cargo audit` was added to CI. (#86, #90)
 
 ## 0.5.0 — telling people it exists
 
@@ -246,3 +250,7 @@ and AirPlay video or photo streaming.
   ([#64](https://github.com/st3fan/openairplay2/issues/64)).
 - **`pair-verify` / persistent pairing**, so a sender does not pair afresh each
   session.
+- **A brute-force lockout on pincode pairing**
+  ([#89](https://github.com/st3fan/openairplay2/issues/89)) — the one 0.4
+  security finding judged not release-blocking: SRP makes each guess an online
+  round, and the connection cap already slows it, but nothing caps attempts.
