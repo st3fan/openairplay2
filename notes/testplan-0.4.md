@@ -129,7 +129,11 @@ Must have: multi-line help to stdout describing every flag; exit code 0.
 Must have: no panic / "failed printing to stdout"; clean output.
 
 **4.5** `openairplay2-receiver --list-devices`
-Must have: a list of playback devices, each name with an indented description.
+Must have: a short list — `default` plus one friendly entry per sound card
+(e.g. `plughw:CARD=Headphones` / "bcm2835 Headphones"), not the full ALSA dump.
+
+**4.5a** `openairplay2-receiver --list-all-devices`
+Must have: the full ALSA playback list (many more entries, plugins included).
 
 **4.6** `openairplay2-receiver --no-avahi --alsa-device nonsense`
 Must have: exits non-zero with `error: ALSA device "nonsense" does not exist …`

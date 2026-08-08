@@ -59,9 +59,44 @@ fn triage(device: &str, e: alsa::Error) -> Probe {
     }
 }
 
-/// Print the playback devices, `aplay -L` style: the name to give
-/// `--alsa-device`, with ALSA's description indented beneath it.
+/// The short device list: `default`, then one friendly entry per sound card —
+/// the way a desktop's sound settings show "Built-in Audio", "USB DAC", "HDMI"
+/// rather than ALSA's wall of plugin definitions.
+///
+/// Each card becomes `plughw:CARD=<id>` (stable across reboots, and the `plug`
+/// layer converts to whatever the hardware wants, so this receiver's 44.1 kHz
+/// stereo always plays) labelled with the card's human name. `--list-all-devices`
+/// is the escape hatch for a specific sub-device or a raw/plugin PCM.
 pub fn list_devices() -> Result<(), alsa::Error> {
+    println!("default");
+    println!("    System default output");
+
+    // Only cards that actually expose a playback PCM (skip capture-only ones
+    // like a webcam mic). Derived from the playback hints, which every
+    // playable card contributes a `…:CARD=<id>` entry to.
+    let playback = playback_card_ids();
+
+    for card in alsa::card::Iter::new() {
+        let card = card?;
+        let Ok(info) = alsa::ctl::Ctl::from_card(&card, false).and_then(|c| c.card_info()) else {
+            continue;
+        };
+        let Ok(id) = info.get_id() else { continue };
+        if !playback.contains(id) {
+            continue;
+        }
+        let name = info.get_name().unwrap_or(id);
+        println!("plughw:CARD={id}");
+        println!("    {name}");
+    }
+    Ok(())
+}
+
+/// The full device list: every playback PCM ALSA offers, `aplay -L` style —
+/// named devices, hardware sub-devices, and the plugin definitions
+/// (`dmix`, `surround*`, converters, `null`, …). For when the short list from
+/// [`list_devices`] doesn't name the exact device you need.
+pub fn list_all_devices() -> Result<(), alsa::Error> {
     for hint in alsa::device_name::HintIter::new_str(None, "pcm")? {
         // Capture-only devices can never be the output.
         if hint.direction == Some(Direction::Capture) {
@@ -76,6 +111,56 @@ pub fn list_devices() -> Result<(), alsa::Error> {
         }
     }
     Ok(())
+}
+
+/// The card ids (`CARD=<id>`) that appear among the playback hints.
+fn playback_card_ids() -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    if let Ok(hints) = alsa::device_name::HintIter::new_str(None, "pcm") {
+        for hint in hints {
+            if hint.direction == Some(Direction::Capture) {
+                continue;
+            }
+            if let Some(id) = hint.name.as_deref().and_then(card_id_of) {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The card id in a hint or device name — the `<id>` of `CARD=<id>`, e.g.
+/// `NVidia` in `plughw:CARD=NVidia,DEV=3`. `None` for names without a card
+/// (`default`, `pulse`, `null`).
+fn card_id_of(name: &str) -> Option<String> {
+    let after = name.split("CARD=").nth(1)?;
+    let id: String = after.chars().take_while(|&c| c != ',').collect();
+    (!id.is_empty()).then_some(id)
+}
+
+/// A human label for an `--alsa-device` value, for the startup log: the sound
+/// card's name for a `…CARD=<id>…` device (e.g. "Sound Blaster Play! 2" for
+/// `plughw:CARD=S2`), or a fixed label for the well-known plugin PCMs. `None`
+/// for anything unrecognized, so the caller logs the bare device.
+pub fn card_name(device: &str) -> Option<String> {
+    if let Some(id) = card_id_of(device) {
+        return alsa::card::Iter::new().flatten().find_map(|card| {
+            let info = alsa::ctl::Ctl::from_card(&card, false)
+                .and_then(|c| c.card_info())
+                .ok()?;
+            (info.get_id().ok()? == id).then(|| info.get_name().unwrap_or(&id).to_string())
+        });
+    }
+    let label = match device.split(':').next().unwrap_or(device) {
+        "default" => "system default output",
+        "sysdefault" => "card default output",
+        "pulse" => "PulseAudio",
+        "pipewire" => "PipeWire",
+        "jack" => "JACK",
+        "null" => "discarded",
+        _ => return None,
+    };
+    Some(label.to_string())
 }
 
 /// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
@@ -342,5 +427,34 @@ mod tests {
             let probe = triage("default", alsa::Error::new("snd_pcm_open", errno));
             assert!(matches!(probe, Probe::Warn(_)), "errno {errno}: {probe:?}");
         }
+    }
+
+    #[test]
+    fn card_id_parsing() {
+        assert_eq!(
+            card_id_of("plughw:CARD=NVidia,DEV=3").as_deref(),
+            Some("NVidia")
+        );
+        assert_eq!(
+            card_id_of("sysdefault:CARD=Generic").as_deref(),
+            Some("Generic")
+        );
+        assert_eq!(card_id_of("hw:CARD=S2,DEV=0").as_deref(), Some("S2"));
+        // Names without a card have no id.
+        assert_eq!(card_id_of("default"), None);
+        assert_eq!(card_id_of("pulse"), None);
+        assert_eq!(card_id_of("null"), None);
+    }
+
+    #[test]
+    fn card_name_labels_known_non_card_devices() {
+        assert_eq!(
+            card_name("default").as_deref(),
+            Some("system default output")
+        );
+        assert_eq!(card_name("pulse").as_deref(), Some("PulseAudio"));
+        assert_eq!(card_name("pipewire").as_deref(), Some("PipeWire"));
+        assert_eq!(card_name("null").as_deref(), Some("discarded"));
+        assert_eq!(card_name("somethingweird"), None);
     }
 }
