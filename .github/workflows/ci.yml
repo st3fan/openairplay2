@@ -3,10 +3,17 @@
 # (see CLAUDE.md), enforced here rather than by discipline.
 name: CI
 
+# Documentation-only changes (plans, notes, the README) don't affect the
+# build or the tests, so skip CI when a push or PR touches nothing but
+# Markdown. Safe because no status check here is a required merge gate; if one
+# ever becomes required, drop these filters (a required check that never runs
+# blocks the merge).
 on:
   push:
     branches: [main]
+    paths-ignore: ['**/*.md']
   pull_request:
+    paths-ignore: ['**/*.md']
 
 env:
   CARGO_TERM_COLOR: always
