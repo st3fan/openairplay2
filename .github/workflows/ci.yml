@@ -40,3 +40,16 @@ jobs:
       # a laptop watching a Linux receiver.
       - run: cargo test -p openairplay2 -p openairplay2-tui-protocol -p openairplay2-tui
       - run: cargo clippy -p openairplay2 -p openairplay2-tui-protocol -p openairplay2-tui --all-targets -- -D warnings
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # RustSec advisories over the dependency tree — so a newly disclosed
+      # vuln in a dependency fails a PR rather than surfacing at a release
+      # (security review 0.4). Advisory-only churn is decoupled from PRs by
+      # not pinning; a network hiccup fetching the DB is the only flake.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
