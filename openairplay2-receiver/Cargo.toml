@@ -60,6 +60,8 @@ restart-after-upgrade = true
 # The version makes this publishable; the path keeps workspace builds local.
 openairplay2 = { path = "../openairplay2", version = "0.4.0" }
 alsa = "0.12"
+# errno constants for triaging the ALSA startup probe.
+libc = "0.2"
 env_logger = "0.11"
 log = "0.4"
 tokio = { version = "1", features = [

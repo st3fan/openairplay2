@@ -20,6 +20,64 @@ fn start_samples(rate: u32, channels: u8) -> usize {
     (rate as usize / 2) * channels as usize // ~0.5 s
 }
 
+/// What a startup probe of the configured device means.
+#[derive(Debug)]
+pub enum Probe {
+    /// The device opened; it exists and we may use it.
+    Ok,
+    /// Could not open it *now*, which says nothing about stream time (busy,
+    /// or something unclassified): log and start anyway.
+    Warn(alsa::Error),
+    /// The configuration is wrong (no such device, no permission) and no
+    /// amount of waiting fixes it: refuse to start, with the fix in the
+    /// message.
+    Fatal(String),
+}
+
+/// Open the device once and drop it, so a wrong `--alsa-device` fails at
+/// startup, in the user's face — not as a receiver that decodes to nowhere.
+pub fn probe_device(device: &str) -> Probe {
+    match PCM::new(device, Direction::Playback, false) {
+        Ok(_) => Probe::Ok,
+        Err(e) => triage(device, e),
+    }
+}
+
+/// `alsa::Error::errno` is negative when it comes straight from a C return
+/// value and positive when it comes from OS errno, hence the `abs`.
+fn triage(device: &str, e: alsa::Error) -> Probe {
+    match e.errno().abs() {
+        libc::ENOENT | libc::ENODEV => Probe::Fatal(format!(
+            "ALSA device \"{device}\" does not exist ({e}); \
+             run `openairplay2-receiver --list-devices` to see this machine's playback devices"
+        )),
+        libc::EACCES | libc::EPERM => Probe::Fatal(format!(
+            "no permission to open ALSA device \"{device}\" ({e}); \
+             is this user in the `audio` group?"
+        )),
+        _ => Probe::Warn(e),
+    }
+}
+
+/// Print the playback devices, `aplay -L` style: the name to give
+/// `--alsa-device`, with ALSA's description indented beneath it.
+pub fn list_devices() -> Result<(), alsa::Error> {
+    for hint in alsa::device_name::HintIter::new_str(None, "pcm")? {
+        // Capture-only devices can never be the output.
+        if hint.direction == Some(Direction::Capture) {
+            continue;
+        }
+        let Some(name) = hint.name else { continue };
+        println!("{name}");
+        if let Some(desc) = hint.desc {
+            for line in desc.lines() {
+                println!("    {line}");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
 /// volume, `-144 dB` (and below) is muted; we never amplify above unity.
 pub fn volume_to_gain(db: f32) -> f32 {
@@ -249,5 +307,40 @@ mod tests {
         assert!((gain.get() - 0.1).abs() < 1e-4);
         gain.set(2.0);
         assert_eq!(gain.get(), 1.0);
+    }
+
+    #[test]
+    fn triage_not_found_is_fatal_and_points_at_list_devices() {
+        // snd_pcm_open returns negative errnos (alsa::Error::from_code).
+        for errno in [-libc::ENOENT, -libc::ENODEV] {
+            let probe = triage("nonsense", alsa::Error::new("snd_pcm_open", errno));
+            match probe {
+                Probe::Fatal(msg) => {
+                    assert!(msg.contains("nonsense"), "{msg}");
+                    assert!(msg.contains("--list-devices"), "{msg}");
+                }
+                other => panic!("expected Fatal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn triage_permission_is_fatal_and_names_the_audio_group() {
+        for errno in [-libc::EACCES, -libc::EPERM] {
+            let probe = triage("default", alsa::Error::new("snd_pcm_open", errno));
+            match probe {
+                Probe::Fatal(msg) => assert!(msg.contains("audio"), "{msg}"),
+                other => panic!("expected Fatal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn triage_busy_and_the_unclassified_warn_and_start() {
+        // Positive errnos too — alsa::Error::last stores them unnegated.
+        for errno in [-libc::EBUSY, libc::EBUSY, -libc::EIO] {
+            let probe = triage("default", alsa::Error::new("snd_pcm_open", errno));
+            assert!(matches!(probe, Probe::Warn(_)), "errno {errno}: {probe:?}");
+        }
     }
 }

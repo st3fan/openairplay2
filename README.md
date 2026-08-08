@@ -153,6 +153,7 @@ cargo install openairplay2-receiver
 | `--mac AA:BB:CC:DD:EE:FF` | Device ID (`deviceid`) reported to senders | discovered from a network interface, else a fixed fallback |
 | `--identity-file PATH` | Where the Ed25519 identity keypair is stored | `~/.config/openairplay2/identity` |
 | `--alsa-device NAME` | ALSA output device to play to | `default` |
+| `--list-devices` | List the ALSA playback devices and exit | — |
 | `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
 | `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
 | `--tui-listen ADDR` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |

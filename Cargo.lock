@@ -1187,6 +1187,7 @@ dependencies = [
  "base64",
  "env_logger",
  "futures-util",
+ "libc",
  "log",
  "openairplay2",
  "openairplay2-tui-protocol",
