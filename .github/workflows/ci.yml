@@ -23,10 +23,10 @@ jobs:
     name: Linux (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install ALSA headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: cargo clippy --all-targets -- -D warnings
@@ -40,8 +40,8 @@ jobs:
     name: macOS (library + display)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The library's macOS portability is a deliverable; so is the display's,
       # which is why it depends on neither the library nor ALSA — you run it on
       # a laptop watching a Linux receiver.
@@ -52,11 +52,11 @@ jobs:
     name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # RustSec advisories over the dependency tree — so a newly disclosed
       # vuln in a dependency fails a PR rather than surfacing at a release
       # (security review 0.4). Advisory-only churn is decoupled from PRs by
       # not pinning; a network hiccup fetching the DB is the only flake.
-      - uses: rustsec/audit-check@v2
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
