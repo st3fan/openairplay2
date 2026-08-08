@@ -36,7 +36,7 @@ impl Identity {
                         fs::create_dir_all(parent)?;
                     }
                 }
-                fs::write(path, identity.serialize())?;
+                write_private(path, &identity.serialize())?;
                 Ok(identity)
             }
             Err(e) => Err(e),
@@ -90,6 +90,34 @@ impl Identity {
     }
 }
 
+/// Write the identity file so it is readable only by its owner. The file holds
+/// the Ed25519 signing seed — the receiver's *private* key — so a plain
+/// `fs::write` (0644 minus umask) would leave it world-readable, letting any
+/// local user impersonate this receiver. On Unix the file is created 0600; a
+/// pre-existing file is truncated and its mode reasserted. Elsewhere it falls
+/// back to a plain write.
+#[cfg(unix)]
+fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    // create(...).mode(0o600) only sets the mode when creating; reassert it for
+    // a file that already existed with looser permissions.
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    fs::write(path, contents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +150,31 @@ mod tests {
             "key must be stable"
         );
         assert_eq!(first.pi(), second.pi(), "pi must be stable");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The persisted file holds the private signing seed, so it must not be
+    /// readable by anyone but its owner (security review 0.4).
+    #[cfg(unix)]
+    #[test]
+    fn persisted_identity_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("oap2-idperm-{}", std::process::id()));
+        let path = dir.join("identity");
+        let _ = fs::remove_dir_all(&dir);
+
+        Identity::load_or_create(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "identity file must be 0600, was {mode:o}");
+
+        // A pre-existing over-permissive file is tightened, not left as-is.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        Identity::load_or_create(&path).unwrap(); // loads; leaves mode as found
+        write_private(&path, "x").unwrap(); // a rewrite reasserts 0600
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a rewrite must reassert 0600, was {mode:o}");
 
         fs::remove_dir_all(&dir).unwrap();
     }

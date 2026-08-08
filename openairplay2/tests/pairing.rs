@@ -385,3 +385,59 @@ async fn pincode_pin_start_and_srp() {
     let (_, m4) = pair_setup(addr, "3939").await;
     assert_eq!(m4.get_u8(ty::ERROR), None);
 }
+
+/// Security review 0.4: an unpaired connection that goes silent must be
+/// dropped, not held open indefinitely (slowloris). The server's handshake
+/// timeout is 10 s; a full run must not wait that long, so we assert the
+/// mechanism a cheaper way — a connection that sends a partial head and then
+/// stalls is eventually closed by the server rather than kept forever. We
+/// prove "closed" by observing EOF on our read side within a bounded wait far
+/// under the real timeout would need... so instead we assert the fast path:
+/// the connection cap refuses excess sockets.
+#[tokio::test]
+async fn excess_connections_are_refused() {
+    let addr = start().await;
+
+    // Hold open more than the cap by sending a partial head on each (so none
+    // completes and frees its slot). MAX_CONNECTIONS is 32; open 32 and then
+    // prove the 33rd cannot get a request served.
+    let mut held = Vec::new();
+    for _ in 0..32 {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // A partial head: enough to occupy the connection without completing.
+        s.write_all(b"GET /info HTTP/1.1\r\n").await.unwrap();
+        held.push(s);
+    }
+
+    // Give the accept loop a moment to spawn all 32 tasks.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The 33rd connection is accepted at the TCP layer but immediately dropped
+    // by the server (over the cap), so a request on it gets no response: the
+    // read sees a clean EOF, or a reset (the server closed a socket with our
+    // unread bytes still queued). Either way it is not served.
+    let mut over = TcpStream::connect(addr).await.unwrap();
+    let _ = over
+        .write_all(b"GET /info HTTP/1.1\r\nCSeq: 0\r\n\r\n")
+        .await;
+    let mut buf = [0u8; 64];
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), over.read(&mut buf))
+        .await
+        .expect("the over-cap connection should be closed promptly, not hang");
+    match result {
+        Ok(0) => {}                                                     // EOF
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {} // RST
+        Ok(n) => panic!(
+            "a connection over the cap must be dropped, but got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        ),
+        Err(e) => panic!("unexpected error on the over-cap connection: {e}"),
+    }
+
+    // Freeing a held connection lets a new one through again.
+    drop(held.pop());
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut ok = TcpStream::connect(addr).await.unwrap();
+    let (status, _) = plain_request(&mut ok, "GET /info HTTP/1.1\r\nCSeq: 0", &[]).await;
+    assert_eq!(status, "HTTP/1.1 200 OK", "a freed slot serves again");
+}

@@ -7,9 +7,25 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::{debug, warn};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+
+/// Ceiling on concurrent control connections. The design is one sender → one
+/// stream, so this is generous headroom (a sender plus a handful of probes),
+/// while bounding what an unauthenticated LAN peer can reserve by opening
+/// sockets — each connection can otherwise hold a task and reserve a request
+/// body up to `crypto_stream::MAX_BODY`.
+const MAX_CONNECTIONS: usize = 32;
+
+/// How long an unpaired connection may take to deliver each request before it
+/// is dropped. It applies only while the channel is still in the clear — a
+/// pairing sender is actively talking, so seconds is ample — so it never
+/// disturbs an established, legitimately idle session, while denying a
+/// slowloris peer a task held open indefinitely by dribbling bytes.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use crate::cipher::control_channel;
 use crate::crypto_stream::ControlConnection;
@@ -38,10 +54,20 @@ pub struct Context {
 }
 
 pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<()> {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Bound concurrency: over the ceiling, accept and immediately drop
+        // rather than queueing (a queued attacker connection is a held socket
+        // too). The permit is released when the task ends.
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            debug!("[{peer}] refused: at {MAX_CONNECTIONS} connections");
+            drop(stream);
+            continue;
+        };
         let context = context.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             debug!("[{peer}] connected");
             if let Err(e) = handle_connection(stream, peer, context).await {
                 warn!("[{peer}] connection error: {e}");
@@ -68,7 +94,25 @@ async fn handle_connection(
         context.events.clone(),
     );
 
-    while let Some(request) = conn.read_request().await? {
+    loop {
+        // While still in the clear (discovery + pairing), bound how long a
+        // request may take to arrive: an unpaired peer that stops sending is a
+        // resource leak, not a paused session. Once encrypted, a session may
+        // idle indefinitely between requests, so the timeout is lifted.
+        let next = if conn.is_encrypted() {
+            conn.read_request().await?
+        } else {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.read_request()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    debug!("[{peer}] handshake timed out");
+                    return Ok(());
+                }
+            }
+        };
+        let Some(request) = next else {
+            break;
+        };
         log_request(&peer, &request, conn.is_encrypted());
 
         // `/pair-setup` advances the state machine and may install the cipher

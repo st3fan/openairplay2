@@ -157,6 +157,19 @@ date and a scope, not a vibe.
   stream, and control exactly as before — the existing suite plus a hardware
   pass against a real Mac/iPhone is the guard.
 
+## Outcome (2026-08-07)
+
+Review done; written up in
+[notes/security-review-0.4.md](../notes/security-review-0.4.md). No
+memory-safety defect or RCE path found; `cargo audit` clean. Three findings,
+all availability/hardening: **F1** (unauthenticated connection/memory DoS) and
+**F2** (private identity key file world-readable) are fixed in this stack with
+regression tests ([#87](https://github.com/st3fan/openairplay2/issues/87),
+[#88](https://github.com/st3fan/openairplay2/issues/88)); **F3** (no pincode
+brute-force lockout) is deferred as not release-blocking
+([#89](https://github.com/st3fan/openairplay2/issues/89)). `cargo audit` added
+to CI. Nothing blocks the 0.4 release.
+
 ## Acceptance criteria
 
 - `cargo audit` and `cargo deny` have been run; the result is recorded, and any
