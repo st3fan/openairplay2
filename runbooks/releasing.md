@@ -64,10 +64,20 @@ publishable since #65 — needs exactly this bootstrap at 0.4.0.)*
 
 ## Releasing a version
 
+**Model: release from trunk.** `main` carries the version, and a release is a
+version-bump PR merged to `main` followed by a tag on `main` — no long-lived
+release branch. The release workflow **requires the tag to equal the crate
+version exactly**, prereleases included, and fails before publishing anything
+otherwise, so a tag can never ship a version the manifests do not name. The bump
+is therefore not optional: tag only a commit whose crate version is the tag.
+
 ### 1. Pick the version
 
 `X.Y.Z`, semver-ish while pre-1.0: minor for features, patch for fixes. One
-version line for everything — library, binary, and `.deb`.
+version line for everything — library, binary, and `.deb`. A release candidate
+is a real version too: `X.Y.Z-rcN` (e.g. `0.4.1-rc1`), bumped and tagged the
+same way, which publishes a **prerelease** to crates.io (not selected by default
+resolution).
 
 ### 2. Version-bump PR against main
 
@@ -160,18 +170,24 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 - Optional provenance check (any machine with `gh`):
   `gh attestation verify openairplay2-receiver_….deb --repo st3fan/openairplay2`.
 
-## Testing the workflow without releasing
+## Testing the packages without publishing
 
-- **Packaging changes:** run `debian.yml` on its own from the Actions tab
-  (workflow_dispatch, any branch). It builds all three architectures and leaves the
-  `.deb`s as workflow artifacts; with no tag, nothing is attached or
-  published.
-- **The whole thing:** tag `vX.Y.Z-rcN` with `--prerelease` (optionally
-  `--target <branch>`); the version check is warn-only for prereleases. Delete
-  the release and its tag afterwards:
-  `gh release delete vX.Y.Z-rcN --cleanup-tag --yes`. Note that a prerelease
-  still publishes to crates.io — use a version number you intend to keep, or
-  expect to yank it.
+Reach for this to try the `.deb`s on real hardware **before** committing a
+version to crates.io — it touches neither crates.io nor a tag:
+
+- Run `debian.yml` on its own from the Actions tab (workflow_dispatch, any
+  branch). It builds all three architectures and leaves the `.deb`s as workflow
+  artifacts; with no tag, nothing is attached or published. Locally,
+  `./packaging/build-deb.sh` does the same for this machine's architecture.
+
+There is **no way to exercise the crates.io publish without publishing**: a
+GitHub Release (prerelease or not) runs the real workflow and the version check
+is strict, so the tag's version — including any `-rcN` — is published for keeps
+(immutable; yank-only). So a release candidate is a *deliberate* prerelease:
+bump the crate version to `X.Y.Z-rcN` (§2), tag `vX.Y.Z-rcN` with `--prerelease`,
+and expect `X.Y.Z-rcN` to live on crates.io. Do **not** tag `vX.Y.Z-rcN` against
+a commit whose crate version is `X.Y.Z` — that is how the 0.4.0 number was once
+spent on a candidate; the strict check now refuses it.
 
 ## If a release goes wrong
 

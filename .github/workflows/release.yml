@@ -20,8 +20,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The tag is the single version for the release. Strict for real releases;
-  # warn-only for prereleases, so vX.Y.Z-rcN tags can exercise this workflow.
+  # The tag is the single version for the release, and it must equal the crate
+  # version exactly — prereleases included. A prerelease is not an exception:
+  # to cut vX.Y.Z-rcN, the crate version must also be X.Y.Z-rcN, so crates.io
+  # gets a proper prerelease. (A warn-only prerelease path once let a
+  # `v0.4.0-rc1` tag publish crate version `0.4.0` — the final number, spent on
+  # a candidate. Never again: mismatch fails the release before anything ships.)
   version:
     name: Check tag matches crate version
     runs-on: ubuntu-latest
@@ -32,18 +36,12 @@ jobs:
       - name: Compare tag with openairplay2-receiver/Cargo.toml
         env:
           TAG: ${{ github.event.release.tag_name }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           version="${TAG#v}"
           crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' openairplay2-receiver/Cargo.toml | head -1)
           if [ "$version" != "$crate" ]; then
-            message="tag $TAG does not match openairplay2-receiver/Cargo.toml version $crate"
-            if [ "$PRERELEASE" = "true" ]; then
-              echo "::warning::$message (allowed: prerelease)"
-            else
-              echo "::error::$message"
-              exit 1
-            fi
+            echo "::error::tag $TAG does not match openairplay2-receiver/Cargo.toml version $crate — bump the crate version to $version (including any -rcN) before releasing"
+            exit 1
           fi
 
   cargo:
