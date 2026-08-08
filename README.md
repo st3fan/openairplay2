@@ -54,7 +54,9 @@ Also not implemented: **ALAC**, **realtime (type 96) audio**, **48 kHz / S24**
 persistent pairing** — pairing is transient, so a sender pairs afresh each
 session.
 
-The milestone-by-milestone development history is in
+What each release contains, and what the next ones are for, is in
+[`notes/roadmap.md`](https://github.com/st3fan/openairplay2/blob/main/notes/roadmap.md);
+the milestone-by-milestone development history is in
 [`notes/status.md`](https://github.com/st3fan/openairplay2/blob/main/notes/status.md).
 
 ## Install (Debian / Ubuntu)

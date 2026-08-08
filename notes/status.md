@@ -2,7 +2,8 @@
 
 The milestone-by-milestone development history of openairplay2. For the current
 high-level status and feature summary, see the [README](../README.md); for each
-milestone's plan and results, see `notes/milestone-*.md`.
+milestone's plan and results, see `notes/milestone-*.md`. For what each release
+contains and what the next ones are for, see [`roadmap.md`](roadmap.md).
 
 **Milestone 1 (discovery & `/info`) — complete.** Advertises `_airplay._tcp`
 via Avahi with an AirPlay 2 `features` bitmask and an Ed25519 public key, runs
