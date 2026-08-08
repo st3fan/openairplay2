@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use log::{debug, error, info, warn};
 use tokio::signal::unix::SignalKind;
 
+mod mixer;
 mod player;
 mod tui;
 
@@ -39,6 +40,12 @@ struct Args {
     /// Audio on or off (`--no-audio` / `OPENAIRPLAY2_AUDIO`); `None` → on.
     audio: Option<bool>,
     alsa_device: Option<String>,
+    /// Drive this ALSA mixer control from volume events instead of scaling
+    /// samples in software; `None` → software gain.
+    mixer: Option<String>,
+    /// The mixer device holding that control; `None` → derived from the
+    /// audio device (see [`default_mixer_device`]).
+    mixer_device: Option<String>,
     /// Require this pincode to pair; `None` → transient `3939`.
     pincode: Option<String>,
     /// Address to serve the now-playing WebSocket on; off when `None`.
@@ -63,14 +70,49 @@ fn effective_device(args: &Args) -> Option<String> {
     )
 }
 
+/// The hardware-volume configuration after flags and environment have
+/// merged: `Some((device, control))` when a mixer control should follow the
+/// sender's volume, `None` for the software gain. A mixer device without a
+/// control to drive on it is a config mistake, not a default.
+fn mixer_config(args: &Args) -> Result<Option<(String, String)>, String> {
+    let control = match (&args.mixer, &args.mixer_device) {
+        (Some(control), _) => control,
+        (None, None) => return Ok(None),
+        (None, Some(_)) => {
+            return Err("--mixer-device (OPENAIRPLAY2_MIXER_DEVICE) needs --mixer \
+                 (OPENAIRPLAY2_MIXER) to name the control to drive"
+                .to_string())
+        }
+    };
+    let device = match &args.mixer_device {
+        Some(device) => device.clone(),
+        None => default_mixer_device(effective_device(args).as_deref()),
+    };
+    Ok(Some((device, control.clone())))
+}
+
+/// The mixer device when none is configured: the card of the audio device
+/// (`plughw:CARD=S2` → `hw:CARD=S2`), because the control being driven is
+/// almost always on the card being played to; ALSA's `default` otherwise
+/// (where PulseAudio/PipeWire expose their own `Master`).
+fn default_mixer_device(alsa_device: Option<&str>) -> String {
+    alsa_device
+        .and_then(player::card_id_of)
+        .map(|id| format!("hw:CARD={id}"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
 /// What the command line asks for; everything but `Run` prints and exits.
+/// `Args` is boxed only to keep the variants comparable in size (clippy's
+/// `large_enum_variant`).
 #[derive(Debug, PartialEq)]
 enum Action {
-    Run(Args),
+    Run(Box<Args>),
     Help,
     Version,
     ListDevices,
     ListAllDevices,
+    ListMixers,
 }
 
 const USAGE: &str = "usage: openairplay2-receiver [options] — run with --help for the list";
@@ -96,6 +138,14 @@ options:
   --alsa-device NAME        ALSA playback device (default \"default\");
                             see --list-devices for what this machine has
   --no-audio                decode but do not open ALSA (silent test run)
+  --mixer CONTROL           drive this ALSA mixer control from the sender's
+                            volume instead of scaling samples in software —
+                            keeps the full sample resolution at low volume,
+                            and a DAC or amp with its own volume control
+                            follows the slider; NAME or NAME,INDEX, see
+                            --list-mixers for this machine's controls
+  --mixer-device DEV        mixer device holding that control (default: the
+                            card of --alsa-device, else \"default\")
   --tui-listen ADDR         serve the now-playing WebSocket that
                             openairplay2-tui renders, e.g. 127.0.0.1:7392; it
                             carries track metadata and cover art, so keep it
@@ -113,12 +163,15 @@ options:
                             exit — pass one to --alsa-device
   --list-all-devices        list every ALSA playback device, including
                             hardware sub-devices and plugins, and exit
+  --list-mixers             list the mixer volume controls of each device
+                            and exit — pass one to --mixer
   --version                 print the version and exit
   -h, --help                print this help
 
 Each option can also come from the environment — OPENAIRPLAY2_NAME, _PORT,
 _MAC, _IDENTITY_FILE, _PINCODE, _AVAHI (on/off), _AUDIO (on/off),
-_ALSA_DEVICE, _TUI_LISTEN, _TUI_PASSWORD, _LOG_LEVEL — which is how
+_ALSA_DEVICE, _MIXER, _MIXER_DEVICE, _TUI_LISTEN, _TUI_PASSWORD,
+_LOG_LEVEL — which is how
 /etc/default/openairplay2-receiver configures the service. A flag wins over its
 variable; an empty variable is unset. %h in the name becomes this machine's
 hostname.
@@ -148,6 +201,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         avahi: None,
         audio: None,
         alsa_device: None,
+        mixer: None,
+        mixer_device: None,
         pincode: None,
         tui_listen: None,
         tui_password: None,
@@ -178,6 +233,8 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
                 args.audio = Some(true);
             }
             "--no-audio" => args.audio = Some(false),
+            "--mixer" => args.mixer = Some(value("--mixer", &mut it)?),
+            "--mixer-device" => args.mixer_device = Some(value("--mixer-device", &mut it)?),
             "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
             "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
@@ -189,12 +246,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--debug" => args.log_level = Some("debug".to_string()),
             "--list-devices" => return Ok(Action::ListDevices),
             "--list-all-devices" => return Ok(Action::ListAllDevices),
+            "--list-mixers" => return Ok(Action::ListMixers),
             "--version" => return Ok(Action::Version),
             "-h" | "--help" => return Ok(Action::Help),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
-    Ok(Action::Run(args))
+    Ok(Action::Run(Box::new(args)))
 }
 
 /// The value validators, shared by the flags and the environment variables so
@@ -264,6 +322,12 @@ fn resolve(mut args: Args, env: impl Fn(&str) -> Option<String>) -> Result<Args,
     }
     if args.alsa_device.is_none() {
         args.alsa_device = get("OPENAIRPLAY2_ALSA_DEVICE");
+    }
+    if args.mixer.is_none() {
+        args.mixer = get("OPENAIRPLAY2_MIXER");
+    }
+    if args.mixer_device.is_none() {
+        args.mixer_device = get("OPENAIRPLAY2_MIXER_DEVICE");
     }
     if args.pincode.is_none() {
         args.pincode = get("OPENAIRPLAY2_PINCODE");
@@ -406,7 +470,7 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = match parse(std::env::args().skip(1)) {
-        Ok(Action::Run(args)) => args,
+        Ok(Action::Run(args)) => *args,
         Ok(Action::Help) => {
             sigpipe_default();
             print!("{HELP}");
@@ -423,6 +487,10 @@ async fn main() -> ExitCode {
         Ok(Action::ListAllDevices) => {
             sigpipe_default();
             return list_result(player::list_all_devices());
+        }
+        Ok(Action::ListMixers) => {
+            sigpipe_default();
+            return list_result(mixer::list_mixers());
         }
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -450,6 +518,14 @@ async fn main() -> ExitCode {
         error!("{msg}");
     }
     let alsa_device = effective_device(&args);
+    // Resolved before `args` fields start moving into the builder below.
+    let mixer_cfg = match mixer_config(&args) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(EXIT_CONFIG);
+        }
+    };
 
     let identity_path = args.identity_file.unwrap_or_else(default_identity_path);
     let mut builder = Receiver::builder()
@@ -515,6 +591,22 @@ async fn main() -> ExitCode {
     // reports session events; the volume path is ours (dB → linear gain,
     // shared with the sink so slider moves apply live).
     let gain = SharedGain::new();
+    // Hardware volume, if configured: the mixer control follows the sender's
+    // slider and the software gain stays parked at full scale. A control
+    // that doesn't exist fails here, at startup, like a wrong device name.
+    let mut hw_volume = match &mixer_cfg {
+        Some((device, control)) => match mixer::HwVolume::open(device, control, gain.clone()) {
+            Ok(hw) => {
+                info!("hardware volume: {}", hw.describe());
+                Some(hw)
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::from(EXIT_CONFIG);
+            }
+        },
+        None => None,
+    };
     let sink_gain = gain.clone();
     let device = alsa_device;
     let sink_factory = move |rate: u32, channels: u8| -> Box<dyn AudioSink> {
@@ -561,7 +653,10 @@ async fn main() -> ExitCode {
             match event {
                 Event::Volume { db } => {
                     debug!("volume {db} dB");
-                    gain.set(volume_to_gain(db));
+                    match hw_volume.as_mut() {
+                        Some(hw) => hw.set(db),
+                        None => gain.set(volume_to_gain(db)),
+                    }
                 }
                 Event::SessionStarted {
                     rate,
@@ -641,7 +736,7 @@ mod tests {
 
     fn run_args(args: &[&str]) -> Args {
         match parse_strs(args) {
-            Ok(Action::Run(args)) => args,
+            Ok(Action::Run(args)) => *args,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -690,6 +785,10 @@ mod tests {
             "--no-avahi",
             "--alsa-device",
             "hw:1",
+            "--mixer",
+            "PCM",
+            "--mixer-device",
+            "hw:CARD=S2",
             "--pincode",
             "4821",
             "--tui-listen",
@@ -706,6 +805,8 @@ mod tests {
         );
         assert_eq!(args.avahi, Some(false));
         assert_eq!(effective_device(&args).as_deref(), Some("hw:1"));
+        assert_eq!(args.mixer.as_deref(), Some("PCM"));
+        assert_eq!(args.mixer_device.as_deref(), Some("hw:CARD=S2"));
         assert_eq!(args.pincode.as_deref(), Some("4821"));
         assert_eq!(args.tui_listen.as_deref(), Some("127.0.0.1:7392"));
         // Normalized to lowercase.
@@ -755,6 +856,8 @@ mod tests {
             ("OPENAIRPLAY2_AVAHI", "off"),
             ("OPENAIRPLAY2_AUDIO", "off"),
             ("OPENAIRPLAY2_ALSA_DEVICE", "hw:1"),
+            ("OPENAIRPLAY2_MIXER", "Master"),
+            ("OPENAIRPLAY2_MIXER_DEVICE", "default"),
             ("OPENAIRPLAY2_TUI_LISTEN", "0.0.0.0:7392"),
             ("OPENAIRPLAY2_TUI_PASSWORD", "sekrit"),
             ("OPENAIRPLAY2_LOG_LEVEL", "Debug"),
@@ -769,6 +872,8 @@ mod tests {
         );
         assert_eq!(args.pincode.as_deref(), Some("4821"));
         assert_eq!(args.avahi, Some(false));
+        assert_eq!(args.mixer.as_deref(), Some("Master"));
+        assert_eq!(args.mixer_device.as_deref(), Some("default"));
         assert_eq!(args.tui_listen.as_deref(), Some("0.0.0.0:7392"));
         assert_eq!(args.tui_password.as_deref(), Some("sekrit"));
         assert_eq!(args.log_level.as_deref(), Some("debug")); // normalized
@@ -865,6 +970,46 @@ mod tests {
             parse_strs(&["--list-all-devices"]),
             Ok(Action::ListAllDevices)
         );
+        assert_eq!(parse_strs(&["--list-mixers"]), Ok(Action::ListMixers));
+    }
+
+    #[test]
+    fn mixer_config_resolves_device_and_control() {
+        // No mixer → software gain, no matter the audio device.
+        assert_eq!(mixer_config(&run_args(&[])).unwrap(), None);
+
+        // Explicit control and device pass through verbatim.
+        assert_eq!(
+            mixer_config(&run_args(&["--mixer", "PCM", "--mixer-device", "hw:9"])).unwrap(),
+            Some(("hw:9".to_string(), "PCM".to_string()))
+        );
+
+        // The default mixer device is the card of the audio device…
+        assert_eq!(
+            mixer_config(&run_args(&[
+                "--mixer",
+                "Speaker",
+                "--alsa-device",
+                "plughw:CARD=S2"
+            ]))
+            .unwrap(),
+            Some(("hw:CARD=S2".to_string(), "Speaker".to_string()))
+        );
+        // …and `default` when the audio device names no card (or is off).
+        assert_eq!(
+            mixer_config(&run_args(&["--mixer", "Master"])).unwrap(),
+            Some(("default".to_string(), "Master".to_string()))
+        );
+        assert_eq!(
+            mixer_config(&run_args(&["--mixer", "Master", "--no-audio"])).unwrap(),
+            Some(("default".to_string(), "Master".to_string()))
+        );
+
+        // A mixer device with no control to drive is a config mistake; the
+        // message names both the flag and the variable spellings.
+        let err = mixer_config(&run_args(&["--mixer-device", "hw:9"])).unwrap_err();
+        assert!(err.contains("--mixer"), "{err}");
+        assert!(err.contains("OPENAIRPLAY2_MIXER"), "{err}");
     }
 
     #[test]
@@ -896,6 +1041,9 @@ mod tests {
             &["--no-avahi"],
             &["--alsa-device", "x"],
             &["--no-audio"],
+            &["--mixer", "x"],
+            &["--mixer-device", "x"],
+            &["--list-mixers"],
             &["--tui-listen", "x"],
             &["--tui-password", "x"],
             &["--log-level", "info"],

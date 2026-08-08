@@ -128,8 +128,9 @@ fn playback_card_ids() -> std::collections::HashSet<String> {
 
 /// The card id in a hint or device name — the `<id>` of `CARD=<id>`, e.g.
 /// `NVidia` in `plughw:CARD=NVidia,DEV=3`. `None` for names without a card
-/// (`default`, `pulse`, `null`).
-fn card_id_of(name: &str) -> Option<String> {
+/// (`default`, `pulse`, `null`). Also how the default mixer device is
+/// derived from `--alsa-device` (main.rs `default_mixer_device`).
+pub(crate) fn card_id_of(name: &str) -> Option<String> {
     let after = name.split("CARD=").nth(1)?;
     let id: String = after.chars().take_while(|&c| c != ',').collect();
     (!id.is_empty()).then_some(id)

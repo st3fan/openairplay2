@@ -15,6 +15,15 @@
 # ALSA playback device; `openairplay2-receiver --list-devices` lists them.
 #OPENAIRPLAY2_ALSA_DEVICE=default
 
+# Drive this ALSA mixer control from the sender's volume instead of scaling
+# samples in software (hardware volume); `openairplay2-receiver
+# --list-mixers` lists the controls. NAME, or NAME,INDEX.
+#OPENAIRPLAY2_MIXER=
+
+# Mixer device holding that control (default: the card of the ALSA device
+# above, else "default").
+#OPENAIRPLAY2_MIXER_DEVICE=
+
 # Require this code to pair. Without one, any device on the network can pair.
 #OPENAIRPLAY2_PINCODE=
 
