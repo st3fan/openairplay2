@@ -162,6 +162,7 @@ cargo install openairplay2-receiver
 | `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
 | `--tui-password PASS` | `OPENAIRPLAY2_TUI_PASSWORD` | Require this password on the now-playing WebSocket (`openairplay2-tui --password`). Prefer the variable — a flag is visible in `ps`. | open |
 | `--pincode CODE` | `OPENAIRPLAY2_PINCODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged. Prefer the environment variable (the service's options file): a `--pincode` argument is visible to any local user in `ps`, an environment variable is not. | transient `3939` |
+| `--log-level LEVEL` (or `--debug`) | `OPENAIRPLAY2_LOG_LEVEL` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. `debug` logs every request and hex-dumps bodies. `RUST_LOG` overrides it for per-module control. | `info` |
 
 Every option falls back to its environment variable when the flag is absent —
 that is how `/etc/default/openairplay2-receiver` configures the service — and
@@ -169,8 +170,9 @@ a flag on the command line wins. An empty variable means unset. The booleans
 take exactly `on` or `off`.
 | `-h`, `--help` | Print usage and exit | — |
 
-Set `RUST_LOG=debug` to log every request — useful for watching what a real
-sender sends.
+Pass `--debug` (or `--log-level debug`) to log every request — useful for
+watching what a real sender sends. `RUST_LOG` still works and overrides it for
+per-module control (e.g. `RUST_LOG=openairplay2::session=trace`).
 
 ## Now-playing display
 
