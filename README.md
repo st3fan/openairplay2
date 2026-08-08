@@ -158,6 +158,9 @@ cargo install openairplay2-receiver
 | `--list-devices` | — | List the audio outputs (one friendly entry per sound card) and exit | — |
 | `--list-all-devices` | — | List every ALSA playback device — sub-devices and plugins included — and exit | — |
 | `--no-audio` | `OPENAIRPLAY2_AUDIO=off` | Decode but don't open ALSA (silent run) | audio on |
+| `--mixer CONTROL` | `OPENAIRPLAY2_MIXER` | Drive this ALSA mixer control from the sender's volume instead of scaling samples in software (`NAME` or `NAME,INDEX`) — see [hardware volume](#hardware-volume) | software gain |
+| `--mixer-device DEV` | `OPENAIRPLAY2_MIXER_DEVICE` | Mixer device holding that control | the card of `--alsa-device`, else `default` |
+| `--list-mixers` | — | List each device's mixer volume controls, with their dB ranges, and exit | — |
 | `--no-avahi` | `OPENAIRPLAY2_AVAHI=off` | Don't advertise over Avahi / mDNS | advertising on |
 | `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
 | `--tui-password PASS` | `OPENAIRPLAY2_TUI_PASSWORD` | Require this password on the now-playing WebSocket (`openairplay2-tui --password`). Prefer the variable — a flag is visible in `ps`. | open |
@@ -173,6 +176,25 @@ take exactly `on` or `off`.
 Pass `--debug` (or `--log-level debug`) to log every request — useful for
 watching what a real sender sends. `RUST_LOG` still works and overrides it for
 per-module control (e.g. `RUST_LOG=openairplay2::session=trace`).
+
+### Hardware volume
+
+By default the receiver applies volume in software, scaling every sample by
+the sender's dB value — which works everywhere but throws away sample
+resolution at low volume. With `--mixer`, the sender's slider drives the
+sound card's **own** mixer control instead: the card attenuates (often in its
+analog stage), the samples reach it at full scale, and a DAC or amp with a
+real volume control follows the slider.
+
+```sh
+openairplay2-receiver --list-mixers        # what can be driven
+openairplay2-receiver --alsa-device plughw:CARD=S2 --mixer Speaker
+```
+
+The slider maps linearly onto the control's whole dB range (slider-top = the
+control's maximum), and muting on the sender uses the control's mute switch
+when it has one. The mixer device is normally derived from `--alsa-device`;
+`--mixer-device` overrides it for split setups.
 
 ## Now-playing display
 
