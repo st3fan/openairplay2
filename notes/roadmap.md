@@ -61,6 +61,34 @@ the package, start it, and understand what happened.
   first thing a new user gets wrong on a Pi, so: a way to list the devices, and
   startup errors that name the actual problem (device missing or busy, port
   already bound, no Avahi) instead of leaving someone to guess.
+- **Configure everything from `/etc/default/openairplay2-receiver`.** Today that
+  file holds one opaque `OPENAIRPLAY2_ARGS` blob of command-line flags. Every
+  option gets its own named environment variable instead — name, ALSA device,
+  port, pincode, mDNS on or off, the now-playing endpoint's enable, address and
+  password — read by the binary itself, with a command-line flag still winning
+  over an environment variable so interactive runs are unchanged. `--name` also
+  learns hostname substitutions (`%h`), so one file can be deployed unedited
+  across several machines.
+
+  This is a security fix and not only ergonomics. The systemd unit already
+  admits the problem: options are passed on the command line, `/proc/<pid>/cmdline`
+  is world-readable, so any local user can read a `--pincode` out of `ps`, and
+  the conffile's 0640 protects the file and nothing else. `/proc/<pid>/environ`
+  is readable only by the process owner and root, so moving secrets into the
+  environment closes that hole.
+
+  `OPENAIRPLAY2_ARGS` is **removed** rather than kept alongside. A preserved
+  conffile would then silently stop taking effect — an upgraded box would come
+  back up with its name and audio device reset to defaults and nothing in the
+  log to explain it — so the upgrade has to announce itself: a `NEWS.Debian`
+  entry, and the daemon logging an error when it finds `OPENAIRPLAY2_ARGS` set
+  in its environment and ignored.
+- **A password on the now-playing endpoint.** This is new functionality, not
+  configuration: the WebSocket has no authentication of any kind today, so
+  anyone who can reach the port gets track metadata and cover art, and the only
+  present mitigation is a comment in the options file suggesting loopback. A
+  shared secret from the config file, sent by `openairplay2-tui` and compared in
+  constant time before the WebSocket upgrade.
 - **A security review** before strangers run this on their own networks. The
   attack surface is a daemon that listens on a well-known port and speaks
   pairing, an encrypted channel, and a media decoder to anything that connects —
@@ -161,11 +189,49 @@ Milestones 1–7: a working single-stream receiver, end to end.
   [`notes/licensing.md`](licensing.md), which is required reading before
   touching the FairPlay path.
 
-## Later, and not scheduled
+## 0.6 and later
 
 Everything here has been deliberately postponed rather than forgotten.
 
-- **Fail loudly on what we do not support** (0.6). A stranger's sender may pick
+### Wanted, not yet scheduled
+
+Weighed against
+[shairport-sync](https://github.com/mikebrady/shairport-sync)'s feature set and
+kept; the rest of that list was considered and declined, which is recorded below
+so it does not get re-proposed.
+
+- **Hardware mixer volume.** Drive the sound card's own mixer control instead of
+  multiplying PCM by a gain. Software gain throws away bits at low volume, and a
+  real amp or DAC expects to be told its own volume. The seam for it already
+  exists: the library reports dB and the host decides what to do with it.
+- **DAC standby prevention.** Keep the device open, or feed it silence, so a DAC
+  does not fall asleep between tracks and swallow the first fraction of a
+  second of the next one.
+- **Statistics.** Buffer occupancy, drift and underrun counts — the numbers
+  needed when someone reports stuttering that cannot be reproduced — logged
+  periodically, and shown in `openairplay2-tui` so they are visible while it is
+  happening rather than only afterwards in a journal.
+
+### Deliberately declined
+
+The one that shapes everything else: **PTP**, and therefore **multi-room
+grouping**. This receiver targets one sender → one stream → one output; PTP
+exists to align *multiple* outputs to a shared clock, and for a single output
+the sender's buffering plus our backpressure suffice. See
+[`notes/milestone-6.md`](milestone-6.md).
+
+Considered from shairport-sync and not wanted here: additional output backends
+(PipeWire, PulseAudio, pipe/stdout), resampling, ALSA period and buffer tuning,
+configurable idle and session timeouts, and the whole integration surface —
+shell hooks, a metadata pipe or UDP feed, MQTT with Home Assistant
+autodiscovery, and D-Bus/MPRIS. Also out of scope by design rather than by
+scheduling: AirPlay 1 (that is
+[openairplay1](https://github.com/st3fan/openairplay1)), multichannel 5.1/7.1,
+and AirPlay video or photo streaming.
+
+### Postponed
+
+- **Fail loudly on what we do not support.** A stranger's sender may pick
   ALAC, realtime (type 96) audio, or 48 kHz / S24, and `aac_params()` hard-codes
   44.1 kHz stereo AAC-LC. Untested too: a second sender connecting mid-stream —
   the accept loop spawns a task per connection with no session arbitration — and
@@ -180,9 +246,3 @@ Everything here has been deliberately postponed rather than forgotten.
   ([#64](https://github.com/st3fan/openairplay2/issues/64)).
 - **`pair-verify` / persistent pairing**, so a sender does not pair afresh each
   session.
-
-Out of scope by design, not by scheduling: **PTP** and therefore **multi-room
-grouping**. This receiver targets one sender → one stream → one output; PTP
-exists to align *multiple* outputs to a shared clock, and for a single output
-the sender's buffering plus our backpressure suffice. See
-[`notes/milestone-6.md`](milestone-6.md).
