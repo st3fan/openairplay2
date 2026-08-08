@@ -16,4 +16,9 @@ openairplay2-receiver (0.4.0-1) unstable; urgency=medium
 
   A name may now contain %h, which becomes the machine's hostname.
 
+  The now-playing WebSocket (OPENAIRPLAY2_TUI_LISTEN) can now require a
+  password: set OPENAIRPLAY2_TUI_PASSWORD, and start openairplay2-tui with
+  --password. Without one it remains open to anyone who can reach it, as
+  before.
+
  -- Stefan Arentz <stefan.arentz@gmail.com>  Fri, 07 Aug 2026 22:00:00 -0400

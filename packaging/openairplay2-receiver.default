@@ -34,6 +34,11 @@
 # loopback unless you mean otherwise.
 #OPENAIRPLAY2_TUI_LISTEN=
 
+# Require this password on the now-playing WebSocket; openairplay2-tui
+# presents it with --password (or this same variable). Without one, anyone
+# who can reach the address connects.
+#OPENAIRPLAY2_TUI_PASSWORD=
+
 # OPENAIRPLAY2_IDENTITY_FILE is set by the systemd unit (--identity-file,
 # which wins) and should not be set here.
 

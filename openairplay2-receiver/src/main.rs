@@ -34,6 +34,8 @@ struct Args {
     pincode: Option<String>,
     /// Address to serve the now-playing WebSocket on; off when `None`.
     tui_listen: Option<String>,
+    /// Require this password on the now-playing WebSocket; `None` → open.
+    tui_password: Option<String>,
 }
 
 /// The device to open after flags and environment have merged: `None` is
@@ -85,13 +87,18 @@ options:
                             openairplay2-tui renders, e.g. 127.0.0.1:7392; it
                             carries track metadata and cover art, so keep it
                             on loopback unless you mean otherwise
+  --tui-password PASS       require this password on the now-playing
+                            WebSocket (openairplay2-tui --password); without
+                            one, anyone who can reach the address connects.
+                            Prefer the OPENAIRPLAY2_TUI_PASSWORD variable —
+                            like --pincode, a flag is visible in ps
   --list-devices            list the ALSA playback devices and exit
   --version                 print the version and exit
   -h, --help                print this help
 
 Each option can also come from the environment — OPENAIRPLAY2_NAME, _PORT,
 _MAC, _IDENTITY_FILE, _PINCODE, _AVAHI (on/off), _AUDIO (on/off),
-_ALSA_DEVICE, _TUI_LISTEN — which is how /etc/default/openairplay2-receiver
+_ALSA_DEVICE, _TUI_LISTEN, _TUI_PASSWORD — which is how /etc/default/openairplay2-receiver
 configures the service. A flag wins over its variable; an empty variable is
 unset. %h in the name becomes this machine's hostname.
 
@@ -121,6 +128,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         alsa_device: None,
         pincode: None,
         tui_listen: None,
+        tui_password: None,
     };
     let value = |flag: &str, it: &mut dyn Iterator<Item = String>| {
         it.next().ok_or_else(|| format!("{flag} needs a value"))
@@ -149,6 +157,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--no-audio" => args.audio = Some(false),
             "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
+            "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
             "--list-devices" => return Ok(Action::ListDevices),
             "--version" => return Ok(Action::Version),
             "-h" | "--help" => return Ok(Action::Help),
@@ -219,6 +228,9 @@ fn resolve(mut args: Args, env: impl Fn(&str) -> Option<String>) -> Result<Args,
     }
     if args.tui_listen.is_none() {
         args.tui_listen = get("OPENAIRPLAY2_TUI_LISTEN");
+    }
+    if args.tui_password.is_none() {
+        args.tui_password = get("OPENAIRPLAY2_TUI_PASSWORD");
     }
     Ok(args)
 }
@@ -443,9 +455,17 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            info!("now-playing endpoint: ws://{addr}");
+            // The password is a secret: name the state, never the value.
+            match &args.tui_password {
+                Some(_) => info!("now-playing endpoint: ws://{addr} (password required)"),
+                None => info!("now-playing endpoint: ws://{addr} (no password)"),
+            }
             let publisher = tui::Publisher::new(receiver.config().name.clone());
-            tokio::spawn(tui::serve(listener, publisher.clone()));
+            tokio::spawn(tui::serve(
+                listener,
+                publisher.clone(),
+                args.tui_password.clone(),
+            ));
             Some(publisher)
         }
         None => None,
@@ -622,6 +642,7 @@ mod tests {
             ("OPENAIRPLAY2_AUDIO", "off"),
             ("OPENAIRPLAY2_ALSA_DEVICE", "hw:1"),
             ("OPENAIRPLAY2_TUI_LISTEN", "0.0.0.0:7392"),
+            ("OPENAIRPLAY2_TUI_PASSWORD", "sekrit"),
         ];
         let args = resolve(run_args(&[]), env_of(&env)).unwrap();
         assert_eq!(args.name.as_deref(), Some("Kitchen %h"));
@@ -634,6 +655,7 @@ mod tests {
         assert_eq!(args.pincode.as_deref(), Some("4821"));
         assert_eq!(args.avahi, Some(false));
         assert_eq!(args.tui_listen.as_deref(), Some("0.0.0.0:7392"));
+        assert_eq!(args.tui_password.as_deref(), Some("sekrit"));
         // The audio switch dominates the device name.
         assert_eq!(effective_device(&args), None);
     }
@@ -734,6 +756,7 @@ mod tests {
             &["--alsa-device", "x"],
             &["--no-audio"],
             &["--tui-listen", "x"],
+            &["--tui-password", "x"],
             &["--list-devices"],
             &["--version"],
             &["--help"],
