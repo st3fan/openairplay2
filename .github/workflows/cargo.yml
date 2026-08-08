@@ -1,9 +1,20 @@
-# Publishes both crates to crates.io. Called by release.yml when a GitHub
+# Publishes the crates to crates.io. Called by release.yml when a GitHub
 # Release is published; not triggered on its own.
 #
 # Authentication is crates.io Trusted Publishing (GitHub OIDC): no API token
 # is stored in the repo. One-time setup and the release procedure live in
 # runbooks/releasing.md.
+#
+# Shape (see plans/20260807-02-publishable-release.md): a crates.io version is
+# immutable, so a release that publishes some crates and fails on another is
+# the worst outcome (#65). Two defenses:
+#
+#   1. `cargo package --workspace` gates the job: every publishable crate must
+#      package and verify — dependents build against a local tmp-registry of
+#      the just-packaged crates — before anything uploads.
+#   2. Each publish first checks the sparse index and skips versions already
+#      published, so re-running after a partial failure (or after a manual
+#      first publish of a new crate) picks up where it left off.
 name: crates.io
 
 on:
@@ -25,16 +36,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: Test before publishing
         run: cargo test --workspace
+      # The gate: if any crate cannot publish, fail here — with crates.io
+      # still untouched. (Not `publish --dry-run`: that errors on versions
+      # already on the index, which is exactly the state a re-run is in.)
+      - name: Package and verify every publishable crate
+        run: cargo package --workspace
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish openairplay2
-        run: cargo publish -p openairplay2
+      # Dependency order; cargo publish waits for each crate to be available
+      # in the index before returning, so the next crate's packaging can
+      # resolve it. --no-verify: the gate above already verified every crate
+      # from its packaged form.
+      - name: Publish (skipping versions already on the index)
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      # cargo waits for the library to be available in the index before
-      # verifying the dependent binary crate.
-      - name: Publish openairplay2-receiver
-        run: cargo publish -p openairplay2-receiver
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          for crate in openairplay2-tui-protocol openairplay2 openairplay2-receiver; do
+            version=$(cargo metadata --format-version 1 --no-deps |
+              jq -r --arg name "$crate" '.packages[] | select(.name == $name) | .version')
+            # Sparse-index path for names of 4+ characters: aa/bb/name.
+            # A 404 (crate never published) reads as "not published".
+            if curl -sf "https://index.crates.io/${crate:0:2}/${crate:2:2}/${crate}" |
+              jq -e --arg v "$version" 'select(.vers == $v)' >/dev/null; then
+              echo "${crate}@${version} is already on crates.io — skipping"
+              continue
+            fi
+            cargo publish -p "$crate" --no-verify
+          done

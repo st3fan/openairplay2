@@ -7,11 +7,15 @@ Publishing a release runs [release.yml](../.github/workflows/release.yml),
 which checks the tag against the crate version and then dispatches two
 workflows that run in parallel:
 
-- [cargo.yml](../.github/workflows/cargo.yml) — publishes `openairplay2` and
-  then `openairplay2-receiver` to crates.io using Trusted Publishing (GitHub
-  OIDC, no stored API token). The library must publish first: the binary
-  depends on it and its pre-publish verification build resolves the library
-  from the registry, not the workspace.
+- [cargo.yml](../.github/workflows/cargo.yml) — publishes
+  `openairplay2-tui-protocol`, `openairplay2` and `openairplay2-receiver`, in
+  that order (dependencies before dependents), to crates.io using Trusted
+  Publishing (GitHub OIDC, no stored API token). Before anything uploads,
+  `cargo package --workspace` must package and verify **every** publishable
+  crate — a crates.io version is immutable, so a release that publishes some
+  crates and then fails is the worst outcome (#65). Each publish step skips
+  versions already on the index, so the job is safe to re-run after a partial
+  failure.
 - [debian.yml](../.github/workflows/debian.yml) — builds
   `openairplay2-receiver_X.Y.Z-1_{amd64,arm64,armhf}.deb` in parallel, in
   `debian:trixie` containers (amd64 and arm64 natively; armhf cross-compiled,
@@ -44,6 +48,19 @@ exists, so the very first publish is manual:
 *(Done: both crates were published by hand at 0.1.0 and 0.2.0; 0.3.0 was the
 first automated release.)*
 
+### Bootstrapping a new crate
+
+The same constraint applies whenever the workspace grows a new publishable
+crate: its very first publish must be manual, after which Trusted Publishing
+takes over. Publish it by hand (`cargo login` with a `publish-new`-scoped
+token, `cargo publish -p <crate>`), add the trusted publisher on crates.io
+(repository `st3fan/openairplay2`, workflow `release.yml`), and revoke the
+token. The workflow's skip-if-published guard means the next release passes
+over the hand-published version untouched.
+
+*(To do before the 0.4.0 release: `openairplay2-tui-protocol` — newly
+publishable since #65 — needs exactly this bootstrap at 0.4.0.)*
+
 ## Releasing a version
 
 ### 1. Pick the version
@@ -55,9 +72,12 @@ version line for everything — library, binary, and `.deb`.
 
 - Bump `version` in **all four** manifests — `openairplay2/Cargo.toml`,
   `openairplay2-receiver/Cargo.toml`, `openairplay2-tui/Cargo.toml`,
-  `openairplay2-tui-protocol/Cargo.toml` — and the `openairplay2 = { version
-  = … }` dependency line in the receiver. (The two `tui` crates are
-  `publish = false`, but the versions are one line for everything.)
+  `openairplay2-tui-protocol/Cargo.toml` — and all **three** in-workspace
+  dependency version lines: `openairplay2 = { … version = … }` and
+  `openairplay2-tui-protocol = { … version = … }` in the receiver, and
+  `openairplay2-tui-protocol = { … version = … }` in the tui.
+  (`openairplay2-tui` is `publish = false`, but the versions are one line for
+  everything, and `cargo package --workspace` checks its manifest too.)
 - Bump the `openairplay2 = "X.Y"` line in the README's Embedding section — it
   is the one version outside a manifest and it has been missed before.
 - Update `notes/status.md` and the README if behavior changed.
@@ -65,16 +85,20 @@ version line for everything — library, binary, and `.deb`.
 - Verify the packages build:
 
   ```sh
-  cargo publish --dry-run -p openairplay2
-  cargo publish --dry-run -p openairplay2-receiver
+  cargo package --workspace             # every publishable crate, one command
   ./packaging/build-deb.sh              # native (this machine's architecture)
   ```
 
-  **Dry-run every publishable crate, not just the library.** `cargo.yml`
-  publishes the library first, and a crates.io version is immutable — so a
-  receiver that fails to publish leaves the release half-shipped with nothing
-  to undo. Checking only the library is exactly how
-  [#65](https://github.com/st3fan/openairplay2/issues/65) went unnoticed.
+  `cargo package --workspace` (cargo ≥ 1.90; the workspace's
+  `rust-version = "1.88"` is a build minimum, not a toolchain cap) packages and
+  verifies **every** publishable crate, building dependents against the
+  just-packaged local crates. Do not substitute per-crate
+  `cargo publish --dry-run`: that verifies against the real index, so at bump
+  time it always fails — the bumped library version is not on crates.io yet.
+  Checking only the library, meanwhile, is exactly how
+  [#65](https://github.com/st3fan/openairplay2/issues/65) went unnoticed. CI
+  runs this same check on every PR, so a manifest that cannot publish fails
+  long before a release; this step is the belt to that suspender.
 
   Building armhf locally needs the cross toolchain once
   (`./packaging/setup-build.sh cross` on an amd64 box), after which
@@ -107,8 +131,10 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 
 ### 5. Verify
 
-- <https://crates.io/crates/openairplay2> shows the new version, and
-  <https://docs.rs/openairplay2> builds and renders (a few minutes).
+- <https://crates.io/crates/openairplay2>,
+  <https://crates.io/crates/openairplay2-receiver> and
+  <https://crates.io/crates/openairplay2-tui-protocol> show the new version,
+  and <https://docs.rs/openairplay2> builds and renders (a few minutes).
 - The release page carries all three `.deb`s (amd64, arm64, armhf) and
   `SHA256SUMS`.
 - Install on a real Linux box and pair from a real Mac:
@@ -144,9 +170,12 @@ rerun failed jobs from the run page if the infrastructure hiccups.
 ## If a release goes wrong
 
 A published crates.io version is immutable — it cannot be replaced or deleted.
-Fix forward: `cargo yank openairplay2@X.Y.Z` stops new projects
-resolving the bad version (never breaking existing `Cargo.lock` users), then
-release a patch version.
+If the failure left the release **incomplete** (some crates published, some
+not) but what published is *correct*, just re-run the cargo leg from the run
+page: the publish steps skip versions already on the index and pick up where
+the job stopped. Fix forward only when what published is **wrong**:
+`cargo yank openairplay2@X.Y.Z` stops new projects resolving the bad version
+(never breaking existing `Cargo.lock` users), then release a patch version.
 
 The `.deb` side has no such constraint, but the tag pins the commit, so
 re-running a failed workflow rebuilds the same broken code. Unless the failure
