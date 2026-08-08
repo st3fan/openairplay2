@@ -9,10 +9,34 @@ repository = "https://github.com/st3fan/openairplay2"
 readme = "../README.md"
 keywords = ["airplay", "airplay2", "tui", "now-playing", "terminal"]
 categories = ["multimedia::audio", "command-line-utilities"]
-# Not on crates.io: this is an application, distributed as a package —
-# whether it should also be `cargo install`-able is the packaging item's
-# question (roadmap, "Package openairplay2-tui").
+# Not on crates.io: this is an application, distributed as a .deb (below) —
+# whether it should also be `cargo install`-able is a separate decision.
 publish = false
+
+# .deb packaging via ../packaging/build-deb.sh, beside the receiver's package
+# (see plans/20260807-03-tui-deb.md). An interactive terminal program, not a
+# daemon: no systemd unit, no system user, no conffile — the binary, the
+# README, and the ARMv6 preinst guard are the whole package. Depends is pinned
+# by hand like the receiver's, so all three architecture legs produce
+# identical metadata.
+[package.metadata.deb]
+name = "openairplay2-tui"
+maintainer = "Stefan Arentz <stefan.arentz@gmail.com>"
+copyright = "2026 Stefan Arentz"
+extended-description = """\
+A full-screen now-playing display for an openairplay2 receiver: track title, \
+artist and album, playback position, volume, and the cover art drawn as a \
+real image on terminals that support Kitty or iTerm2 graphics. It watches a \
+receiver over a WebSocket — start openairplay2-receiver with --tui-listen \
+(on this or any other machine) and point openairplay2-tui --connect at it."""
+section = "sound"
+priority = "optional"
+depends = "libc6"
+assets = [
+    ["target/release/openairplay2-tui", "usr/bin/", "755"],
+    ["../README.md", "usr/share/doc/openairplay2-tui/README.md", "644"],
+]
+maintainer-scripts = "../packaging/tui-debian"
 
 # It depends on neither `openairplay2` nor ALSA: this is a WebSocket client
 # and a renderer, which is what lets it run on a laptop (macOS included)

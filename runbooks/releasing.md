@@ -17,10 +17,11 @@ workflows that run in parallel:
   versions already on the index, so the job is safe to re-run after a partial
   failure.
 - [debian.yml](../.github/workflows/debian.yml) — builds
-  `openairplay2-receiver_X.Y.Z-1_{amd64,arm64,armhf}.deb` in parallel, in
+  `openairplay2-receiver_X.Y.Z-1_{amd64,arm64,armhf}.deb` and
+  `openairplay2-tui_X.Y.Z-1_{amd64,arm64,armhf}.deb` in parallel, in
   `debian:trixie` containers (amd64 and arm64 natively; armhf cross-compiled,
   since no 32-bit ARM runners exist), signs a provenance attestation for each,
-  and attaches them plus `SHA256SUMS` to the release.
+  and attaches all six plus `SHA256SUMS` to the release.
 
 ## One-time setup (first release only)
 
@@ -135,8 +136,8 @@ rerun failed jobs from the run page if the infrastructure hiccups.
   <https://crates.io/crates/openairplay2-receiver> and
   <https://crates.io/crates/openairplay2-tui-protocol> show the new version,
   and <https://docs.rs/openairplay2> builds and renders (a few minutes).
-- The release page carries all three `.deb`s (amd64, arm64, armhf) and
-  `SHA256SUMS`.
+- The release page carries all six `.deb`s — receiver and tui, each for
+  amd64, arm64 and armhf — and a `SHA256SUMS` covering them all.
 - Install on a real Linux box and pair from a real Mac:
 
   ```sh
@@ -151,6 +152,8 @@ rerun failed jobs from the run page if the infrastructure hiccups.
   `/etc/default/openairplay2-receiver` and the pairing identity in
   `/var/lib/openairplay2` — a Mac that paired before the upgrade must not be
   asked to pair again.
+- Install the tui package the same way and point `openairplay2-tui --connect`
+  at a receiver started with `--tui-listen` — it draws.
 - Optional provenance check (any machine with `gh`):
   `gh attestation verify openairplay2-receiver_….deb --repo st3fan/openairplay2`.
 

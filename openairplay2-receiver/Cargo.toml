@@ -32,6 +32,9 @@ depends = "libasound2t64, libc6, adduser"
 # The receiver runs without Avahi — it warns, is simply undiscoverable, and
 # --no-avahi is a supported mode — so this is Recommends, not Depends.
 recommends = "avahi-daemon"
+# The now-playing display is an optional companion that usually runs on a
+# different machine than a headless receiver: Suggests, not Recommends.
+suggests = "openairplay2-tui"
 assets = [
     ["target/release/openairplay2-receiver", "usr/bin/", "755"],
     [
