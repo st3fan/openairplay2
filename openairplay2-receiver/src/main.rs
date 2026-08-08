@@ -16,6 +16,14 @@ use openairplay2::{AudioSink, Event, Receiver};
 
 const DEFAULT_ALSA_DEVICE: &str = "default";
 
+/// Exit code for a configuration mistake the operator must fix — a bad
+/// `OPENAIRPLAY2_*` value, an unknown ALSA device, a port already in use or
+/// privileged. `78` is `EX_CONFIG` from sysexits.h. The systemd unit lists it
+/// in `RestartPreventExitStatus`, so such an exit fails the service and stays
+/// stopped rather than restart-looping; a crash (any other failure, or a
+/// signal) still restarts.
+const EXIT_CONFIG: u8 = 78;
+
 /// Everything is optional: `None` means "not given on the command line", so
 /// [`resolve`] knows which fields the environment may still fill before the
 /// built-in defaults apply.
@@ -396,7 +404,7 @@ async fn main() -> ExitCode {
         Ok(args) => args,
         Err(msg) => {
             eprintln!("error: {msg}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
     if let Some(msg) = legacy_args_notice(|k| std::env::var(k).ok()) {
@@ -424,7 +432,7 @@ async fn main() -> ExitCode {
         Ok(receiver) => receiver,
         Err(e) => {
             eprintln!("cannot load or create identity at {identity_path:?}: {e}");
-            return ExitCode::FAILURE;
+            return ExitCode::from(EXIT_CONFIG);
         }
     };
 
@@ -459,7 +467,7 @@ async fn main() -> ExitCode {
             }
             player::Probe::Fatal(msg) => {
                 eprintln!("error: {msg}");
-                return ExitCode::FAILURE;
+                return ExitCode::from(EXIT_CONFIG);
             }
         }
     }
@@ -484,7 +492,7 @@ async fn main() -> ExitCode {
                 Ok(listener) => listener,
                 Err(e) => {
                     eprintln!("cannot listen for displays on {addr}: {e}");
-                    return ExitCode::FAILURE;
+                    return ExitCode::from(EXIT_CONFIG);
                 }
             };
             // The password is a secret: name the state, never the value.
@@ -557,12 +565,24 @@ async fn main() -> ExitCode {
     tokio::select! {
         result = receiver.run(sink_factory, event_tx) => {
             if let Err(e) = result {
-                if e.kind() == std::io::ErrorKind::AddrInUse {
-                    eprintln!("error: {e} — is another receiver already running?");
-                } else {
-                    eprintln!("error: {e}");
+                // A bind that fails deterministically (port taken, or below
+                // 1024 without privileges) is a config mistake, not a crash —
+                // exit EX_CONFIG so systemd doesn't restart-loop it. Anything
+                // else is unexpected and should restart.
+                match e.kind() {
+                    std::io::ErrorKind::AddrInUse => {
+                        eprintln!("error: {e} — is another receiver already running?");
+                        return ExitCode::from(EXIT_CONFIG);
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        eprintln!("error: {e} — a port below 1024 needs privileges the service does not have");
+                        return ExitCode::from(EXIT_CONFIG);
+                    }
+                    _ => {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
-                return ExitCode::FAILURE;
             }
         }
         _ = shutdown_signal() => {
