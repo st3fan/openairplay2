@@ -61,16 +61,18 @@ the milestone-by-milestone development history is in
 
 ## Install (Debian / Ubuntu)
 
-Every release carries a `.deb` for **amd64**, **arm64** and **armhf** (Debian's
-ARMv7 port — ARMv6 boards like the Pi Zero W are not supported). They are built
-on Debian 13 (trixie) and depend on `libasound2t64` and a glibc of at least
-2.39, so they install on **Debian 13+ / Ubuntu 24.04+**. Download the one
-for your machine from the
+Every release carries `.deb`s for **amd64**, **arm64** and **armhf** (Debian's
+ARMv7 port — ARMv6 boards like the Pi Zero W are not supported): the receiver,
+and the now-playing display as its own package. They are built on Debian 13
+(trixie) and depend on a glibc of at least 2.39 (the receiver also on
+`libasound2t64`), so they install on **Debian 13+ / Ubuntu 24.04+**. Download
+the ones for your machine from the
 [releases page](https://github.com/st3fan/openairplay2/releases) and install
-it — it brings a systemd service that starts at boot:
+them — the receiver brings a systemd service that starts at boot:
 
 ```sh
 sudo apt-get install -y ./openairplay2-receiver_X.Y.Z-1_arm64.deb
+sudo apt-get install -y ./openairplay2-tui_X.Y.Z-1_arm64.deb      # optional
 ```
 
 Set the name and the audio device in `/etc/default/openairplay2-receiver`
@@ -83,7 +85,9 @@ systemctl status openairplay2-receiver
 
 The service runs as its own `openairplay2` user and keeps its pairing
 identity in `/var/lib/openairplay2`, so senders keep recognizing the receiver
-across upgrades. The packages carry a build-provenance attestation:
+across upgrades. The display package is just the `openairplay2-tui` binary —
+no service, no configuration; it can go on a different machine than the
+receiver. All the packages carry a build-provenance attestation:
 
 ```sh
 gh attestation verify openairplay2-receiver_X.Y.Z-1_arm64.deb --repo st3fan/openairplay2
@@ -166,8 +170,10 @@ that can draw one (Ghostty, Kitty, WezTerm, iTerm2, Konsole), and a status line
 with the receiver's name, the sender's address, the stream format and the
 volume.
 
-The display is not on crates.io and is not in the `.deb` yet — build it from
-this repository:
+On Debian/Ubuntu, install it from the `openairplay2-tui` package on the
+[releases page](https://github.com/st3fan/openairplay2/releases) (see the
+install section above). Elsewhere — macOS included, where it builds and runs —
+build it from this repository:
 
 ```sh
 cargo build --release -p openairplay2-tui

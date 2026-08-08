@@ -1,5 +1,6 @@
-# Builds openairplay2-receiver .deb packages for amd64, arm64 and armhf, and —
-# when called with a release tag — attaches them to that GitHub Release.
+# Builds the openairplay2-receiver and openairplay2-tui .deb packages for
+# amd64, arm64 and armhf — six packages — and, when called with a release tag,
+# attaches them to that GitHub Release.
 #
 # amd64 and arm64 build NATIVELY: amd64 on ubuntu-latest, arm64 on the free
 # public arm64 runners. armhf (Debian's ARMv7 port) cross-compiles on an amd64
@@ -88,20 +89,26 @@ jobs:
         run: cargo install cargo-deb --locked
 
       # Native and cross builds land in different directories, so the script
-      # reports the path it produced rather than the workflow globbing for it.
-      - name: Build .deb
+      # reports the paths it produced rather than the workflow globbing for
+      # them.
+      - name: Build .debs
         id: build
         run: ./packaging/build-deb.sh ${{ matrix.arch }}
 
+      # Each package gets its own provenance attestation.
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v4
         with:
-          subject-path: ${{ steps.build.outputs.deb }}
+          subject-path: |
+            ${{ steps.build.outputs.receiver_deb }}
+            ${{ steps.build.outputs.tui_deb }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: openairplay2-receiver-${{ matrix.arch }}
-          path: ${{ steps.build.outputs.deb }}
+          name: debs-${{ matrix.arch }}
+          path: |
+            ${{ steps.build.outputs.receiver_deb }}
+            ${{ steps.build.outputs.tui_deb }}
           if-no-files-found: error
 
   assets:
