@@ -59,8 +59,46 @@ fn triage(device: &str, e: alsa::Error) -> Probe {
     }
 }
 
+/// Whether a device name is worth offering as an `--alsa-device` target.
+///
+/// ALSA's hint list is dominated by plugin definitions — the null sink,
+/// software mixers (`dmix`/`dsnoop`), channel-layout plugins (`surround*`,
+/// `front`, …) and rate/channel converters — that are either irrelevant to a
+/// plain stereo receiver or a worse pick than the card's own
+/// `default`/`plughw`/`hw`/`sysdefault` and its digital/HDMI outputs. Keep the
+/// real outputs, drop the plumbing. This is a denylist by plugin family (the
+/// token before the first `:`), so an unfamiliar real device is still shown.
+fn is_listable_device(name: &str) -> bool {
+    let family = name.split(':').next().unwrap_or(name);
+    const DROP_EXACT: &[&str] = &[
+        "null",
+        "front",
+        "rear",
+        "side",
+        "center_lfe",
+        "oss",
+        "modem",
+        "phoneline",
+    ];
+    const DROP_PREFIX: &[&str] = &[
+        "dmix",       // shared software mixing — the default already uses it
+        "dsnoop",     // shared capture
+        "dshare",     // shared output plumbing
+        "surround",   // multichannel profiles; this receiver is stereo
+        "samplerate", // rate converters
+        "speexrate",
+        "lavrate",
+        "upmix",     // channel converters
+        "vdownmix",  //
+        "usbstream", // raw USB gadget stream
+    ];
+    !DROP_EXACT.contains(&family) && !DROP_PREFIX.iter().any(|p| family.starts_with(p))
+}
+
 /// Print the playback devices, `aplay -L` style: the name to give
-/// `--alsa-device`, with ALSA's description indented beneath it.
+/// `--alsa-device`, with ALSA's description indented beneath it. Plugin
+/// definitions that aren't real outputs are filtered out — see
+/// [`is_listable_device`].
 pub fn list_devices() -> Result<(), alsa::Error> {
     for hint in alsa::device_name::HintIter::new_str(None, "pcm")? {
         // Capture-only devices can never be the output.
@@ -68,6 +106,9 @@ pub fn list_devices() -> Result<(), alsa::Error> {
             continue;
         }
         let Some(name) = hint.name else { continue };
+        if !is_listable_device(&name) {
+            continue;
+        }
         println!("{name}");
         if let Some(desc) = hint.desc {
             for line in desc.lines() {
@@ -341,6 +382,38 @@ mod tests {
         for errno in [-libc::EBUSY, libc::EBUSY, -libc::EIO] {
             let probe = triage("default", alsa::Error::new("snd_pcm_open", errno));
             assert!(matches!(probe, Probe::Warn(_)), "errno {errno}: {probe:?}");
+        }
+    }
+
+    #[test]
+    fn list_filter_keeps_real_outputs_and_drops_plumbing() {
+        for keep in [
+            "default",
+            "pipewire",
+            "pulse",
+            "jack",
+            "sysdefault:CARD=Generic",
+            "hw:CARD=S2,DEV=0",
+            "plughw:CARD=S2,DEV=0",
+            "hdmi:CARD=NVidia,DEV=0",
+            "iec958:CARD=Generic,DEV=0",
+        ] {
+            assert!(is_listable_device(keep), "should keep {keep}");
+        }
+        for drop in [
+            "null",
+            "dmix:CARD=NVidia,DEV=3",
+            "dsnoop:CARD=S2,DEV=0",
+            "surround51:CARD=Generic,DEV=0",
+            "surround21:CARD=S2,DEV=0",
+            "front:CARD=S2,DEV=0",
+            "samplerate",
+            "speexrate",
+            "upmix",
+            "vdownmix",
+            "usbstream",
+        ] {
+            assert!(!is_listable_device(drop), "should drop {drop}");
         }
     }
 }
