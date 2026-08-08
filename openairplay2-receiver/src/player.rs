@@ -138,6 +138,31 @@ fn card_id_of(name: &str) -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
+/// A human label for an `--alsa-device` value, for the startup log: the sound
+/// card's name for a `…CARD=<id>…` device (e.g. "Sound Blaster Play! 2" for
+/// `plughw:CARD=S2`), or a fixed label for the well-known plugin PCMs. `None`
+/// for anything unrecognized, so the caller logs the bare device.
+pub fn card_name(device: &str) -> Option<String> {
+    if let Some(id) = card_id_of(device) {
+        return alsa::card::Iter::new().flatten().find_map(|card| {
+            let info = alsa::ctl::Ctl::from_card(&card, false)
+                .and_then(|c| c.card_info())
+                .ok()?;
+            (info.get_id().ok()? == id).then(|| info.get_name().unwrap_or(&id).to_string())
+        });
+    }
+    let label = match device.split(':').next().unwrap_or(device) {
+        "default" => "system default output",
+        "sysdefault" => "card default output",
+        "pulse" => "PulseAudio",
+        "pipewire" => "PipeWire",
+        "jack" => "JACK",
+        "null" => "discarded",
+        _ => return None,
+    };
+    Some(label.to_string())
+}
+
 /// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
 /// volume, `-144 dB` (and below) is muted; we never amplify above unity.
 pub fn volume_to_gain(db: f32) -> f32 {
@@ -419,5 +444,17 @@ mod tests {
         assert_eq!(card_id_of("default"), None);
         assert_eq!(card_id_of("pulse"), None);
         assert_eq!(card_id_of("null"), None);
+    }
+
+    #[test]
+    fn card_name_labels_known_non_card_devices() {
+        assert_eq!(
+            card_name("default").as_deref(),
+            Some("system default output")
+        );
+        assert_eq!(card_name("pulse").as_deref(), Some("PulseAudio"));
+        assert_eq!(card_name("pipewire").as_deref(), Some("PipeWire"));
+        assert_eq!(card_name("null").as_deref(), Some("discarded"));
+        assert_eq!(card_name("somethingweird"), None);
     }
 }

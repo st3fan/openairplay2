@@ -426,7 +426,10 @@ async fn main() -> ExitCode {
         None => info!("pincode: off (transient 3939)"),
     }
     match &alsa_device {
-        Some(dev) => info!("audio output: ALSA \"{dev}\""),
+        Some(dev) => match player::card_name(dev) {
+            Some(name) => info!("audio output: {dev} ({name})"),
+            None => info!("audio output: {dev}"),
+        },
         None => info!("audio output: disabled (--no-audio)"),
     }
 
