@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use tokio::signal::unix::SignalKind;
 
 mod player;
@@ -16,6 +16,7 @@ use openairplay2::{AudioSink, Event, Receiver};
 
 const DEFAULT_ALSA_DEVICE: &str = "default";
 
+#[derive(Debug, PartialEq)]
 struct Args {
     /// `None` → the library's defaults (name "OpenAirPlay2", port 7000).
     name: Option<String>,
@@ -31,14 +32,47 @@ struct Args {
     tui_listen: Option<String>,
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: openairplay2-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--identity-file PATH] [--no-avahi] [--alsa-device NAME] [--no-audio] [--pincode CODE] \
-         [--tui-listen ADDR]"
-    );
-    std::process::exit(2);
+/// What the command line asks for; everything but `Run` prints and exits.
+#[derive(Debug, PartialEq)]
+enum Action {
+    Run(Args),
+    Help,
+    Version,
+    ListDevices,
 }
+
+const USAGE: &str = "usage: openairplay2-receiver [options] — run with --help for the list";
+
+const HELP: &str = "\
+openairplay2-receiver — standalone AirPlay 2 audio receiver (ALSA)
+
+usage: openairplay2-receiver [options]
+
+options:
+  --name NAME               name senders see in the AirPlay menu
+                            (default \"OpenAirPlay2\")
+  --port PORT               control port (default 7000)
+  --mac AA:BB:CC:DD:EE:FF   device id in the advertisement (default: taken
+                            from a real network interface)
+  --identity-file PATH      where the pairing identity lives — senders
+                            remember this receiver by it, so keep it stable
+                            (default ~/.config/openairplay2/identity)
+  --pincode CODE            require this code to pair; without it any device
+                            on the network can pair
+  --no-avahi                do not advertise over mDNS
+  --alsa-device NAME        ALSA playback device (default \"default\");
+                            see --list-devices for what this machine has
+  --no-audio                decode but do not open ALSA (silent test run)
+  --tui-listen ADDR         serve the now-playing WebSocket that
+                            openairplay2-tui renders, e.g. 127.0.0.1:7392; it
+                            carries track metadata and cover art, so keep it
+                            on loopback unless you mean otherwise
+  --list-devices            list the ALSA playback devices and exit
+  --version                 print the version and exit
+  -h, --help                print this help
+
+RUST_LOG=debug logs every request a sender makes and hex-dumps the bodies.
+";
 
 /// Parse the `--mac` argument, e.g. `aa:bb:cc:dd:ee:ff`.
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
@@ -50,7 +84,9 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(mac)
 }
 
-fn parse_args() -> Args {
+/// Pure over its input — no process exit, no environment — so it has tests.
+/// Errors are the message alone; `main` appends the usage line.
+fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     let mut args = Args {
         name: None,
         port: None,
@@ -61,41 +97,52 @@ fn parse_args() -> Args {
         pincode: None,
         tui_listen: None,
     };
-    let mut it = std::env::args().skip(1);
+    let value = |flag: &str, it: &mut dyn Iterator<Item = String>| {
+        it.next().ok_or_else(|| format!("{flag} needs a value"))
+    };
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--name" => args.name = Some(it.next().unwrap_or_else(|| usage())),
+            "--name" => args.name = Some(value("--name", &mut it)?),
             "--port" => {
+                let v = value("--port", &mut it)?;
                 args.port = Some(
-                    it.next()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or_else(|| usage()),
-                )
+                    v.parse()
+                        .map_err(|_| format!("--port needs a number 1-65535, not \"{v}\""))?,
+                );
             }
             "--mac" => {
+                let v = value("--mac", &mut it)?;
                 args.mac = Some(
-                    it.next()
-                        .as_deref()
-                        .and_then(parse_mac)
-                        .unwrap_or_else(|| usage()),
-                )
+                    parse_mac(&v)
+                        .ok_or_else(|| format!("--mac needs AA:BB:CC:DD:EE:FF, not \"{v}\""))?,
+                );
             }
             "--identity-file" => {
-                args.identity_file = Some(PathBuf::from(it.next().unwrap_or_else(|| usage())))
+                args.identity_file = Some(PathBuf::from(value("--identity-file", &mut it)?))
             }
             "--no-avahi" => args.avahi = false,
-            "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
+            "--alsa-device" => args.alsa_device = Some(value("--alsa-device", &mut it)?),
             "--no-audio" => args.alsa_device = None,
-            "--pincode" => args.pincode = Some(it.next().unwrap_or_else(|| usage())),
-            "--tui-listen" => args.tui_listen = Some(it.next().unwrap_or_else(|| usage())),
-            "-h" | "--help" => usage(),
-            other => {
-                eprintln!("unknown argument: {other}");
-                usage();
-            }
+            "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
+            "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
+            "--list-devices" => return Ok(Action::ListDevices),
+            "--version" => return Ok(Action::Version),
+            "-h" | "--help" => return Ok(Action::Help),
+            other => return Err(format!("unknown argument: {other}")),
         }
     }
-    args
+    Ok(Action::Run(args))
+}
+
+/// Make a print-and-exit path behave like a Unix tool when piped into
+/// `head` or a pager: die quietly on a closed pipe instead of panicking.
+/// Only for paths that exit right after printing — the server keeps Rust's
+/// default (SIGPIPE ignored) so a peer closing a socket mid-write stays an
+/// io error, not a process death.
+fn sigpipe_default() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 fn default_identity_path() -> PathBuf {
@@ -127,7 +174,33 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let args = parse_args();
+    let args = match parse(std::env::args().skip(1)) {
+        Ok(Action::Run(args)) => args,
+        Ok(Action::Help) => {
+            sigpipe_default();
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
+        Ok(Action::Version) => {
+            println!("openairplay2-receiver {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Action::ListDevices) => {
+            sigpipe_default();
+            return match player::list_devices() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: cannot list ALSA devices: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
 
     let identity_path = args.identity_file.unwrap_or_else(default_identity_path);
     let mut builder = Receiver::builder()
@@ -168,6 +241,22 @@ async fn main() -> ExitCode {
     match &args.alsa_device {
         Some(dev) => info!("audio output: ALSA \"{dev}\""),
         None => info!("audio output: disabled (--no-audio)"),
+    }
+
+    // Probe the device now, so a typo fails in the user's face instead of
+    // starting a receiver that decodes to nowhere (the sink's decode-only
+    // fallback is for devices that vanish mid-run, not for wrong names).
+    if let Some(dev) = &args.alsa_device {
+        match player::probe_device(dev) {
+            player::Probe::Ok => {}
+            player::Probe::Warn(e) => {
+                warn!("cannot open ALSA \"{dev}\" right now ({e}); will try again when a stream starts")
+            }
+            player::Probe::Fatal(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     // The sink seam: the library delivers PCM to an AlsaSink per stream and
@@ -255,7 +344,11 @@ async fn main() -> ExitCode {
     tokio::select! {
         result = receiver.run(sink_factory, event_tx) => {
             if let Err(e) = result {
-                eprintln!("server error: {e}");
+                if e.kind() == std::io::ErrorKind::AddrInUse {
+                    eprintln!("error: {e} — is another receiver already running?");
+                } else {
+                    eprintln!("error: {e}");
+                }
                 return ExitCode::FAILURE;
             }
         }
@@ -264,4 +357,136 @@ async fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_strs(args: &[&str]) -> Result<Action, String> {
+        parse(args.iter().map(|s| s.to_string()))
+    }
+
+    fn run_args(args: &[&str]) -> Args {
+        match parse_strs(args) {
+            Ok(Action::Run(args)) => args,
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_arguments_yields_the_defaults() {
+        let args = run_args(&[]);
+        assert_eq!(args.name, None);
+        assert_eq!(args.port, None);
+        assert_eq!(args.mac, None);
+        assert_eq!(args.identity_file, None);
+        assert!(args.avahi);
+        assert_eq!(args.alsa_device.as_deref(), Some(DEFAULT_ALSA_DEVICE));
+        assert_eq!(args.pincode, None);
+        assert_eq!(args.tui_listen, None);
+    }
+
+    #[test]
+    fn every_flag_parses() {
+        let args = run_args(&[
+            "--name",
+            "Kitchen",
+            "--port",
+            "7100",
+            "--mac",
+            "aa:bb:cc:dd:ee:ff",
+            "--identity-file",
+            "/tmp/id",
+            "--no-avahi",
+            "--alsa-device",
+            "hw:1",
+            "--pincode",
+            "4821",
+            "--tui-listen",
+            "127.0.0.1:7392",
+        ]);
+        assert_eq!(args.name.as_deref(), Some("Kitchen"));
+        assert_eq!(args.port, Some(7100));
+        assert_eq!(args.mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(
+            args.identity_file.as_deref(),
+            Some(std::path::Path::new("/tmp/id"))
+        );
+        assert!(!args.avahi);
+        assert_eq!(args.alsa_device.as_deref(), Some("hw:1"));
+        assert_eq!(args.pincode.as_deref(), Some("4821"));
+        assert_eq!(args.tui_listen.as_deref(), Some("127.0.0.1:7392"));
+    }
+
+    #[test]
+    fn later_flags_win() {
+        // --no-audio clears the device; a later --alsa-device restores one.
+        assert_eq!(run_args(&["--no-audio"]).alsa_device, None);
+        assert_eq!(
+            run_args(&["--no-audio", "--alsa-device", "hw:0"])
+                .alsa_device
+                .as_deref(),
+            Some("hw:0")
+        );
+        assert_eq!(
+            run_args(&["--alsa-device", "hw:0", "--no-audio"]).alsa_device,
+            None
+        );
+    }
+
+    #[test]
+    fn help_version_and_list_devices_are_actions() {
+        assert_eq!(parse_strs(&["--help"]), Ok(Action::Help));
+        assert_eq!(parse_strs(&["-h"]), Ok(Action::Help));
+        assert_eq!(parse_strs(&["--version"]), Ok(Action::Version));
+        assert_eq!(parse_strs(&["--list-devices"]), Ok(Action::ListDevices));
+    }
+
+    #[test]
+    fn mistakes_name_the_flag() {
+        assert!(parse_strs(&["--name"]).unwrap_err().contains("--name"));
+        assert!(parse_strs(&["--port", "x"]).unwrap_err().contains("--port"));
+        assert!(parse_strs(&["--port", "70000"])
+            .unwrap_err()
+            .contains("--port"));
+        assert!(parse_strs(&["--mac", "not-a-mac"])
+            .unwrap_err()
+            .contains("--mac"));
+        assert!(parse_strs(&["--frobnicate"])
+            .unwrap_err()
+            .contains("--frobnicate"));
+    }
+
+    /// Every flag the parser accepts is documented in HELP — adding a flag
+    /// without describing it fails here. (The list is checked against the
+    /// parser too: each entry must parse.)
+    #[test]
+    fn help_describes_every_flag() {
+        let flags: &[&[&str]] = &[
+            &["--name", "x"],
+            &["--port", "7000"],
+            &["--mac", "aa:bb:cc:dd:ee:ff"],
+            &["--identity-file", "x"],
+            &["--pincode", "x"],
+            &["--no-avahi"],
+            &["--alsa-device", "x"],
+            &["--no-audio"],
+            &["--tui-listen", "x"],
+            &["--list-devices"],
+            &["--version"],
+            &["--help"],
+        ];
+        for invocation in flags {
+            assert!(
+                parse_strs(invocation).is_ok(),
+                "{invocation:?} should parse"
+            );
+            assert!(
+                HELP.contains(invocation[0]),
+                "HELP is missing {}",
+                invocation[0]
+            );
+        }
+    }
 }
