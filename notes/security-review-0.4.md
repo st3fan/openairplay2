@@ -109,8 +109,10 @@ backoff / attempt cap as the shape of a fix.
 
 ## Recommendations carried forward
 
-- **`cargo audit` in CI** — added, so the dependency surface stays watched
-  rather than reviewed once. (See the stack's CI change.)
+- **Watching the dependency surface** — a `cargo audit` CI job was added here,
+  then removed again pending a better approach to advisory scanning. The
+  dependency tree is still clean as of this review; keeping it watched is open
+  work.
 - **Endpoint bind guidance** — the README/options-file advice to keep
   `--tui-listen` on loopback unless a password is set stands; F1's fixes do not
   change that the endpoint, once bound to a routable address without a password,
