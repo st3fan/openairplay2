@@ -187,6 +187,21 @@ fn apply_gain(samples: &mut [i16], gain: f32) {
     }
 }
 
+/// Ramp the first `frames` frames from silence to full, in place — a short
+/// fade-in on the first audio after the device is (re)started, so the step
+/// from silence to the new track's first sample is not an audible click at a
+/// track switch (see plans/20260808-01). Linear is inaudible over a few ms.
+fn apply_fade_in(samples: &mut [i16], channels: usize, frames: usize) {
+    let n = frames.min(samples.len() / channels.max(1));
+    for f in 0..n {
+        let g = (f as f32 + 0.5) / n as f32;
+        for c in 0..channels {
+            let s = &mut samples[f * channels + c];
+            *s = (f32::from(*s) * g) as i16;
+        }
+    }
+}
+
 /// The playback gain, shared between the event consumer (which sets it from
 /// volume events) and the sink (which applies it live). Outlives any single
 /// stream, so a volume set before `SETUP` phase 2 isn't lost.
@@ -236,6 +251,12 @@ pub struct AlsaSink {
     prebuffer: Vec<i16>,
     threshold: usize,
     started: bool,
+    channels: usize,
+    /// Fade the first audio after a (re)start in over this many frames, to
+    /// de-click the silence→new-track step at a track switch.
+    fade_frames: usize,
+    /// The next write after a reset/open still needs its fade-in.
+    fade_pending: bool,
 }
 
 impl AlsaSink {
@@ -257,6 +278,9 @@ impl AlsaSink {
             prebuffer: Vec::new(),
             threshold: start_samples(rate, channels),
             started: false,
+            channels: channels as usize,
+            fade_frames: (rate / 200) as usize, // ~5 ms
+            fade_pending: true,
         }
     }
 }
@@ -276,6 +300,12 @@ impl AudioSink for AlsaSink {
             self.prebuffer.extend_from_slice(&self.scratch);
             if self.prebuffer.len() >= self.threshold {
                 self.started = true;
+                // Fade the opening of the first chunk after a (re)start so the
+                // step from silence to the new track isn't a click.
+                if self.fade_pending {
+                    apply_fade_in(&mut self.prebuffer, self.channels, self.fade_frames);
+                    self.fade_pending = false;
+                }
                 out.write(&self.prebuffer);
                 self.prebuffer.clear();
             }
@@ -285,6 +315,7 @@ impl AudioSink for AlsaSink {
     fn flush(&mut self) {
         self.prebuffer.clear();
         self.started = false;
+        self.fade_pending = true;
         if let Some(out) = self.output.as_mut() {
             out.reset(); // discard queued frames → immediate silence
         }
@@ -374,6 +405,30 @@ mod tests {
         let mut s = [1i16, -32768, 32767];
         apply_gain(&mut s, 1.0);
         assert_eq!(s, [1, -32768, 32767]);
+    }
+
+    #[test]
+    fn fade_in_ramps_the_opening_frames_only() {
+        // Stereo constant full-scale; fade over 4 frames (8 samples).
+        let mut s = vec![1000i16; 20]; // 10 frames
+        apply_fade_in(&mut s, 2, 4);
+        // The first 4 frames rise monotonically from near-zero toward full;
+        // the rest are untouched.
+        let left: Vec<i16> = s.iter().step_by(2).copied().collect();
+        assert!(left[0] < left[1] && left[1] < left[2] && left[2] < left[3]);
+        assert!(left[0] < 1000 && left[3] < 1000); // still ramping at frame 3
+        assert!(s[8..].iter().all(|&x| x == 1000)); // frame 4 onward untouched
+                                                    // Both channels ramp identically.
+        assert_eq!(s[0], s[1]);
+        assert_eq!(s[6], s[7]);
+    }
+
+    #[test]
+    fn fade_in_shorter_than_the_ramp_is_safe() {
+        // Fewer frames than the fade length: ramp what's there, no panic.
+        let mut s = vec![1000i16; 4]; // 2 frames
+        apply_fade_in(&mut s, 2, 100);
+        assert!(s.iter().all(|&x| x <= 1000));
     }
 
     #[test]
