@@ -79,7 +79,12 @@ Two findings from scouting this plan shape the design:
 - `openairplay2-tui/Cargo.toml`: its `publish = false` comment says "see
   openairplay2-tui-protocol", whose rationale this plan deletes; give it its own
   one-line reason (distributed as a package, not a library; crates.io presence
-  is the packaging item's call).
+  is the packaging item's call). **Found during implementation:** its protocol
+  dependency needs `version` alongside `path` too — unlike
+  `publish --workspace`, `cargo package --workspace` does *not* skip
+  `publish = false` members, so the gate packages and verifies all **four**
+  crates. Broader coverage than planned, and it means the tui is publish-ready
+  if the packaging item ever wants that.
 
 ### `cargo.yml`
 
