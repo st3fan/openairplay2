@@ -6,19 +6,16 @@
 //! the gain. The AirPlay volume arrives as an `openairplay2::Event::Volume`
 //! in dB; the binary maps it to a linear gain shared with the sink.
 
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use alsa::pcm::{Access, Format, HwParams, State, PCM};
-use alsa::{Direction, ValueOr};
+use alsa::pcm::PCM;
+use alsa::Direction;
 use log::{debug, warn};
 
 use openairplay2::AudioSink;
-
-/// Prebuffer this fraction of a second before the first ALSA write.
-fn start_samples(rate: u32, channels: u8) -> usize {
-    (rate as usize / 2) * channels as usize // ~0.5 s
-}
 
 /// What a startup probe of the configured device means.
 #[derive(Debug)]
@@ -187,19 +184,26 @@ fn apply_gain(samples: &mut [i16], gain: f32) {
     }
 }
 
-/// Ramp the first `frames` frames from silence to full, in place — a short
-/// fade-in on the first audio after the device is (re)started, so the step
-/// from silence to the new track's first sample is not an audible click at a
-/// track switch (see plans/20260808-01). Linear is inaudible over a few ms.
-fn apply_fade_in(samples: &mut [i16], channels: usize, frames: usize) {
-    let n = frames.min(samples.len() / channels.max(1));
-    for f in 0..n {
-        let g = (f as f32 + 0.5) / n as f32;
+/// Continue a fade-in in place: ramp `samples` from gain `pos/total` up toward
+/// full, one frame at a time, and return the new `pos`. Called per write so a
+/// ramp spans several small chunks — a short fade on the first audio after the
+/// stream (re)starts or after a flush, so the silence→audio boundary at a
+/// track switch is not a click (see plans/20260808-01). `pos >= total` is a
+/// no-op (fade complete). Linear is inaudible over a few ms.
+fn fade_in_progress(samples: &mut [i16], channels: usize, total: usize, mut pos: usize) -> usize {
+    let frames = samples.len() / channels.max(1);
+    for f in 0..frames {
+        if pos >= total {
+            break;
+        }
+        let g = pos as f32 / total as f32;
         for c in 0..channels {
             let s = &mut samples[f * channels + c];
             *s = (f32::from(*s) * g) as i16;
         }
+        pos += 1;
     }
+    pos
 }
 
 /// The playback gain, shared between the event consumer (which sets it from
@@ -242,21 +246,24 @@ impl AudioSink for NullSink {
 
 /// ALSA playback sink. A device that won't open is logged and audio is
 /// discarded so the session keeps running.
+///
+/// The PCM stream is opened once and kept **running** for the whole session:
+/// it is never dropped or restarted, because stopping and starting the stream
+/// makes many DACs mute and un-mute their analog output — an audible pop on
+/// every pause, resume and track switch (see plans/20260808-01). When there is
+/// nothing to play the device outputs silence (ALSA is configured to fill the
+/// buffer with it), and a pause/flush gets immediate silence by *rewinding*
+/// the unplayed audio rather than stopping the stream.
 pub struct AlsaSink {
     output: Option<AlsaOutput>,
     gain: SharedGain,
     /// Gain-scaled copy of the incoming packet.
     scratch: Vec<i16>,
-    /// Cushion accumulated before the first write so startup doesn't underrun.
-    prebuffer: Vec<i16>,
-    threshold: usize,
-    started: bool,
     channels: usize,
-    /// Fade the first audio after a (re)start in over this many frames, to
-    /// de-click the silence→new-track step at a track switch.
-    fade_frames: usize,
-    /// The next write after a reset/open still needs its fade-in.
-    fade_pending: bool,
+    /// Frames over which to fade the first audio in after a start or a flush.
+    fade_len: usize,
+    /// Frames faded so far in the current fade-in; `>= fade_len` means done.
+    fade_pos: usize,
 }
 
 impl AlsaSink {
@@ -275,12 +282,9 @@ impl AlsaSink {
             output,
             gain,
             scratch: Vec::new(),
-            prebuffer: Vec::new(),
-            threshold: start_samples(rate, channels),
-            started: false,
             channels: channels as usize,
-            fade_frames: (rate / 200) as usize, // ~5 ms
-            fade_pending: true,
+            fade_len: (rate / 200) as usize, // ~5 ms
+            fade_pos: 0,                     // fade in the first audio too
         }
     }
 }
@@ -294,100 +298,228 @@ impl AudioSink for AlsaSink {
         self.scratch.extend_from_slice(pcm);
         // Apply the current volume (live) just before playback.
         apply_gain(&mut self.scratch, self.gain.get());
-        if self.started {
-            out.write(&self.scratch);
-        } else {
-            self.prebuffer.extend_from_slice(&self.scratch);
-            if self.prebuffer.len() >= self.threshold {
-                self.started = true;
-                // Fade the opening of the first chunk after a (re)start so the
-                // step from silence to the new track isn't a click.
-                if self.fade_pending {
-                    apply_fade_in(&mut self.prebuffer, self.channels, self.fade_frames);
-                    self.fade_pending = false;
-                }
-                out.write(&self.prebuffer);
-                self.prebuffer.clear();
-            }
+        // Fade the opening frames after a start/flush so the silence→audio
+        // boundary is not a click; the ramp continues across chunks.
+        if self.fade_pos < self.fade_len {
+            self.fade_pos = fade_in_progress(
+                &mut self.scratch,
+                self.channels,
+                self.fade_len,
+                self.fade_pos,
+            );
         }
+        out.write(&self.scratch);
     }
 
     fn flush(&mut self) {
-        self.prebuffer.clear();
-        self.started = false;
-        self.fade_pending = true;
+        // Immediate silence without stopping the stream: rewind the unplayed
+        // audio (ALSA fills the gap with silence). Fade the next audio in.
+        self.fade_pos = 0;
         if let Some(out) = self.output.as_mut() {
-            out.reset(); // discard queued frames → immediate silence
+            out.discard();
         }
     }
 }
 
+/// Translate an ALSA return code into a message via `snd_strerror`.
+fn check(rc: c_int, what: &str) -> Result<(), String> {
+    if rc >= 0 {
+        return Ok(());
+    }
+    let msg = unsafe { alsa_sys::snd_strerror(rc) };
+    let detail = if msg.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    Err(format!("{what}: {detail}"))
+}
+
+/// The playback stream, driven directly through `alsa-sys` so it can be kept
+/// running (see [`AlsaSink`]) — the safe `alsa` wrapper exposes neither
+/// `snd_pcm_rewind` nor the silence sw-params this needs.
 struct AlsaOutput {
-    pcm: PCM,
+    pcm: *mut alsa_sys::snd_pcm_t,
     channels: usize,
 }
 
+// The player thread owns the sink and is the only user of the handle.
+unsafe impl Send for AlsaOutput {}
+
 impl AlsaOutput {
-    fn open(device: &str, rate: u32, channels: u8) -> Result<AlsaOutput, alsa::Error> {
-        let pcm = PCM::new(device, Direction::Playback, false)?;
-        {
-            let hwp = HwParams::any(&pcm)?;
-            hwp.set_channels(u32::from(channels))?;
-            hwp.set_rate(rate, ValueOr::Nearest)?;
-            hwp.set_format(Format::s16())?;
-            hwp.set_access(Access::RWInterleaved)?;
-            let _ = hwp.set_buffer_time_near(500_000, ValueOr::Nearest);
-            pcm.hw_params(&hwp)?;
+    fn open(device: &str, rate: u32, channels: u8) -> Result<AlsaOutput, String> {
+        use alsa_sys as a;
+        let name = CString::new(device).map_err(|_| "device name contains NUL".to_string())?;
+        unsafe {
+            let mut pcm: *mut a::snd_pcm_t = std::ptr::null_mut();
+            check(
+                a::snd_pcm_open(
+                    &mut pcm,
+                    name.as_ptr(),
+                    a::SND_PCM_STREAM_PLAYBACK as a::snd_pcm_stream_t,
+                    0,
+                ),
+                "snd_pcm_open",
+            )?;
+
+            // Hardware params: S16 interleaved at the negotiated rate/channels,
+            // ~0.5 s buffer. Read the buffer size back for the sw-params below.
+            let mut hwp: *mut a::snd_pcm_hw_params_t = std::ptr::null_mut();
+            if a::snd_pcm_hw_params_malloc(&mut hwp) < 0 {
+                a::snd_pcm_close(pcm);
+                return Err("snd_pcm_hw_params_malloc failed".into());
+            }
+            let mut buffer_size: a::snd_pcm_uframes_t = 0;
+            let hw = (|| {
+                check(a::snd_pcm_hw_params_any(pcm, hwp), "hw_params_any")?;
+                check(
+                    a::snd_pcm_hw_params_set_access(
+                        pcm,
+                        hwp,
+                        a::SND_PCM_ACCESS_RW_INTERLEAVED as a::snd_pcm_access_t,
+                    ),
+                    "set_access",
+                )?;
+                check(
+                    a::snd_pcm_hw_params_set_format(
+                        pcm,
+                        hwp,
+                        a::SND_PCM_FORMAT_S16_LE as a::snd_pcm_format_t,
+                    ),
+                    "set_format",
+                )?;
+                check(
+                    a::snd_pcm_hw_params_set_channels(pcm, hwp, c_uint::from(channels)),
+                    "set_channels",
+                )?;
+                let mut r = rate as c_uint;
+                check(
+                    a::snd_pcm_hw_params_set_rate_near(pcm, hwp, &mut r, std::ptr::null_mut()),
+                    "set_rate",
+                )?;
+                let mut bt: c_uint = 500_000;
+                let _ = a::snd_pcm_hw_params_set_buffer_time_near(
+                    pcm,
+                    hwp,
+                    &mut bt,
+                    std::ptr::null_mut(),
+                );
+                check(a::snd_pcm_hw_params(pcm, hwp), "hw_params")?;
+                a::snd_pcm_hw_params_get_buffer_size(hwp, &mut buffer_size);
+                Ok::<(), String>(())
+            })();
+            a::snd_pcm_hw_params_free(hwp);
+            if let Err(e) = hw {
+                a::snd_pcm_close(pcm);
+                return Err(e);
+            }
+
+            // Software params: never stop on underrun, fill unwritten space
+            // with silence (so a gap plays silence, not stale buffer content),
+            // and start once the buffer is full. Together these keep the stream
+            // running for the whole session.
+            let mut swp: *mut a::snd_pcm_sw_params_t = std::ptr::null_mut();
+            if a::snd_pcm_sw_params_malloc(&mut swp) < 0 {
+                a::snd_pcm_close(pcm);
+                return Err("snd_pcm_sw_params_malloc failed".into());
+            }
+            let sw = (|| {
+                check(a::snd_pcm_sw_params_current(pcm, swp), "sw_params_current")?;
+                let mut boundary: a::snd_pcm_uframes_t = 0;
+                check(
+                    a::snd_pcm_sw_params_get_boundary(swp, &mut boundary),
+                    "get_boundary",
+                )?;
+                check(
+                    a::snd_pcm_sw_params_set_stop_threshold(pcm, swp, boundary),
+                    "set_stop_threshold",
+                )?;
+                check(
+                    a::snd_pcm_sw_params_set_silence_threshold(pcm, swp, 0),
+                    "set_silence_threshold",
+                )?;
+                check(
+                    a::snd_pcm_sw_params_set_silence_size(pcm, swp, boundary),
+                    "set_silence_size",
+                )?;
+                let start = if buffer_size > 0 { buffer_size } else { 1 };
+                check(
+                    a::snd_pcm_sw_params_set_start_threshold(pcm, swp, start),
+                    "set_start_threshold",
+                )?;
+                check(a::snd_pcm_sw_params(pcm, swp), "sw_params")?;
+                Ok::<(), String>(())
+            })();
+            a::snd_pcm_sw_params_free(swp);
+            if let Err(e) = sw {
+                a::snd_pcm_close(pcm);
+                return Err(e);
+            }
+
+            if let Err(e) = check(a::snd_pcm_prepare(pcm), "prepare") {
+                a::snd_pcm_close(pcm);
+                return Err(e);
+            }
+            Ok(AlsaOutput {
+                pcm,
+                channels: channels as usize,
+            })
         }
-        pcm.prepare()?;
-        Ok(AlsaOutput {
-            pcm,
-            channels: channels as usize,
-        })
     }
 
-    /// Write all interleaved samples, blocking to pace playback and recovering
-    /// from underruns.
+    /// Write all interleaved samples, blocking to pace playback. The stream is
+    /// started automatically (start-threshold) and, on the rare hard error,
+    /// recovered; underruns don't stop it (stop-threshold = boundary).
     fn write(&mut self, samples: &[i16]) {
-        let Ok(io) = self.pcm.io_i16() else {
-            warn!("player: ALSA io handle lost");
-            return;
-        };
-        let mut frames = samples;
-        while !frames.is_empty() {
-            match io.writei(frames) {
-                Ok(0) => break,
-                Ok(written) => frames = &frames[written * self.channels..],
-                Err(e) => {
-                    if self.pcm.try_recover(e, true).is_err() {
+        use alsa_sys as a;
+        let mut off = 0usize;
+        unsafe {
+            while off < samples.len() {
+                let frames = ((samples.len() - off) / self.channels) as a::snd_pcm_uframes_t;
+                if frames == 0 {
+                    break;
+                }
+                let n =
+                    a::snd_pcm_writei(self.pcm, samples[off..].as_ptr().cast::<c_void>(), frames);
+                if n < 0 {
+                    if a::snd_pcm_recover(self.pcm, n as c_int, 1) < 0 {
                         warn!("player: unrecoverable ALSA write error");
                         return;
                     }
+                    continue; // retry the same frames
                 }
+                off += n as usize * self.channels;
             }
-        }
-        if self.pcm.state() != State::Running {
-            let _ = self.pcm.start();
         }
     }
 
-    /// Discard queued frames (immediate silence) and ready the device for new
-    /// audio. Used on pause/flush. Unlike `snd_pcm_pause`, `drop` + `prepare`
-    /// are supported everywhere (`snd_pcm_pause` fails with EBADFD on `front`).
-    fn reset(&mut self) {
-        let _ = self.pcm.drop();
-        let _ = self.pcm.prepare();
+    /// Immediate silence without stopping the stream: rewind the buffered but
+    /// unplayed audio, so the silence-fill takes over from the play position.
+    /// Used on pause/flush.
+    fn discard(&mut self) {
+        use alsa_sys as a;
+        unsafe {
+            let rewindable = a::snd_pcm_rewindable(self.pcm);
+            if rewindable > 0 {
+                let _ = a::snd_pcm_rewind(self.pcm, rewindable as a::snd_pcm_uframes_t);
+            }
+        }
+    }
+}
+
+impl Drop for AlsaOutput {
+    fn drop(&mut self) {
+        unsafe {
+            alsa_sys::snd_pcm_close(self.pcm);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn prebuffer_threshold_for_44100_stereo() {
-        assert_eq!(start_samples(44100, 2), 44100); // 0.5 s interleaved
-    }
 
     #[test]
     fn apply_gain_scales_samples() {
@@ -408,27 +540,41 @@ mod tests {
     }
 
     #[test]
-    fn fade_in_ramps_the_opening_frames_only() {
-        // Stereo constant full-scale; fade over 4 frames (8 samples).
-        let mut s = vec![1000i16; 20]; // 10 frames
-        apply_fade_in(&mut s, 2, 4);
-        // The first 4 frames rise monotonically from near-zero toward full;
-        // the rest are untouched.
-        let left: Vec<i16> = s.iter().step_by(2).copied().collect();
-        assert!(left[0] < left[1] && left[1] < left[2] && left[2] < left[3]);
-        assert!(left[0] < 1000 && left[3] < 1000); // still ramping at frame 3
-        assert!(s[8..].iter().all(|&x| x == 1000)); // frame 4 onward untouched
-                                                    // Both channels ramp identically.
-        assert_eq!(s[0], s[1]);
-        assert_eq!(s[6], s[7]);
+    fn fade_in_ramps_across_chunks_and_stops_at_full() {
+        // Fade over 6 frames, fed as two 3-frame stereo chunks: the ramp must
+        // continue from where the first chunk left off, then pass audio through
+        // untouched once complete.
+        let mut c1 = vec![1000i16; 6]; // 3 frames
+        let pos = fade_in_progress(&mut c1, 2, 6, 0);
+        assert_eq!(pos, 3);
+        let l1: Vec<i16> = c1.iter().step_by(2).copied().collect();
+        assert!(l1[0] < l1[1] && l1[1] < l1[2] && l1[2] < 1000); // rising, sub-full
+
+        let mut c2 = vec![1000i16; 6]; // 3 frames
+        let pos = fade_in_progress(&mut c2, 2, 6, pos);
+        assert_eq!(pos, 6);
+        let l2: Vec<i16> = c2.iter().step_by(2).copied().collect();
+        assert!(l2[0] > l1[2]); // continues rising past the first chunk
+
+        // Fade complete: further audio is untouched.
+        let mut c3 = vec![1000i16; 4];
+        let pos = fade_in_progress(&mut c3, 2, 6, pos);
+        assert_eq!(pos, 6);
+        assert!(c3.iter().all(|&x| x == 1000));
     }
 
     #[test]
-    fn fade_in_shorter_than_the_ramp_is_safe() {
-        // Fewer frames than the fade length: ramp what's there, no panic.
-        let mut s = vec![1000i16; 4]; // 2 frames
-        apply_fade_in(&mut s, 2, 100);
-        assert!(s.iter().all(|&x| x <= 1000));
+    fn alsa_output_null_round_trips_the_ffi() {
+        // The ALSA "null" device is always present and pure software, so this
+        // exercises the raw open → configure → write → discard → write path
+        // (catching a broken FFI call here rather than only on real hardware).
+        // If the environment has no ALSA config at all, there is nothing to do.
+        let Ok(mut out) = AlsaOutput::open("null", 44100, 2) else {
+            return;
+        };
+        out.write(&vec![0i16; 4096]);
+        out.discard();
+        out.write(&vec![0i16; 4096]);
     }
 
     #[test]
