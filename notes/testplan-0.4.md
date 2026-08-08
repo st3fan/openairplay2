@@ -75,6 +75,10 @@ Must have: `active` — it started at boot.
 **2.6** `journalctl -u openairplay2-receiver -b --no-pager | grep -i avahi`
 Must have: after the reboot, no "avahi advertisement disabled" — it advertised.
 
+**2.7** `sudo kill -9 $(systemctl show -p MainPID --value openairplay2-receiver)`,
+wait ~6 s, `systemctl is-active openairplay2-receiver`.
+Must have: `active` — a crash (killed process) is restarted automatically.
+
 ---
 
 ## 3. Configuration (`/etc/default/openairplay2-receiver`)
@@ -90,7 +94,8 @@ Must have: the name shown is `Studio <hostname>` (the `%h` became the hostname).
 
 **3.3** `openairplay2-receiver --list-devices` (as any user), pick a device, set
 `OPENAIRPLAY2_ALSA_DEVICE=<that device>`.
-Must have: journal shows `audio output: ALSA "<that device>"`; audio plays from it (see §7).
+Must have: journal shows `audio output: <that device> (<friendly name>)`; audio
+plays from it (see §7).
 
 **3.4** Set `OPENAIRPLAY2_AUDIO=off`, restart.
 Must have: journal shows `audio output: disabled`; a stream is accepted but silent.
@@ -99,9 +104,11 @@ Then set it back to `on`.
 **3.5** Set `OPENAIRPLAY2_AVAHI=off`, restart.
 Must have: the receiver no longer appears in the AirPlay menu. Set it back to `on`.
 
-**3.6** Set `OPENAIRPLAY2_AVAHI=maybe`, restart.
-Must have: the service fails to start; journal shows an error naming
-`OPENAIRPLAY2_AVAHI` and the bad value. Fix it back to `on`.
+**3.6** Set `OPENAIRPLAY2_AVAHI=maybe`, restart, then `systemctl is-active
+openairplay2-receiver` and re-check it a few seconds later.
+Must have: the service is `failed` and **stays** failed — it does not
+restart-loop; journal names `OPENAIRPLAY2_AVAHI` and the bad value once, not
+repeatedly. Fix it back to `on` and restart.
 
 **3.7** Set `OPENAIRPLAY2_PORT=7010`, restart, `ss -ltnp | grep 7010`.
 Must have: the control server is listening on 7010. Set it back / remove it.

@@ -24,8 +24,14 @@ Group=openairplay2
 # would hide it, so it is deliberately not set.
 SupplementaryGroups=audio
 StateDirectory=openairplay2
-Restart=always
+# Restart on a crash (a panic or a signal), but NOT on a configuration
+# mistake: a bad OPENAIRPLAY2_* value, an unknown ALSA device, or a port that
+# is taken or privileged exits EX_CONFIG (78) — a usage error exits 2 — and
+# those must fail and stay stopped so the operator fixes the config, rather
+# than restart-looping every few seconds.
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=2 78
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
