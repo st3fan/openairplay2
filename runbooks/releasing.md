@@ -151,7 +151,10 @@ rerun failed jobs from the run page if the infrastructure hiccups.
   Upgrades restart the service automatically and keep both
   `/etc/default/openairplay2-receiver` and the pairing identity in
   `/var/lib/openairplay2` — a Mac that paired before the upgrade must not be
-  asked to pair again.
+  asked to pair again. If the preserved options file predates the named
+  variables (it still sets `OPENAIRPLAY2_ARGS`), the upgrade prints a
+  migration notice in the apt output and the daemon logs an error naming the
+  migration — and keeps running.
 - Install the tui package the same way and point `openairplay2-tui --connect`
   at a receiver started with `--tui-listen` — it draws.
 - Optional provenance check (any machine with `gh`):

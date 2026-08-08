@@ -9,4 +9,15 @@ if ! id -nG openairplay2 | grep -qw audio; then
     adduser openairplay2 audio
 fi
 
+# 0.4.0 replaced OPENAIRPLAY2_ARGS with one named variable per option (see
+# NEWS.Debian). dpkg keeps a locally edited conffile on upgrade, so say so
+# here, in the apt output the person upgrading actually sees; the daemon also
+# logs an error for as long as the variable remains.
+if grep -q '^OPENAIRPLAY2_ARGS=' /etc/default/openairplay2-receiver 2>/dev/null; then
+    echo "openairplay2-receiver: /etc/default/openairplay2-receiver still sets OPENAIRPLAY2_ARGS," >&2
+    echo "openairplay2-receiver: which is no longer read — the daemon runs with defaults until the" >&2
+    echo "openairplay2-receiver: settings move to the OPENAIRPLAY2_* variables. See NEWS.Debian in" >&2
+    echo "openairplay2-receiver: /usr/share/doc/openairplay2-receiver/." >&2
+fi
+
 #DEBHELPER#

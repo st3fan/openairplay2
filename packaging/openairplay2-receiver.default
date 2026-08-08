@@ -1,24 +1,41 @@
-# Options for openairplay2-receiver, passed to the daemon as command-line
-# arguments. Run `openairplay2-receiver --help` for the full list, and
-# `systemctl restart openairplay2-receiver` after editing this file.
+# Configuration for the openairplay2-receiver service. Every option of the
+# daemon is one variable here; a line left commented out (or a variable left
+# empty) means the built-in default. Run `openairplay2-receiver --help` for
+# details, and `systemctl restart openairplay2-receiver` after editing.
 #
-#   --name NAME               name senders see          (default OpenAirPlay2)
-#   --alsa-device NAME        ALSA output device        (default "default")
-#   --port PORT               control port              (default 7000)
-#   --pincode CODE            require this pincode to pair; without it any
-#                             device on the network can pair
-#   --no-avahi                do not advertise over mDNS
-#   --no-audio                decode but do not open ALSA (silent test run)
-#   --tui-listen ADDR         serve the now-playing WebSocket that
-#                             openairplay2-tui renders, e.g. 127.0.0.1:7392.
-#                             It carries track metadata and cover art, so keep
-#                             it on loopback unless you mean otherwise
-#
-# --identity-file is set by the systemd unit and should not be repeated here.
-#
-# This file is root-owned and mode 0640 because a pincode is a secret.
+# This file is root-owned and mode 0640 because it can hold secrets. They are
+# passed to the daemon as environment variables, not command-line arguments,
+# so unlike a --pincode flag they are not visible to other users in `ps`.
 
-OPENAIRPLAY2_ARGS="--name OpenAirPlay2 --alsa-device default"
+# Name senders see in the AirPlay menu. %h becomes this machine's hostname,
+# so one file can be deployed unedited across several machines.
+#OPENAIRPLAY2_NAME=OpenAirPlay2
+
+# ALSA playback device; `openairplay2-receiver --list-devices` lists them.
+#OPENAIRPLAY2_ALSA_DEVICE=default
+
+# Require this code to pair. Without one, any device on the network can pair.
+#OPENAIRPLAY2_PINCODE=
+
+# Control port.
+#OPENAIRPLAY2_PORT=7000
+
+# Advertise over mDNS (on/off).
+#OPENAIRPLAY2_AVAHI=on
+
+# Open the ALSA device (on/off); off decodes without playing.
+#OPENAIRPLAY2_AUDIO=on
+
+# Device id in the advertisement (default: from a real network interface).
+#OPENAIRPLAY2_MAC=
+
+# Serve the now-playing WebSocket that openairplay2-tui renders, e.g.
+# 127.0.0.1:7392. It carries track metadata and cover art, so keep it on
+# loopback unless you mean otherwise.
+#OPENAIRPLAY2_TUI_LISTEN=
+
+# OPENAIRPLAY2_IDENTITY_FILE is set by the systemd unit (--identity-file,
+# which wins) and should not be set here.
 
 # Set RUST_LOG=debug for the full protocol trace (very chatty while playing).
 #RUST_LOG=debug
