@@ -43,6 +43,13 @@ assets = [
         "640",
     ],
     ["../README.md", "usr/share/doc/openairplay2-receiver/README.md", "644"],
+    # Shipped plain rather than gzipped (apt-listchanges reads both; cargo-deb
+    # cannot run a compression step) — the 0.4.0 options-file migration notice.
+    [
+        "../packaging/NEWS.Debian",
+        "usr/share/doc/openairplay2-receiver/NEWS.Debian",
+        "644",
+    ],
 ]
 # A pincode is a secret: root-owned, 0640, and preserved across upgrades.
 conf-files = ["/etc/default/openairplay2-receiver"]

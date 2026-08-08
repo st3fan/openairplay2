@@ -6,16 +6,18 @@ Wants=network-online.target avahi-daemon.service
 
 [Service]
 # Options live in /etc/default/openairplay2-receiver (a conffile, so local
-# edits survive upgrades). systemd reads it as root, before dropping to the
-# service user, so the *file* stays root-only (0640). Note this does not hide
-# a --pincode: options are passed on the command line, and /proc/<pid>/cmdline
-# is world-readable, so any local user can read it from ps.
+# edits survive upgrades), one OPENAIRPLAY2_* variable each, read by the
+# daemon itself. systemd reads the file as root, before dropping to the
+# service user, so the *file* stays root-only (0640) — and because options
+# travel as environment variables rather than command-line arguments, a
+# pincode here is not visible in ps: /proc/<pid>/environ is readable only by
+# the service user and root, where /proc/<pid>/cmdline is world-readable.
 EnvironmentFile=-/etc/default/openairplay2-receiver
 # --identity-file is here rather than in the options file: a system unit has
 # no HOME, so the binary's ~/.config default would land in the working
 # directory. Senders remember this receiver by the identity's public key, so
 # it has to live somewhere stable — StateDirectory gives us /var/lib.
-ExecStart=/usr/bin/openairplay2-receiver --identity-file /var/lib/openairplay2/identity $OPENAIRPLAY2_ARGS
+ExecStart=/usr/bin/openairplay2-receiver --identity-file /var/lib/openairplay2/identity
 User=openairplay2
 Group=openairplay2
 # The ALSA device (/dev/snd/*) is group-owned by "audio"; PrivateDevices=

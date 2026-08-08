@@ -1,0 +1,19 @@
+openairplay2-receiver (0.4.0-1) unstable; urgency=medium
+
+  The options file /etc/default/openairplay2-receiver no longer uses
+  OPENAIRPLAY2_ARGS. Every option is now its own variable, read by the
+  daemon itself: OPENAIRPLAY2_NAME, OPENAIRPLAY2_ALSA_DEVICE,
+  OPENAIRPLAY2_PINCODE, OPENAIRPLAY2_PORT, OPENAIRPLAY2_AVAHI,
+  OPENAIRPLAY2_AUDIO, OPENAIRPLAY2_MAC and OPENAIRPLAY2_TUI_LISTEN — see
+  the comments in the shipped options file for each one's meaning and
+  default.
+
+  dpkg keeps your locally edited options file on upgrade, so if it still
+  sets OPENAIRPLAY2_ARGS, the daemon ignores it, logs an error saying so,
+  and runs with its defaults until you migrate the settings to the named
+  variables. Moving options into variables is also what keeps a pincode
+  out of the world-readable command line (ps).
+
+  A name may now contain %h, which becomes the machine's hostname.
+
+ -- Stefan Arentz <stefan.arentz@gmail.com>  Fri, 07 Aug 2026 22:00:00 -0400

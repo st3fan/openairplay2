@@ -75,8 +75,10 @@ sudo apt-get install -y ./openairplay2-receiver_X.Y.Z-1_arm64.deb
 sudo apt-get install -y ./openairplay2-tui_X.Y.Z-1_arm64.deb      # optional
 ```
 
-Set the name and the audio device in `/etc/default/openairplay2-receiver`
-(the same flags as below), then:
+Set the name, the audio device, a pincode — any option — in
+`/etc/default/openairplay2-receiver`: each is a named `OPENAIRPLAY2_*`
+variable, documented in the file itself (the same options as the table
+below). Then:
 
 ```sh
 sudo systemctl restart openairplay2-receiver
@@ -146,18 +148,23 @@ cargo install openairplay2-receiver
 
 ### Options
 
-| Option | Description | Default |
-| --- | --- | --- |
-| `--name NAME` | Name advertised to senders (mDNS + `GET /info`) | `OpenAirPlay2` |
-| `--port PORT` | TCP port for the HTTP/RTSP control server | `7000` |
-| `--mac AA:BB:CC:DD:EE:FF` | Device ID (`deviceid`) reported to senders | discovered from a network interface, else a fixed fallback |
-| `--identity-file PATH` | Where the Ed25519 identity keypair is stored | `~/.config/openairplay2/identity` |
-| `--alsa-device NAME` | ALSA output device to play to | `default` |
-| `--list-devices` | List the ALSA playback devices and exit | — |
-| `--no-audio` | Decode but don't open ALSA (silent run) | audio on |
-| `--no-avahi` | Don't advertise over Avahi / mDNS | advertising on |
-| `--tui-listen ADDR` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
-| `--pincode CODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged, but note it is a command-line argument, so any local user can read it from `ps`. | transient `3939` |
+| Option | Environment variable | Description | Default |
+| --- | --- | --- | --- |
+| `--name NAME` | `OPENAIRPLAY2_NAME` | Name advertised to senders (mDNS + `GET /info`); `%h` becomes the hostname | `OpenAirPlay2` |
+| `--port PORT` | `OPENAIRPLAY2_PORT` | TCP port for the HTTP/RTSP control server | `7000` |
+| `--mac AA:BB:CC:DD:EE:FF` | `OPENAIRPLAY2_MAC` | Device ID (`deviceid`) reported to senders | discovered from a network interface, else a fixed fallback |
+| `--identity-file PATH` | `OPENAIRPLAY2_IDENTITY_FILE` | Where the Ed25519 identity keypair is stored | `~/.config/openairplay2/identity` |
+| `--alsa-device NAME` | `OPENAIRPLAY2_ALSA_DEVICE` | ALSA output device to play to | `default` |
+| `--list-devices` | — | List the ALSA playback devices and exit | — |
+| `--no-audio` | `OPENAIRPLAY2_AUDIO=off` | Decode but don't open ALSA (silent run) | audio on |
+| `--no-avahi` | `OPENAIRPLAY2_AVAHI=off` | Don't advertise over Avahi / mDNS | advertising on |
+| `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
+| `--pincode CODE` | `OPENAIRPLAY2_PINCODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged. Prefer the environment variable (the service's options file): a `--pincode` argument is visible to any local user in `ps`, an environment variable is not. | transient `3939` |
+
+Every option falls back to its environment variable when the flag is absent —
+that is how `/etc/default/openairplay2-receiver` configures the service — and
+a flag on the command line wins. An empty variable means unset. The booleans
+take exactly `on` or `off`.
 | `-h`, `--help` | Print usage and exit | — |
 
 Set `RUST_LOG=debug` to log every request — useful for watching what a real
