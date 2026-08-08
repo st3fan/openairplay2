@@ -67,6 +67,11 @@ restart-after-upgrade = true
 # The version makes this publishable; the path keeps workspace builds local.
 openairplay2 = { path = "../openairplay2", version = "0.4.0" }
 alsa = "0.12"
+# Raw ALSA for the playback stream: the safe `alsa` wrapper does not expose
+# snd_pcm_rewind or the silence sw-params we need to keep the stream running
+# (never drop/restart) so a track switch does not pop. (alsa-sys is already
+# in the tree via alsa; naming it directly lets the sink call those.)
+alsa-sys = "0.6"
 # errno constants for triaging the ALSA startup probe.
 libc = "0.2"
 env_logger = "0.11"

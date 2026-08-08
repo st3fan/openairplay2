@@ -1184,6 +1184,7 @@ name = "openairplay2-receiver"
 version = "0.4.0"
 dependencies = [
  "alsa",
+ "alsa-sys",
  "base64",
  "env_logger",
  "futures-util",
