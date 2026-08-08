@@ -47,6 +47,15 @@ pub fn max_queued_samples(rate: u32, channels: u8) -> usize {
 const FLUSH_NONE: u64 = 0;
 const FLUSH_ALL: u64 = u64::MAX;
 
+/// Write a packet to the sink in chunks of this many interleaved samples,
+/// re-checking pause/flush between them. Blocking writes pace playback, so a
+/// whole packet (~23 ms of AAC) meant a pause or a track flush was only
+/// noticed after that much *old* audio had already drained out — the
+/// track-switch "tick". At 256 interleaved samples (~3 ms of 44.1 kHz stereo)
+/// that tail is short enough to be inaudible, at a handful of extra `writei`
+/// calls per packet.
+const WRITE_CHUNK: usize = 256;
+
 enum Command {
     /// (packet sequence number, RTP timestamp, interleaved samples).
     Pcm(u64, u32, Vec<i16>),
@@ -347,18 +356,29 @@ fn run(
             if packets <= 3 || packets.is_multiple_of(250) {
                 debug!("player: {packets} packets");
             }
-            sink.write(&pcm);
+            // Write in small chunks so a pause/flush lands within a few ms
+            // instead of a whole packet: the unwritten remainder is discarded
+            // by the flush/drop that follows, exactly as the whole packet
+            // would have been, but far less old audio drains out first.
+            let mut interrupted = false;
+            for chunk in pcm.chunks(WRITE_CHUNK) {
+                sink.write(chunk);
+                if ctx.stop.load(Ordering::Relaxed) {
+                    break 'outer;
+                }
+                if ctx.paused.load(Ordering::Relaxed)
+                    || ctx.flush_request.load(Ordering::Relaxed) != FLUSH_NONE
+                {
+                    interrupted = true;
+                    break;
+                }
+            }
             // Reported from the audio just handed over, so the position
             // follows playback rather than wall time.
             if let Some(position) = position.as_mut() {
                 position.played(ts);
             }
-            if ctx.stop.load(Ordering::Relaxed) {
-                break 'outer;
-            }
-            if ctx.paused.load(Ordering::Relaxed)
-                || ctx.flush_request.load(Ordering::Relaxed) != FLUSH_NONE
-            {
+            if interrupted {
                 // Handled at the top of the loop; the control call also sent
                 // a Wake, so recv() returns promptly.
                 break;
@@ -458,6 +478,27 @@ mod tests {
         assert_eq!(
             *writes.lock().unwrap(),
             vec![vec![1i16; 4], vec![2i16; 4], vec![3i16; 4]]
+        );
+    }
+
+    #[test]
+    fn a_large_packet_is_delivered_intact_across_chunks() {
+        // A packet bigger than WRITE_CHUNK is written in pieces (so a pause or
+        // flush can land mid-packet); the pieces must concatenate back to the
+        // original, in order, losing nothing.
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let player = Player::spawn(Box::new(recorder), None);
+        let sender = player.sender();
+        let packet: Vec<i16> = (0..WRITE_CHUNK as i32 * 2 + 5).map(|i| i as i16).collect();
+        sender.play(1, 0, packet.clone());
+        settle(&sender);
+        drop(player);
+        let delivered: Vec<i16> = writes.lock().unwrap().concat();
+        assert_eq!(delivered, packet, "a split packet must reassemble exactly");
+        assert!(
+            writes.lock().unwrap().len() >= 3,
+            "a packet over 2x WRITE_CHUNK should be written in several chunks"
         );
     }
 
