@@ -24,6 +24,10 @@ jobs:
       - run: cargo test --workspace
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
+      # A manifest that cannot publish should fail a PR, not a release (#65).
+      # Workspace packaging verifies dependents against the just-packaged
+      # local crates, so it works even when the versions aren't on crates.io.
+      - run: cargo package --workspace
 
   macos:
     name: macOS (library + display)

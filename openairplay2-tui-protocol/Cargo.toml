@@ -9,9 +9,9 @@ repository = "https://github.com/st3fan/openairplay2"
 readme = "../README.md"
 keywords = ["airplay", "airplay2", "tui", "websocket", "protocol"]
 categories = ["multimedia::audio", "encoding"]
-# Not on crates.io yet: the receiver and the TUI are the only clients, and a
-# published wire format is a promise worth making deliberately.
-publish = false
+# Published to crates.io: the receiver depends on it, and a crate that a
+# published crate depends on must itself be published (#65). The promise is
+# not new — every message's exact JSON was already pinned by tests.
 
 # Types only — no serde_json, no tokio: whatever a client uses to move the
 # bytes is its own business.

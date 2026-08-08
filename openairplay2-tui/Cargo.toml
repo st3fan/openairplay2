@@ -9,14 +9,16 @@ repository = "https://github.com/st3fan/openairplay2"
 readme = "../README.md"
 keywords = ["airplay", "airplay2", "tui", "now-playing", "terminal"]
 categories = ["multimedia::audio", "command-line-utilities"]
-# Not on crates.io yet — see openairplay2-tui-protocol.
+# Not on crates.io: this is an application, distributed as a package —
+# whether it should also be `cargo install`-able is the packaging item's
+# question (roadmap, "Package openairplay2-tui").
 publish = false
 
 # It depends on neither `openairplay2` nor ALSA: this is a WebSocket client
 # and a renderer, which is what lets it run on a laptop (macOS included)
 # watching a receiver on a Linux box.
 [dependencies]
-openairplay2-tui-protocol = { path = "../openairplay2-tui-protocol" }
+openairplay2-tui-protocol = { path = "../openairplay2-tui-protocol", version = "0.4.0" }
 base64 = "0.22"
 crossterm = { version = "0.29", features = ["event-stream"] }
 env_logger = "0.11"
