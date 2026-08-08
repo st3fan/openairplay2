@@ -8,8 +8,9 @@
 # so unlike a --pincode flag they are not visible to other users in `ps`.
 
 # Name senders see in the AirPlay menu. %h becomes this machine's hostname,
-# so one file can be deployed unedited across several machines.
-#OPENAIRPLAY2_NAME=OpenAirPlay2
+# so one file can be deployed unedited across several machines. The default
+# already includes the hostname.
+#OPENAIRPLAY2_NAME=OpenAirPlay2 (%h)
 
 # ALSA playback device; `openairplay2-receiver --list-devices` lists them.
 #OPENAIRPLAY2_ALSA_DEVICE=default
