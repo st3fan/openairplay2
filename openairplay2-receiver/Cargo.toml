@@ -1,6 +1,6 @@
 [package]
 name = "openairplay2-receiver"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Standalone AirPlay 2 receiver for Linux/ALSA"
@@ -22,7 +22,7 @@ maintainer = "Stefan Arentz <stefan.arentz@gmail.com>"
 copyright = "2026 Stefan Arentz"
 extended-description = """\
 An AirPlay 2 audio receiver: a Mac or iPhone discovers it over mDNS, pairs \
-with it (HomeKit transient pairing, optionally behind a pincode), and streams \
+with it (HomeKit transient pairing, optionally behind a password), and streams \
 AAC to it; audio comes out of an ALSA device with working pause, seek and \
 volume. One sender, one stream, one output — no multi-room grouping."""
 section = "sound"
@@ -51,7 +51,7 @@ assets = [
         "644",
     ],
 ]
-# A pincode is a secret: root-owned, 0640, and preserved across upgrades.
+# A pairing password is a secret: root-owned, 0640, preserved across upgrades.
 conf-files = ["/etc/default/openairplay2-receiver"]
 maintainer-scripts = "../packaging/debian"
 
@@ -65,7 +65,7 @@ restart-after-upgrade = true
 
 [dependencies]
 # The version makes this publishable; the path keeps workspace builds local.
-openairplay2 = { path = "../openairplay2", version = "0.4.0" }
+openairplay2 = { path = "../openairplay2", version = "0.5.0" }
 alsa = "0.12"
 # Raw ALSA for the playback stream: the safe `alsa` wrapper does not expose
 # snd_pcm_rewind or the silence sw-params we need to keep the stream running
@@ -88,7 +88,7 @@ tokio = { version = "1", features = [
 # The now-playing WebSocket (--tui-listen). Off unless asked for, but the
 # handful of crates it costs are always linked; tokio-tungstenite over a plain
 # TcpListener is the small standard choice, no HTTP stack involved.
-openairplay2-tui-protocol = { path = "../openairplay2-tui-protocol", version = "0.4.0" }
+openairplay2-tui-protocol = { path = "../openairplay2-tui-protocol", version = "0.5.0" }
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 serde_json = "1"
