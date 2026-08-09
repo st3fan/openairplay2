@@ -1,9 +1,11 @@
-//! `_airplay._tcp` advertisement via the system Avahi daemon's D-Bus API.
+//! Service advertisement via the system Avahi daemon's D-Bus API.
 //!
 //! Registers directly over D-Bus (no `avahi-utils` dependency); the
 //! registration lives as long as the [`Advertisement`] holds the connection.
-//! Ported from the AirPlay 1 receiver, changed to the `_airplay._tcp` service
-//! type and AirPlay 2 TXT records.
+//! Ported from the AirPlay 1 receiver. The service type is a parameter: the
+//! library registers `_airplay._tcp`, and the receiver binary reuses this to
+//! register its now-playing endpoint as `_openairplay2._tcp` — which is why
+//! the module is `#[doc(hidden)]` public rather than private.
 
 use log::info;
 use zbus::zvariant::OwnedObjectPath;
@@ -21,9 +23,11 @@ pub struct Advertisement {
     _group: OwnedObjectPath,
 }
 
-/// Register `service_name` as `_airplay._tcp` on `port` with `txt_records`.
+/// Register `service_name` as `service_type` (e.g. `_airplay._tcp`) on
+/// `port` with `txt_records`.
 pub async fn publish(
     service_name: &str,
+    service_type: &str,
     port: u16,
     txt_records: &[String],
 ) -> zbus::Result<Advertisement> {
@@ -54,7 +58,7 @@ pub async fn publish(
                 PROTO_UNSPEC,
                 0u32,
                 service_name,
-                "_airplay._tcp",
+                service_type,
                 "",
                 "",
                 port,
@@ -67,7 +71,7 @@ pub async fn publish(
         .call_method(Some(AVAHI_DEST), &group, Some(GROUP_IFACE), "Commit", &())
         .await?;
 
-    info!("advertising \"{service_name}\" on _airplay._tcp port {port}");
+    info!("advertising \"{service_name}\" on {service_type} port {port}");
 
     Ok(Advertisement {
         _connection: connection,

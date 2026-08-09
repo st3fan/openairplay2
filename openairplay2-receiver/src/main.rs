@@ -130,6 +130,28 @@ fn tui_socket_path(
     }
 }
 
+/// The mDNS service type of the now-playing endpoint, browsed by
+/// `openairplay2-tui`. Not `_openairplay2-tui._tcp`: DNS-SD service labels
+/// are capped at 15 characters (RFC 6763 §7.2), and the project name alone
+/// fits.
+const TUI_SERVICE_TYPE: &str = "_openairplay2._tcp";
+
+/// The port to advertise as `_openairplay2._tcp`, or `None` when the
+/// endpoint should not be on the network's radar: no `--tui-listen` at all,
+/// Avahi off, a loopback bind address (deliberately private — advertising
+/// `127.0.0.1` to the network is noise), or an address so malformed the bind
+/// will reject it anyway.
+fn tui_advertisement(tui_listen: Option<&str>, avahi: bool) -> Option<u16> {
+    if !avahi {
+        return None;
+    }
+    let addr: std::net::SocketAddr = tui_listen?.parse().ok()?;
+    if addr.ip().is_loopback() {
+        return None;
+    }
+    Some(addr.port())
+}
+
 /// What the command line asks for; everything but `Run` prints and exits.
 /// `Args` is boxed only to keep the variants comparable in size (clippy's
 /// `large_enum_variant`).
@@ -187,7 +209,10 @@ options:
   --tui-listen ADDR         serve the now-playing WebSocket that
                             openairplay2-tui renders, e.g. 127.0.0.1:7392; it
                             carries track metadata and cover art, so keep it
-                            on loopback unless you mean otherwise
+                            on loopback unless you mean otherwise. A
+                            non-loopback address is advertised over mDNS
+                            (unless --no-avahi), so displays elsewhere on the
+                            network find it on their own
   --tui-password PASS       require this password on the now-playing
                             WebSocket (openairplay2-tui --password); without
                             one, anyone who can reach the address connects.
@@ -740,6 +765,9 @@ async fn main() -> ExitCode {
             ),
         }
     }
+    // Held for the life of the process: dropping it would withdraw the
+    // registration.
+    let mut _tui_advertisement = None;
     if let (Some(addr), Some(publisher)) = (&args.tui_listen, &publisher) {
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => listener,
@@ -758,6 +786,30 @@ async fn main() -> ExitCode {
             publisher.clone(),
             args.tui_password.clone(),
         ));
+        // A non-loopback endpoint is meant to be reached from elsewhere, so
+        // make it discoverable: openairplay2-tui browses this type and offers
+        // what it finds. Registered only now, after the listener exists.
+        // Failing to register costs discovery, not the endpoint.
+        if let Some(port) = tui_advertisement(Some(addr), args.avahi.unwrap_or(true)) {
+            let txt = [
+                "txtvers=1".to_string(),
+                format!("pw={}", u8::from(args.tui_password.is_some())),
+            ];
+            match openairplay2::avahi::publish(
+                &receiver.config().name,
+                TUI_SERVICE_TYPE,
+                port,
+                &txt,
+            )
+            .await
+            {
+                Ok(ad) => _tui_advertisement = Some(ad),
+                Err(e) => warn!(
+                    "now-playing endpoint not advertised ({e}); \
+                     displays must be given ws://…:{port} by hand"
+                ),
+            }
+        }
     }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1115,6 +1167,39 @@ mod tests {
         );
         // And off is off.
         assert_eq!(tui_socket_path(Some("off"), Some("/run/user/1000")), None);
+    }
+
+    #[test]
+    fn tui_advertisement_decision() {
+        // The documented remote setup: a wildcard bind, Avahi on.
+        assert_eq!(tui_advertisement(Some("0.0.0.0:7392"), true), Some(7392));
+        assert_eq!(tui_advertisement(Some("[::]:7392"), true), Some(7392));
+        // A specific non-loopback address is discoverable too.
+        assert_eq!(
+            tui_advertisement(Some("192.168.1.5:7000"), true),
+            Some(7000)
+        );
+        // Loopback is deliberately private: advertising it would offer the
+        // network an endpoint it cannot reach.
+        assert_eq!(tui_advertisement(Some("127.0.0.1:7392"), true), None);
+        assert_eq!(tui_advertisement(Some("[::1]:7392"), true), None);
+        // No endpoint, or mDNS off, advertises nothing.
+        assert_eq!(tui_advertisement(None, true), None);
+        assert_eq!(tui_advertisement(Some("0.0.0.0:7392"), false), None);
+        // An unparseable address is the bind's error to report, not ours.
+        assert_eq!(tui_advertisement(Some("not-an-address"), true), None);
+    }
+
+    #[test]
+    fn the_tui_service_type_is_a_legal_dns_sd_label() {
+        // RFC 6763 §7.2: the service label (between the underscore and
+        // "._tcp") is at most 15 characters — the reason this is not
+        // "_openairplay2-tui._tcp".
+        let label = TUI_SERVICE_TYPE
+            .strip_prefix('_')
+            .and_then(|s| s.strip_suffix("._tcp"))
+            .expect("shaped like _name._tcp");
+        assert!((1..=15).contains(&label.len()), "{label}");
     }
 
     #[test]
