@@ -24,6 +24,10 @@ Group=openairplay2
 # would hide it, so it is deliberately not set.
 SupplementaryGroups=audio
 StateDirectory=openairplay2
+# /run/openairplay2 — where the daemon binds the local now-playing socket
+# (tui.sock) that openairplay2-tui connects to by default. The directory is
+# 0755 and the socket file 0666: any local user may watch what is playing.
+RuntimeDirectory=openairplay2
 # Restart on a crash (a panic or a signal), but NOT on a configuration
 # mistake: a bad OPENAIRPLAY2_* value, an unknown ALSA device, or a port that
 # is taken or privileged exits EX_CONFIG (78) — a usage error exits 2 — and

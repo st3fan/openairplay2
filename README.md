@@ -162,7 +162,8 @@ cargo install openairplay2-receiver
 | `--mixer-device DEV` | `OPENAIRPLAY2_MIXER_DEVICE` | Mixer device holding that control | the card of `--alsa-device`, else `default` |
 | `--list-mixers` | — | List each device's mixer volume controls, with their dB ranges, and exit | — |
 | `--no-avahi` | `OPENAIRPLAY2_AVAHI=off` | Don't advertise over Avahi / mDNS | advertising on |
-| `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Serve the [now-playing WebSocket](#now-playing-display) on this address, e.g. `127.0.0.1:7392` | off |
+| `--tui-socket PATH` (or `off`) | `OPENAIRPLAY2_TUI_SOCKET` | Serve the [now-playing WebSocket](#now-playing-display) on this local Unix socket — what `openairplay2-tui` connects to by default on the same machine; any local user may connect | `$XDG_RUNTIME_DIR/openairplay2/tui.sock`, else `/run/openairplay2/tui.sock` |
+| `--tui-listen ADDR` | `OPENAIRPLAY2_TUI_LISTEN` | Also serve the [now-playing WebSocket](#now-playing-display) over TCP for a display on another machine, e.g. `127.0.0.1:7392` | off |
 | `--tui-password PASS` | `OPENAIRPLAY2_TUI_PASSWORD` | Require this password on the now-playing WebSocket (`openairplay2-tui --password`). Prefer the variable — a flag is visible in `ps`. | open |
 | `--pincode CODE` | `OPENAIRPLAY2_PINCODE` | Require this pincode to pair — senders must enter it (free-text "password" dialog). Unset = transient `3939` (trusted LAN). It is never logged. Prefer the environment variable (the service's options file): a `--pincode` argument is visible to any local user in `ps`, an environment variable is not. | transient `3939` |
 | `--log-level LEVEL` (or `--debug`) | `OPENAIRPLAY2_LOG_LEVEL` | Log verbosity: `error`, `warn`, `info`, `debug`, `trace`. `debug` logs every request and hex-dumps bodies. `RUST_LOG` overrides it for per-module control. | `info` |

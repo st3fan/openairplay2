@@ -1,6 +1,8 @@
 //! The now-playing endpoint: what is playing, published over a WebSocket.
 //!
-//! `--tui-listen ADDR` turns this on. Every connected client gets a
+//! Served on a local Unix socket by default (`--tui-socket`, so an on-device
+//! display works with zero configuration) and over TCP with `--tui-listen`
+//! for displays on other machines. Every connected client gets a
 //! [`Message::Snapshot`] immediately and then one message per change, so a
 //! display started mid-track shows a full screen at once rather than waiting
 //! for the sender to do something — which, for a sender parked on one track,
@@ -16,7 +18,9 @@
 //!   fresh snapshot. Artwork frames are hundreds of KB, and a client that
 //!   missed one is better off resynced than killed.
 
-use std::net::SocketAddr;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,7 +28,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, warn};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -133,28 +138,65 @@ fn display_addr(addr: std::net::IpAddr) -> String {
     }
 }
 
-/// Accept display connections until the listener fails. With a `password`,
-/// a client must present it before the WebSocket upgrade; without one,
-/// anyone who can reach the port connects (the options file's advice to
-/// keep the address on loopback stands either way).
+/// Accept display connections over TCP until the listener fails. With a
+/// `password`, a client must present it before the WebSocket upgrade;
+/// without one, anyone who can reach the port connects (the options file's
+/// advice to keep the address on loopback stands either way).
 pub async fn serve(
     listener: TcpListener,
     publisher: Publisher,
     password: Option<String>,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let password = Arc::new(password);
     loop {
         let (stream, peer) = listener.accept().await?;
         let publisher = publisher.clone();
         let password = password.clone();
         tokio::spawn(async move {
+            let peer = peer.to_string();
             debug!("tui [{peer}] connected");
-            if let Err(e) = serve_client(stream, peer, publisher, password.as_deref()).await {
+            if let Err(e) = serve_client(stream, &peer, publisher, password.as_deref()).await {
                 debug!("tui [{peer}] ended: {e}");
             }
             debug!("tui [{peer}] disconnected");
         });
     }
+}
+
+/// Accept display connections on the local Unix socket. No password:
+/// permission to the socket file *is* the access control — which is what
+/// lets an on-device display work with zero configuration.
+pub async fn serve_unix(listener: UnixListener, publisher: Publisher) -> io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let publisher = publisher.clone();
+        tokio::spawn(async move {
+            debug!("tui [local] connected");
+            if let Err(e) = serve_client(stream, "local", publisher, None).await {
+                debug!("tui [local] ended: {e}");
+            }
+            debug!("tui [local] disconnected");
+        });
+    }
+}
+
+/// Bind the now-playing Unix socket: create the parent directory if needed,
+/// replace a stale socket file (a crashed predecessor leaves one; unlinking
+/// is the standard trade — last starter wins), and open the file to any
+/// local user, which is the point of the socket. Where a stricter scope is
+/// wanted, the parent directory provides it (`$XDG_RUNTIME_DIR` is `0700`).
+pub fn bind_socket(path: &Path) -> io::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    Ok(listener)
 }
 
 /// Constant-time equality: fold over the longer length, so neither a
@@ -172,10 +214,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // The auth callback's `Result<Response, ErrorResponse>` is tungstenite's
 // signature, not a choice — its Err carries a whole HTTP response by design.
+// Generic over the stream: a WebSocket is an HTTP upgrade over any byte
+// stream, so TCP and the Unix socket share everything from here down.
 #[allow(clippy::result_large_err)]
-async fn serve_client(
-    stream: TcpStream,
-    peer: SocketAddr,
+async fn serve_client<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    peer: &str,
     publisher: Publisher,
     password: Option<&str>,
 ) -> Result<(), tokio_tungstenite::tungstenite::Error> {
@@ -255,9 +299,10 @@ fn encode(message: &Message) -> WsMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use futures_util::stream::SplitStream;
+    use tokio::net::TcpStream;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
     async fn start() -> (SocketAddr, Publisher) {
@@ -526,6 +571,79 @@ mod tests {
         let (addr, _publisher) = start().await;
         let (_, mut rx) = connect(addr).await.split();
         assert!(matches!(next(&mut rx).await, Message::Snapshot(_)));
+    }
+
+    /// A scratch socket path, unique per test, short enough for sun_path.
+    fn socket_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("oap2-{}-{tag}.sock", std::process::id()))
+    }
+
+    async fn connect_unix(path: &Path) -> WebSocketStream<tokio::net::UnixStream> {
+        let stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        // The handshake needs a nominal URL; the host is meaningless here.
+        let (socket, _) = tokio_tungstenite::client_async("ws://localhost/", stream)
+            .await
+            .expect("the socket should accept the connection");
+        socket
+    }
+
+    /// Read the next message from a unix-socket client.
+    async fn next_unix(
+        socket: &mut SplitStream<WebSocketStream<tokio::net::UnixStream>>,
+    ) -> Message {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("timed out waiting for a message")
+                .expect("socket closed")
+                .expect("socket error");
+            if let WsMessage::Text(text) = frame {
+                return serde_json::from_str(&text).expect("valid protocol JSON");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_unix_socket_client_gets_the_snapshot_and_changes() {
+        // The same protocol over the local socket: snapshot on connect, then
+        // one message per change — proving the generic serve path.
+        let path = socket_path("roundtrip");
+        let listener = bind_socket(&path).unwrap();
+        let publisher = Publisher::new("Living Room".into());
+        tokio::spawn(serve_unix(listener, publisher.clone()));
+
+        let (_, mut rx) = connect_unix(&path).await.split();
+        match next_unix(&mut rx).await {
+            Message::Snapshot(snapshot) => assert_eq!(snapshot.receiver.name, "Living Room"),
+            other => panic!("the first message must be a snapshot, got {other:?}"),
+        }
+        publisher.publish(&Event::Volume { db: -12.5 });
+        assert_eq!(next_unix(&mut rx).await, Message::Volume { db: -12.5 });
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bind_socket_is_world_accessible_and_replaces_a_stale_file() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let path = socket_path("stale");
+
+        // First bind: file exists with local-user-open permissions.
+        let first = bind_socket(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o666, "any local user may connect");
+
+        // A crashed predecessor leaves the file behind; a new bind must
+        // replace it rather than fail with AddrInUse.
+        drop(first);
+        assert!(path.exists(), "closing the listener leaves the file");
+        let _second = bind_socket(&path).expect("stale socket file must be replaced");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
