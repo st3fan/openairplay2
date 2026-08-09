@@ -171,6 +171,31 @@ branch: which hypothesis held, with the log excerpts that prove it.
 For H1: the pointer-resync in `AlsaOutput` as designed above, receiver
 binary only. For H2/H3: scoped by phase 1's findings, recorded here first.
 
+**Both phases were built before the capture**, at Stefan's request, so one
+hardware session can test the measurement and the fix together: the phase-1
+build alone prints the divergence (and still garbles), the phase-2 build on
+top prints it and corrects it. That ordering does not change what the
+capture has to establish — if the numbers show the application pointer
+staying level with the hardware pointer across a long pause, H1 is refuted
+and phase 2 is the wrong fix, however green its tests are.
+
+### Implementation notes (recorded during the build)
+
+- **The resync must be gated on the stream actually `RUNNING`.** Only a
+  running stream advances its hardware pointer on its own; before it starts
+  (`PREPARED` — where a session's *first* audio is written) there is no play
+  position to be behind, and `avail` need not even be meaningful there.
+  ALSA's `null` device reports `avail` = twice the buffer in `PREPARED`,
+  which is how this surfaced: an ungated resync would have skipped the
+  opening audio of every session. The `null`-device round-trip test now
+  pins it.
+- The check runs before **every** write, not only after a pause: any stall
+  that empties the ring ends in the same state, and one `snd_pcm_avail` per
+  ~3 ms chunk is cheap next to the `writei` beside it.
+- A resync re-arms the sink's fade-in, so resumed audio ramps rather than
+  clicking — the same treatment every other silence→audio boundary gets
+  (plans/20260808-01).
+
 ## Test strategy
 
 - **Unit:** the resync arithmetic pure function (overrange → forward frames;
