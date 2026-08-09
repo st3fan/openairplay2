@@ -11,8 +11,10 @@
 
 mod feedback;
 mod fp_setup;
+mod get_parameter;
 mod info;
 mod pair_pin_start;
+mod set_parameter;
 
 use log::warn;
 
@@ -59,16 +61,8 @@ async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Re
                 Response::new(proto, 400, "Bad Request")
             }
         }),
-        // A sender queries the current volume during setup and expects a
-        // `text/parameters` body back; an empty response makes it give up.
-        "GET_PARAMETER" => {
-            let body = session.get_parameter(&request.body);
-            Some(Response::ok(proto).body(PARAMETERS_CONTENT_TYPE, body))
-        }
-        "SET_PARAMETER" => {
-            session.set_parameter(request.headers.get("Content-Type"), &request.body);
-            Some(Response::ok(proto))
-        }
+        "GET_PARAMETER" => Some(get_parameter::handle_get_parameter(request, session)),
+        "SET_PARAMETER" => Some(set_parameter::handle_set_parameter(request, session)),
         // Transport control: play/pause rate and the RTP anchor.
         "SETRATEANCHORTIME" => {
             session.set_rate_anchor(&request.body);

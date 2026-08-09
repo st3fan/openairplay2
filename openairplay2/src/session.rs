@@ -18,9 +18,8 @@ use tokio::task::JoinHandle;
 
 use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
 use crate::decode::AacDecoder;
-use crate::dmap;
 use crate::events::{Event, EventSender};
-use crate::player::{frames_to_duration, Player, PlayerSender, Position, Track, TrackAnchor};
+use crate::player::{Player, PlayerSender, Position, TrackAnchor};
 use crate::sink::{AudioSink, SinkFactory};
 use crate::takeover::ActiveGuard;
 
@@ -28,57 +27,54 @@ use crate::takeover::ActiveGuard;
 const TYPE_REALTIME: u64 = 96;
 const TYPE_BUFFERED: u64 = 103;
 
-/// `SET_PARAMETER` content type carrying DMAP track metadata.
-const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
-
-/// The AirPlay volume range: `0` is full scale and `-144` is the mute
-/// sentinel, so anything outside this says nothing a volume can mean.
-const MUTE_DB: f32 = -144.0;
-const FULL_DB: f32 = 0.0;
-
+/// The per-connection session state the commands operate on
+/// ([`crate::commands`] is the only place outside this module that touches
+/// the fields), plus the audio pipeline it feeds.
 pub struct Session {
     /// The address the control connection arrived on — what we bind to and
     /// report back so the sender can reach our channels.
-    local_ip: IpAddr,
+    pub(crate) local_ip: IpAddr,
     /// The address the sender connected *from*, reported to the host with
     /// `SessionStarted` (a display shows it; nothing else uses it).
-    peer_ip: IpAddr,
-    tasks: Vec<JoinHandle<()>>,
+    pub(crate) peer_ip: IpAddr,
+    pub(crate) tasks: Vec<JoinHandle<()>>,
     /// Captured at SETUP phase 2, for audio decrypt/decode.
-    stream_key: Option<Vec<u8>>,
-    audio_format: Option<u64>,
-    stream_type: Option<u64>,
-    /// AirPlay volume in dB (0 = full, −30 ≈ min, −144 = mute).
-    volume: f32,
+    pub(crate) stream_key: Option<Vec<u8>>,
+    pub(crate) audio_format: Option<u64>,
+    pub(crate) stream_type: Option<u64>,
+    /// AirPlay volume in dB (0 = full, −30 ≈ min, −144 = mute). Always
+    /// finite and in range: it is only ever written from a validated
+    /// [`crate::types::VolumeDb`].
+    pub(crate) volume: f32,
     /// Creates the host's sink at SETUP phase 2.
-    sink_factory: SinkFactory,
+    pub(crate) sink_factory: SinkFactory,
     /// Where session milestones are reported to the host.
-    events: EventSender,
+    pub(crate) events: EventSender,
     /// True between `SessionStarted` and `SessionEnded`.
-    session_active: bool,
+    pub(crate) session_active: bool,
     /// Metadata/artwork that arrived while no session was active (senders
     /// may push them during the handshake, before SETUP phase 2). The
     /// latest of each is latched here and delivered right after
     /// `SessionStarted`, so the host only ever sees them inside a session.
-    pending_metadata: Option<Event>,
-    pending_artwork: Option<Event>,
+    pub(crate) pending_metadata: Option<Event>,
+    pub(crate) pending_artwork: Option<Event>,
     /// The playback thread, alive for the duration of a buffered stream.
-    player: Option<Player>,
+    pub(crate) player: Option<Player>,
     /// Control handle for the player (pause/resume, flush) from the RTSP path.
-    player_control: Option<PlayerSender>,
+    pub(crate) player_control: Option<PlayerSender>,
     /// `FLUSHBUFFERED` boundary: the reader drops arriving audio packets with
     /// a sequence number below this, discarding buffered-ahead audio on
     /// seek/skip. Self-clearing (consumed when the stream reaches it) and
     /// reset at stream setup — a stale boundary discards wanted audio.
-    flush_until_seq: Arc<AtomicU64>,
+    pub(crate) flush_until_seq: Arc<AtomicU64>,
     /// The current track's extent on the RTP timeline, from the sender's
     /// `progress:` line. Shared with the playback thread, which turns it into
     /// a position that follows the audio.
-    track: TrackAnchor,
+    pub(crate) track: TrackAnchor,
     /// Proof that this connection owns the active-session slot, held here so
     /// that it is released only once this session has fully torn down — see
     /// [`Drop`] and [`crate::takeover`].
-    active_guard: Option<ActiveGuard>,
+    pub(crate) active_guard: Option<ActiveGuard>,
 }
 
 impl Session {
@@ -117,7 +113,7 @@ impl Session {
     }
 
     /// Report a session milestone; a host that dropped its receiver is fine.
-    fn send_event(&self, event: Event) {
+    pub(crate) fn send_event(&self, event: Event) {
         let _ = self.events.send(event);
     }
 
@@ -337,131 +333,10 @@ impl Session {
         self.send_event(Event::Flushed);
     }
 
-    /// Answer a `GET_PARAMETER` query. A sender asks `volume\r\n` during setup
-    /// and expects `volume: <dB>\r\n` back (an empty response makes it abort).
-    pub fn get_parameter(&self, body: &[u8]) -> Vec<u8> {
-        let query = String::from_utf8_lossy(body);
-        if query.trim() == "volume" {
-            format!("volume: {:.6}\r\n", self.volume).into_bytes()
-        } else {
-            debug!("GET_PARAMETER for unknown parameter: {query:?}");
-            Vec::new()
-        }
-    }
-
-    /// Apply a `SET_PARAMETER` body, dispatched on its `Content-Type`:
-    /// DMAP track metadata, cover art, or (the default) `text/parameters`
-    /// lines — currently the volume.
-    pub fn set_parameter(&mut self, content_type: Option<&str>, body: &[u8]) {
-        // Strip any parameters ("; charset=...") from the media type.
-        let media_type = content_type.map(|ct| ct.split(';').next().unwrap_or(ct).trim());
-        match media_type {
-            Some(ct) if ct.eq_ignore_ascii_case(DMAP_CONTENT_TYPE) => self.set_metadata(body),
-            Some(ct)
-                if ct
-                    .get(..6)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("image/")) =>
-            {
-                self.set_artwork(ct, body)
-            }
-            _ => self.set_text_parameters(body),
-        }
-    }
-
-    /// The `text/parameters` flavor: the volume line, and the sender's
-    /// position report. The volume (dB) is recorded (to answer
-    /// `GET_PARAMETER`) and reported to the host, which owns the gain path.
-    fn set_text_parameters(&mut self, body: &[u8]) {
-        let text = String::from_utf8_lossy(body);
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(v) = line.strip_prefix("volume:") {
-                match v.trim().parse::<f32>().ok().and_then(sanitize_volume) {
-                    Some(db) => {
-                        self.volume = db;
-                        debug!("SET_PARAMETER volume {db} dB");
-                        self.send_event(Event::Volume { db });
-                    }
-                    // Unparseable or non-finite: the knob does not move.
-                    None => debug!("SET_PARAMETER unusable volume {:?}", v.trim()),
-                }
-            } else if let Some(v) = line.strip_prefix("progress:") {
-                self.set_progress(v.trim());
-            }
-        }
-    }
-
-    /// `progress: <start>/<current>/<end>` — three RTP timestamps naming the
-    /// current track's extent and the sender's idea of the position.
-    ///
-    /// The extent is what matters: it is handed to the playback thread, which
-    /// turns the audio it plays into a running position. The sender's own
-    /// `current` is reported once here (it is right at track start, which is
-    /// essentially the only time this line arrives) and never extrapolated
-    /// from.
-    fn set_progress(&mut self, value: &str) {
-        let mut parts = value.split('/').map(|p| p.trim().parse::<u32>());
-        let (Some(Ok(start)), Some(Ok(current)), Some(Ok(end)), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            debug!("SET_PARAMETER progress: unparseable value {value:?}");
-            return;
-        };
-        *self.track.lock().unwrap() = Some(Track { start, end });
-        if !self.session_active {
-            return; // a position without a stream means nothing
-        }
-        let (rate, _) = aac_params(self.audio_format);
-        // A seek can put `current` before `start`, and the timestamps wrap;
-        // saturating subtraction keeps both readings sane rather than
-        // reporting a position of ~27 hours.
-        let elapsed = frames_to_duration(current.saturating_sub(start), rate);
-        let duration = frames_to_duration(end.saturating_sub(start), rate);
-        debug!(
-            "SET_PARAMETER progress {:.1}s / {:.1}s",
-            elapsed.as_secs_f32(),
-            duration.as_secs_f32()
-        );
-        self.send_event(Event::Progress { elapsed, duration });
-    }
-
-    /// DMAP track metadata. Metadata is decoration: an unparseable payload
-    /// is dropped with a debug log, never an error to the sender.
-    fn set_metadata(&mut self, body: &[u8]) {
-        let Some(meta) = dmap::parse(body) else {
-            debug!(
-                "SET_PARAMETER metadata: unrecognized DMAP payload ({} bytes)",
-                body.len()
-            );
-            return;
-        };
-        debug!(
-            "SET_PARAMETER metadata: title={:?} artist={:?} album={:?}",
-            meta.title, meta.artist, meta.album
-        );
-        self.send_session_event(Event::Metadata {
-            title: meta.title,
-            artist: meta.artist,
-            album: meta.album,
-        });
-    }
-
-    /// Cover art, forwarded as-is (`image/none`/empty means cleared).
-    fn set_artwork(&mut self, content_type: &str, body: &[u8]) {
-        debug!(
-            "SET_PARAMETER artwork: {content_type}, {} bytes",
-            body.len()
-        );
-        self.send_session_event(Event::Artwork {
-            content_type: content_type.to_string(),
-            data: body.to_vec(),
-        });
-    }
-
     /// Deliver an event the host expects only inside a session; before
     /// `SessionStarted` it is latched (latest wins) and replayed once the
     /// session starts.
-    fn send_session_event(&mut self, event: Event) {
+    pub(crate) fn send_session_event(&mut self, event: Event) {
         if self.session_active {
             self.send_event(event);
         } else if matches!(event, Event::Artwork { .. }) {
@@ -553,22 +428,10 @@ async fn audio_channel(socket: UdpSocket, label: &'static str) {
     }
 }
 
-/// Make a parsed `volume:` value safe to hand to a host's gain path, or reject
-/// it. `f32::parse` accepts `nan`, `inf` and overflowing literals like `1e40`,
-/// and none of the arithmetic downstream expects them: NaN survives a
-/// `min(0.0)` (that returns the *other* operand) and comes out as full scale,
-/// which is the loudest possible reading of a value that means nothing. So a
-/// non-finite volume is refused outright — the knob keeps its old position —
-/// and a finite one is clamped into the range AirPlay actually uses, which only
-/// rewrites values that were already nonsense.
-fn sanitize_volume(db: f32) -> Option<f32> {
-    db.is_finite().then(|| db.clamp(MUTE_DB, FULL_DB))
-}
-
 /// Decode parameters for the buffered stream. AirPlay 2 buffered audio is
 /// AAC-LC 44.1 kHz stereo (audioFormat bit `0x400000`); other formats aren't
 /// negotiated yet, so default to that.
-fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
+pub(crate) fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
     (44100, 2)
 }
 
@@ -707,31 +570,8 @@ async fn drain_tcp(listener: TcpListener) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
-    use tokio::sync::mpsc::UnboundedReceiver;
-
-    fn local() -> IpAddr {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    }
-
-    /// The address a test "sender" connects from.
-    fn peer() -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42))
-    }
-
-    struct TestSink;
-
-    impl AudioSink for TestSink {
-        fn write(&mut self, _pcm: &[i16]) {}
-        fn flush(&mut self) {}
-    }
-
-    /// A session wired to a discarding sink, plus the host's event receiver.
-    fn session() -> (Session, UnboundedReceiver<Event>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
-        (Session::new(local(), peer(), factory, tx), rx)
-    }
+    use crate::commands::test_helpers::{peer, session};
+    use crate::player::Track;
 
     #[tokio::test]
     async fn phase1_response_has_event_and_timing_ports() {
@@ -811,294 +651,21 @@ mod tests {
             .contains_key("eventPort"));
     }
 
-    #[test]
-    fn volume_query_returns_current_volume() {
-        let (mut session, mut events) = session();
-        // A sender's exact query is "volume\r\n".
-        assert_eq!(
-            session.get_parameter(b"volume\r\n"),
-            b"volume: 0.000000\r\n"
-        );
-        session.set_parameter(Some("text/parameters"), b"volume: -12.5\r\n");
-        assert_eq!(
-            session.get_parameter(b"volume\r\n"),
-            b"volume: -12.500000\r\n"
-        );
-        // The volume reaches the host as an event, in dB as sent.
-        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
-        // Unknown parameters yield an empty body rather than a bad one.
-        assert!(session.get_parameter(b"progress\r\n").is_empty());
-    }
-
-    #[test]
-    fn non_finite_volume_is_refused() {
-        let (mut session, mut events) = session();
-        session.set_parameter(Some("text/parameters"), b"volume: -12.5\r\n");
-        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
-        // `f32::parse` takes all of these; the knob must not move for any of
-        // them, least of all to full scale.
-        for value in ["nan", "NaN", "inf", "-inf", "1e40", "-1e40", "banana", ""] {
-            session.set_parameter(
-                Some("text/parameters"),
-                format!("volume: {value}\r\n").as_bytes(),
-            );
-            assert!(
-                events.try_recv().is_err(),
-                "volume: {value:?} emitted an event"
-            );
-            // And the answer a sender gets back stays a well-formed float —
-            // a malformed one makes it abort before SETUP phase 2.
-            assert_eq!(
-                session.get_parameter(b"volume\r\n"),
-                b"volume: -12.500000\r\n",
-                "volume: {value:?} changed the current volume"
-            );
-        }
-    }
-
-    #[test]
-    fn out_of_range_volume_is_clamped() {
-        let (mut session, mut events) = session();
-        // Above full scale, and far below the mute sentinel.
-        for (sent, expected) in [("6.0", 0.0), ("-500", -144.0), ("-144", -144.0)] {
-            session.set_parameter(
-                Some("text/parameters"),
-                format!("volume: {sent}\r\n").as_bytes(),
-            );
-            assert_eq!(events.try_recv(), Ok(Event::Volume { db: expected }));
-        }
-        // The echo carries the clamped value, not what was sent.
-        assert_eq!(
-            session.get_parameter(b"volume\r\n"),
-            b"volume: -144.000000\r\n"
-        );
-    }
-
-    /// One DMAP entry: 4-byte tag + big-endian u32 length + payload.
-    fn dmap_entry(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let mut e = tag.to_vec();
-        e.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        e.extend_from_slice(payload);
-        e
-    }
-
-    /// A complete track statement: `mlit` wrapping title/artist/album.
-    fn dmap_track(title: &str) -> Vec<u8> {
-        let children = [
-            dmap_entry(b"minm", title.as_bytes()),
-            dmap_entry(b"asar", b"Artist"),
-            dmap_entry(b"asal", b"Album"),
-        ]
-        .concat();
-        dmap_entry(b"mlit", &children)
-    }
-
-    /// Run a phase-2 SETUP for a buffered stream, starting the session.
-    async fn start_stream(session: &mut Session) {
-        let mut stream = Dictionary::new();
-        stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
-        stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "streams".into(),
-            Value::Array(vec![Value::Dictionary(stream)]),
-        );
-        let body = encode_plist(&dict).unwrap();
-        session.handle_setup(&body).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn metadata_and_artwork_reach_the_host_mid_session() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        assert!(matches!(
-            events.try_recv(),
-            Ok(Event::SessionStarted { .. })
-        ));
-
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Song"));
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Metadata {
-                title: Some("Song".into()),
-                artist: Some("Artist".into()),
-                album: Some("Album".into()),
-            })
-        );
-
-        session.set_parameter(Some("image/png"), b"\x89PNG");
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Artwork {
-                content_type: "image/png".into(),
-                data: b"\x89PNG".to_vec(),
-            })
-        );
-
-        // `image/none` with an empty body is the artwork-cleared statement,
-        // forwarded rather than suppressed (it can happen mid-track).
-        session.set_parameter(Some("image/none"), b"");
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Artwork {
-                content_type: "image/none".into(),
-                data: Vec::new(),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn early_metadata_is_latched_until_session_start() {
-        let (mut session, mut events) = session();
-        // Pushed during the handshake, before SETUP phase 2: nothing yet...
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("First"));
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Second"));
-        session.set_parameter(Some("image/jpeg"), b"JPEG");
-        assert!(events.try_recv().is_err());
-
-        // ...and the latest of each replays right after SessionStarted.
-        start_stream(&mut session).await;
-        assert!(matches!(
-            events.try_recv(),
-            Ok(Event::SessionStarted { .. })
-        ));
-        assert!(matches!(
-            events.try_recv(),
-            Ok(Event::Metadata { title: Some(t), .. }) if t == "Second"
-        ));
-        assert!(matches!(events.try_recv(), Ok(Event::Artwork { .. })));
-        assert!(events.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn malformed_metadata_never_reaches_the_host() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        assert!(matches!(
-            events.try_recv(),
-            Ok(Event::SessionStarted { .. })
-        ));
-
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"");
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"garbage, not dmap");
-        // Truncated: an mlit that claims more payload than exists.
-        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"mlit\x00\x00\xff\xff");
-        assert!(events.try_recv().is_err());
-
-        // The session itself is unharmed — the volume path still works.
-        session.set_parameter(Some("text/parameters"), b"volume: -6.0\r\n");
-        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
-    }
-
-    #[tokio::test]
-    async fn progress_anchors_the_track_and_reports_the_senders_position() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        while events.try_recv().is_ok() {} // drain SessionStarted
-
-        // A minute-long track, the sender five seconds in.
-        let start = 1_000u32;
-        let end = start + 44_100 * 60;
-        let current = start + 44_100 * 5;
-        session.set_parameter(
-            Some("text/parameters"),
-            format!("progress: {start}/{current}/{end}\r\n").as_bytes(),
-        );
-
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Progress {
-                elapsed: Duration::from_secs(5),
-                duration: Duration::from_secs(60),
-            })
-        );
-        // The extent is what the playback thread needs: it turns the audio it
-        // plays into a running position without another word from the sender.
-        assert_eq!(
-            *session.track.lock().unwrap(),
-            Some(Track { start, end }),
-            "the track extent must reach the playback thread"
-        );
-    }
-
-    #[tokio::test]
-    async fn progress_before_a_stream_anchors_but_reports_nothing() {
-        let (mut session, mut events) = session();
-        session.set_parameter(Some("text/parameters"), b"progress: 0/44100/441000\r\n");
-        assert!(
-            events.try_recv().is_err(),
-            "a position without a stream means nothing"
-        );
-        assert!(session.track.lock().unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn malformed_progress_is_ignored() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        while events.try_recv().is_ok() {}
-        for body in [
-            &b"progress: 1000/2000\r\n"[..],      // too few fields
-            b"progress: 1000/2000/3000/4000\r\n", // too many
-            b"progress: a/b/c\r\n",               // not numbers
-            b"progress:\r\n",                     // empty
-        ] {
-            session.set_parameter(Some("text/parameters"), body);
-            assert!(
-                events.try_recv().is_err(),
-                "unparseable progress must not report: {:?}",
-                String::from_utf8_lossy(body)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn progress_after_a_seek_clamps_instead_of_reporting_27_hours() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        while events.try_recv().is_ok() {}
-        // `current` before `start`: the subtraction would wrap.
-        session.set_parameter(Some("text/parameters"), b"progress: 44100/0/441000\r\n");
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Progress {
-                elapsed: Duration::ZERO,
-                duration: Duration::from_secs(9),
-            })
-        );
-    }
-
     #[tokio::test]
     async fn a_new_stream_drops_the_previous_tracks_extent() {
+        use crate::commands::test_helpers::start_stream;
         let (mut session, mut events) = session();
         start_stream(&mut session).await;
-        session.set_parameter(Some("text/parameters"), b"progress: 0/0/441000\r\n");
-        assert!(session.track.lock().unwrap().is_some());
+        *session.track.lock().unwrap() = Some(Track {
+            start: 0,
+            end: 441_000,
+        });
 
         // A second stream on the same connection is a fresh timeline; a stale
         // extent would place the new audio inside the old track.
         start_stream(&mut session).await;
         assert_eq!(*session.track.lock().unwrap(), None);
         while events.try_recv().is_ok() {}
-    }
-
-    #[tokio::test]
-    async fn volume_and_progress_travel_in_one_body() {
-        let (mut session, mut events) = session();
-        start_stream(&mut session).await;
-        while events.try_recv().is_ok() {}
-        session.set_parameter(
-            Some("text/parameters"),
-            b"volume: -6.0\r\nprogress: 0/44100/441000\r\n",
-        );
-        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::Progress {
-                elapsed: Duration::from_secs(1),
-                duration: Duration::from_secs(10),
-            })
-        );
     }
 
     #[test]

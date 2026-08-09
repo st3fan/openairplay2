@@ -39,6 +39,7 @@
 #![warn(missing_docs)]
 
 mod buffered;
+mod commands;
 mod crypto_stream;
 mod decode;
 mod dmap;
@@ -56,6 +57,7 @@ mod receiver;
 mod session;
 mod sink;
 mod takeover;
+mod types;
 
 // The Avahi registration helper, reused by the receiver binary to advertise
 // its now-playing endpoint. Public for the workspace, but not part of the
