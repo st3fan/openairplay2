@@ -8,6 +8,8 @@
 //! 200 themselves — the *tolerance policy* lives visibly in the handler,
 //! while the status mapping for errors that *are* sender-visible lives here.
 
+use std::io;
+
 use thiserror::Error;
 
 use crate::http::Response;
@@ -22,6 +24,10 @@ pub enum CommandError {
     /// A params struct that failed its command's validation.
     #[error("validation: {0}")]
     Validation(#[from] validator::ValidationErrors),
+    /// The command could not act — binding a channel socket failed. Not the
+    /// sender's fault, and the status says so.
+    #[error("i/o: {0}")]
+    Io(#[from] io::Error),
 }
 
 impl CommandError {
@@ -32,6 +38,7 @@ impl CommandError {
     pub fn response(&self, protocol: &str) -> Response {
         let (status, reason) = match self {
             CommandError::MalformedBody(..) | CommandError::Validation(_) => (400, "Bad Request"),
+            CommandError::Io(_) => (500, "Internal Server Error"),
         };
         Response::new(protocol, status, reason)
     }
@@ -53,6 +60,7 @@ mod tests {
                 CommandError::Validation(validator::ValidationErrors::new()),
                 400,
             ),
+            (CommandError::Io(io::Error::other("bind failed")), 500),
         ];
         for (error, status) in cases {
             assert_eq!(error.response("RTSP/1.0").status(), status, "{error}");

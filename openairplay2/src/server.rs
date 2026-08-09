@@ -30,10 +30,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::cipher::control_channel;
 use crate::crypto_stream::ControlConnection;
 use crate::events::EventSender;
-use crate::handlers::{self, PAIRING_CONTENT_TYPE};
+use crate::handlers;
 use crate::http::{Request, Response};
 use crate::identity::Identity;
-use crate::pairing::{Outcome, PairSetup};
+use crate::pairing::PairSetup;
 use crate::session::Session;
 use crate::sink::SinkFactory;
 use crate::takeover::{next_connection_id, ActiveSlot};
@@ -161,22 +161,11 @@ async fn handle_connection(
         log_request(&peer, &request, conn.is_encrypted());
 
         // `/pair-setup` advances the state machine and may install the cipher
-        // (after the plaintext M4 response is written).
+        // (after the plaintext M4 response is written) — which is why it is
+        // dispatched here and not in the handler table.
         if request.method == "POST" && request.target == "/pair-setup" {
-            let outcome = pair.handle(&request.body);
-            let (tlv, secret) = match outcome {
-                Outcome::Continue(tlv) => (tlv, None),
-                Outcome::Failed(tlv) => (tlv, None),
-                Outcome::Done {
-                    response,
-                    shared_secret,
-                } => (response, Some(shared_secret)),
-            };
-            let response = finalize(
-                Response::ok(&request.protocol).body(PAIRING_CONTENT_TYPE, tlv),
-                &request,
-            );
-            conn.write_response(&response).await?;
+            let (response, secret) = handlers::handle_pair_setup(&request, &mut pair);
+            conn.write_response(&finalize(response, &request)).await?;
             if let Some(secret) = secret {
                 let (enc, dec) = control_channel(&secret);
                 conn.enable_encryption(enc, dec);

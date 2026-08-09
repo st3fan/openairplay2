@@ -7,6 +7,14 @@
 //! (see [`crate::errors`]); they apply validated params to session state and
 //! report the resulting [`crate::events::Event`]s to the host.
 
+// SETUP
+
+pub mod setup_streams;
+pub use setup_streams::{setup_streams, SetupStreamsParams};
+
+pub mod setup_timing;
+pub use setup_timing::{setup_timing, SetupTimingParams};
+
 // Transport control
 
 pub mod flush_buffered;
