@@ -38,7 +38,6 @@
 
 #![warn(missing_docs)]
 
-mod avahi;
 mod buffered;
 mod crypto_stream;
 mod decode;
@@ -55,6 +54,12 @@ mod receiver;
 mod session;
 mod sink;
 mod takeover;
+
+// The Avahi registration helper, reused by the receiver binary to advertise
+// its now-playing endpoint. Public for the workspace, but not part of the
+// documented embedding API.
+#[doc(hidden)]
+pub mod avahi;
 
 // Sender-side pieces the integration tests (and a future test-sender) drive
 // the real server with. Public so the tests can reach them, but not part of

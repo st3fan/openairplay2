@@ -240,7 +240,7 @@ impl Receiver {
 
         let _advertisement = if self.advertise {
             let records = self.txt_records();
-            match avahi::publish(&self.config.name, port, &records).await {
+            match avahi::publish(&self.config.name, "_airplay._tcp", port, &records).await {
                 Ok(ad) => Some(ad),
                 Err(e) => {
                     warn!("avahi advertisement disabled ({e}); is avahi-daemon running?");
