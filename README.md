@@ -178,6 +178,22 @@ Pass `--debug` (or `--log-level debug`) to log every request — useful for
 watching what a real sender sends. `RUST_LOG` still works and overrides it for
 per-module control (e.g. `RUST_LOG=openairplay2::session=trace`).
 
+### The audio device is held while the receiver runs
+
+The receiver opens its ALSA device at startup and **keeps it open for as long
+as it runs**, playing silence when nothing is streaming. That is deliberate:
+a device it has let go of is one another program can take, and then the next
+sender's stream has nowhere to play — and a card kept running never lets a DAC
+fall asleep between tracks. It also means the handover when a second sender
+takes over is seamless.
+
+The trade-off is that the receiver owns that card exclusively. On a desktop
+where the same card is also the system output, run the receiver on a card of
+its own, point it at a sound server (`--alsa-device pipewire`, or `default`)
+so the two share, or use `--no-audio` when you only want to watch the
+protocol. On a headless box — the normal case — there is nothing to share
+with.
+
 ### Hardware volume
 
 By default the receiver applies volume in software, scaling every sample by

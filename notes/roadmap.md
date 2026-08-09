@@ -233,7 +233,11 @@ so it does not get re-proposed.
 
 - **DAC standby prevention.** Keep the device open, or feed it silence, so a DAC
   does not fall asleep between tracks and swallow the first fraction of a
-  second of the next one.
+  second of the next one. *Probably already done:* since
+  plans/20260808-04-sender-takeover.md the receiver holds its ALSA device open
+  for the whole process and it plays silence while idle, which is exactly this
+  mechanism — this item survives only until someone confirms it on a DAC that
+  actually sleeps.
 - **Statistics.** Buffer occupancy, drift and underrun counts — the numbers
   needed when someone reports stuttering that cannot be reproduced — logged
   periodically, and shown in `openairplay2-tui` so they are visible while it is

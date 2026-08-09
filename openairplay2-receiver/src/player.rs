@@ -5,11 +5,14 @@
 //! should play, and it owns the device, the pacing (blocking `writei`), and
 //! the gain. The AirPlay volume arrives as an `openairplay2::Event::Volume`
 //! in dB; the binary maps it to a linear gain shared with the sink.
+//!
+//! The device itself is opened once per *process* ([`SharedOutput`]), not per
+//! stream: a closed device is a device something else can take.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_uint, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alsa::pcm::PCM;
 use alsa::Direction;
@@ -236,6 +239,13 @@ impl Default for SharedGain {
     }
 }
 
+/// What the device is opened with at startup, before any sender has said what
+/// it will send. The library's `aac_params` fixes every stream at 44.1 kHz
+/// stereo today, so this is what every stream then asks for; a stream that
+/// ever asks for something else reopens the device
+/// ([`SharedOutput::ensure`]).
+pub const STARTUP_FORMAT: (u32, u8) = (44_100, 2);
+
 /// Discards all audio — used for `--no-audio` (decode-only). Never blocks,
 /// so the pipeline runs unpaced, same as before the sink seam existed.
 pub struct NullSink;
@@ -245,18 +255,120 @@ impl AudioSink for NullSink {
     fn flush(&mut self) {}
 }
 
-/// ALSA playback sink. A device that won't open is logged and audio is
-/// discarded so the session keeps running.
+/// The process's one ALSA playback stream, shared by every stream that ever
+/// plays — including one that takes over from another
+/// (plans/20260808-04-sender-takeover.md).
 ///
-/// The PCM stream is opened once and kept **running** for the whole session:
-/// it is never dropped or restarted, because stopping and starting the stream
-/// makes many DACs mute and un-mute their analog output — an audible pop on
-/// every pause, resume and track switch (see plans/20260808-01). When there is
-/// nothing to play the device outputs silence (ALSA is configured to fill the
-/// buffer with it), and a pause/flush gets immediate silence by *rewinding*
-/// the unplayed audio rather than stopping the stream.
-pub struct AlsaSink {
+/// The PCM stream is opened **once and never closed**. Two reasons, and the
+/// second is why this outlives a session rather than just a stream:
+///
+/// - Stopping and starting the stream makes many DACs mute and un-mute their
+///   analog output — an audible pop on every pause, resume and track switch
+///   (plans/20260808-01). So it is configured never to stop: when there is
+///   nothing to play the device outputs silence (ALSA fills the buffer with
+///   it), and a pause/flush gets immediate silence by *rewinding* the
+///   unplayed audio.
+/// - Every moment the device is *closed* is a moment something else can take
+///   it. On a machine where the card is also the desktop's output, a sound
+///   server waiting to play grabs it during a session gap and the next stream
+///   start fails with `EBUSY` — observed as a stream that decoded to nowhere
+///   (issue #110). Holding the device for the life of the process removes the
+///   gap entirely: only the very first open can fail.
+///
+/// A card held open playing silence also never enters standby, so a DAC does
+/// not swallow the first fraction of a second of the next track.
+#[derive(Clone)]
+pub struct SharedOutput(Arc<Mutex<OutputState>>);
+
+struct OutputState {
+    device: String,
+    /// `None` until the first successful open. Once open it stays open for
+    /// the life of the process.
     output: Option<AlsaOutput>,
+    /// What it was opened with, so a stream wanting something else reopens.
+    format: Option<(u32, u8)>,
+    /// How many times the device was actually opened — one, in a healthy run.
+    /// Lets the tests assert that a handover does *not* reopen it.
+    opens: u32,
+}
+
+impl SharedOutput {
+    /// Name the device without touching it.
+    pub fn new(device: &str) -> SharedOutput {
+        SharedOutput(Arc::new(Mutex::new(OutputState {
+            device: device.to_string(),
+            output: None,
+            format: None,
+            opens: 0,
+        })))
+    }
+
+    /// Open the device if it is not already open, so it is held from here on.
+    /// Returns whether a usable stream exists. A failure is the caller's to
+    /// report: at startup it is a warning (the probe has said more), and at
+    /// stream time it means this stream decodes without playing.
+    pub fn ensure(&self, rate: u32, channels: u8) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        // Already open with the format this stream wants: nothing to do —
+        // this is the takeover and back-to-back-session path.
+        if state.output.is_some() && state.format == Some((rate, channels)) {
+            return Ok(());
+        }
+        if state.output.is_some() {
+            // Today every stream is 44.1 kHz stereo (the library's
+            // `aac_params` fixes it), so this is unreachable until format
+            // negotiation lands; reopening is the honest thing to do then.
+            warn!(
+                "player: stream wants {rate} Hz {channels}ch, reopening ALSA \
+                 (was {:?})",
+                state.format
+            );
+            state.output = None;
+        }
+        let out = AlsaOutput::open(&state.device, rate, channels)?;
+        state.opens += 1;
+        debug!(
+            "player: ALSA \"{}\" {rate} Hz {channels}ch (open #{})",
+            state.device, state.opens
+        );
+        state.output = Some(out);
+        state.format = Some((rate, channels));
+        Ok(())
+    }
+
+    /// Write samples, blocking to pace playback. Nothing happens if the
+    /// device never opened.
+    fn write(&self, samples: &[i16]) {
+        let mut state = self.0.lock().unwrap();
+        if let Some(out) = state.output.as_mut() {
+            out.write(samples);
+        }
+    }
+
+    /// Discard the buffered-but-unplayed audio — immediate silence, without
+    /// stopping the stream.
+    fn discard(&self) {
+        let mut state = self.0.lock().unwrap();
+        if let Some(out) = state.output.as_mut() {
+            out.discard();
+        }
+    }
+
+    /// How many times the device has been opened (tests).
+    #[cfg(test)]
+    fn opens(&self) -> u32 {
+        self.0.lock().unwrap().opens
+    }
+}
+
+/// One stream's view of the shared device: the per-stream volume, fade-in and
+/// scratch buffer. Dropping it discards whatever it had queued but leaves the
+/// device open for the next stream.
+pub struct AlsaSink {
+    output: SharedOutput,
+    /// False when the device could not be opened: writes are discarded and
+    /// the stream decodes to nowhere, as before.
+    playable: bool,
     gain: SharedGain,
     /// Gain-scaled copy of the incoming packet.
     scratch: Vec<i16>,
@@ -268,19 +380,19 @@ pub struct AlsaSink {
 }
 
 impl AlsaSink {
-    pub fn open(device: &str, rate: u32, channels: u8, gain: SharedGain) -> AlsaSink {
-        let output = match AlsaOutput::open(device, rate, channels) {
-            Ok(out) => {
-                debug!("player: ALSA \"{device}\" {rate} Hz {channels}ch");
-                Some(out)
-            }
+    /// Attach a new stream to the shared device, opening it if this is the
+    /// first use (a startup probe that only warned leaves it closed).
+    pub fn new(output: SharedOutput, rate: u32, channels: u8, gain: SharedGain) -> AlsaSink {
+        let playable = match output.ensure(rate, channels) {
+            Ok(()) => true,
             Err(e) => {
                 warn!("player: cannot open ALSA ({e}); decode-only");
-                None
+                false
             }
         };
         AlsaSink {
             output,
+            playable,
             gain,
             scratch: Vec::new(),
             channels: channels as usize,
@@ -292,9 +404,9 @@ impl AlsaSink {
 
 impl AudioSink for AlsaSink {
     fn write(&mut self, pcm: &[i16]) {
-        let Some(out) = self.output.as_mut() else {
-            return; // device failed to open → discard
-        };
+        if !self.playable {
+            return;
+        }
         self.scratch.clear();
         self.scratch.extend_from_slice(pcm);
         // Apply the current volume (live) just before playback.
@@ -309,15 +421,24 @@ impl AudioSink for AlsaSink {
                 self.fade_pos,
             );
         }
-        out.write(&self.scratch);
+        self.output.write(&self.scratch);
     }
 
     fn flush(&mut self) {
         // Immediate silence without stopping the stream: rewind the unplayed
         // audio (ALSA fills the gap with silence). Fade the next audio in.
         self.fade_pos = 0;
-        if let Some(out) = self.output.as_mut() {
-            out.discard();
+        self.output.discard();
+    }
+}
+
+impl Drop for AlsaSink {
+    fn drop(&mut self) {
+        // The stream is over (ended, or taken over by another sender): drop
+        // what it had queued so the next one does not begin with the tail of
+        // the last, but leave the device open — that is the whole point.
+        if self.playable {
+            self.output.discard();
         }
     }
 }
@@ -562,6 +683,43 @@ mod tests {
         let pos = fade_in_progress(&mut c3, 2, 6, pos);
         assert_eq!(pos, 6);
         assert!(c3.iter().all(|&x| x == 1000));
+    }
+
+    /// A takeover, at the device level: one stream plays, its sink goes away,
+    /// the next stream's sink plays — through the *same* open device. If this
+    /// ever reopens, the gap is exactly what a desktop sound server grabs
+    /// (#110), so the open count is the assertion.
+    #[test]
+    fn a_handover_reuses_the_one_open_device() {
+        // ALSA's "null" device is always present and pure software.
+        let output = SharedOutput::new("null");
+        if output.ensure(44_100, 2).is_err() {
+            return; // no ALSA config at all in this environment
+        }
+        assert_eq!(output.opens(), 1);
+
+        let gain = SharedGain::new();
+        let mut first = AlsaSink::new(output.clone(), 44_100, 2, gain.clone());
+        first.write(&vec![0i16; 4096]);
+        // The interrupted stream's sink is dropped — device stays open.
+        drop(first);
+        assert_eq!(output.opens(), 1, "a session ending must not close it");
+
+        let mut second = AlsaSink::new(output.clone(), 44_100, 2, gain);
+        second.write(&vec![0i16; 4096]);
+        second.flush();
+        second.write(&vec![0i16; 4096]);
+        assert_eq!(output.opens(), 1, "the next stream must reuse it");
+    }
+
+    #[test]
+    fn a_sink_for_an_unopenable_device_discards() {
+        // A device that cannot be opened: the stream decodes to nowhere
+        // rather than failing, as before the device became persistent.
+        let output = SharedOutput::new("no-such-alsa-device");
+        let mut sink = AlsaSink::new(output, 44_100, 2, SharedGain::new());
+        sink.write(&[0i16; 64]); // must not panic
+        sink.flush();
     }
 
     #[test]

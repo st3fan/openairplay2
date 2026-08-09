@@ -12,7 +12,7 @@ mod mixer;
 mod player;
 mod tui;
 
-use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
+use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain, SharedOutput};
 use openairplay2::{AudioSink, Event, Receiver};
 
 const DEFAULT_ALSA_DEVICE: &str = "default";
@@ -678,10 +678,30 @@ async fn main() -> ExitCode {
         None => None,
     };
     let sink_gain = gain.clone();
-    let device = alsa_device;
+    // One ALSA device for the life of the process, shared by every stream —
+    // including one that takes over from another. Opened now rather than at
+    // the first stream: a device we have not opened is one a desktop sound
+    // server can take before a sender ever arrives, and then the first
+    // stream would decode to nowhere (#110). It plays silence while idle.
+    let output = alsa_device.as_deref().map(SharedOutput::new);
+    if let Some(output) = &output {
+        let (rate, channels) = player::STARTUP_FORMAT;
+        match output.ensure(rate, channels) {
+            // Held from here until the process exits.
+            Ok(()) => info!("audio device held open (silence while idle)"),
+            // The probe above already classified the fatal cases, so this is
+            // "busy right now": try again when a stream starts.
+            Err(e) => warn!("cannot hold the audio device yet ({e})"),
+        }
+    }
     let sink_factory = move |rate: u32, channels: u8| -> Box<dyn AudioSink> {
-        match &device {
-            Some(dev) => Box::new(AlsaSink::open(dev, rate, channels, sink_gain.clone())),
+        match &output {
+            Some(output) => Box::new(AlsaSink::new(
+                output.clone(),
+                rate,
+                channels,
+                sink_gain.clone(),
+            )),
             None => Box::new(NullSink),
         }
     };
