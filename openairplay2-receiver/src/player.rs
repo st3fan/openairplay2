@@ -465,6 +465,47 @@ fn check(rc: c_int, what: &str) -> Result<(), String> {
 struct AlsaOutput {
     pcm: *mut alsa_sys::snd_pcm_t,
     channels: usize,
+    /// The ring's size in frames, read back after `hw_params`. The reference
+    /// for how far the two pointers have drifted apart: `avail` above this is
+    /// only possible when the application pointer has fallen *behind* the
+    /// hardware pointer (see [`AlsaOutput::pointers`]).
+    buffer_size: alsa_sys::snd_pcm_uframes_t,
+    /// Frames per second, for reporting drift in seconds.
+    rate: u32,
+    /// Set by [`AlsaOutput::discard`]: the next write ends a silence, and is
+    /// where a long pause's damage would show up.
+    report_next_write: bool,
+}
+
+/// A reading of where the stream's two pointers are, for the log.
+///
+/// Playback `avail` is the ring's free space: `buffer_size − (appl − hw)`. In
+/// a healthy stream it stays within `0..=buffer_size`. The stream here is
+/// configured never to stop (`stop_threshold = boundary`), so when nothing is
+/// written the hardware pointer keeps advancing through the silence fill while
+/// the application pointer stands still — `appl − hw` goes *negative* and
+/// `avail` climbs past `buffer_size`. The excess is exactly how far behind the
+/// application pointer has fallen, which is what makes a subsequent write land
+/// in the past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pointers {
+    /// Free ring space in frames, as ALSA reports it (negative = an error code).
+    avail: i64,
+    /// Frames of audio still to be heard, as ALSA reports it.
+    delay: i64,
+    /// How far the application pointer is behind the hardware pointer.
+    behind: u64,
+}
+
+/// How far the application pointer has fallen behind the hardware pointer,
+/// given a playback `avail` and the ring size: the amount `avail` overshoots
+/// the buffer. Zero for any healthy reading (including a negative `avail`,
+/// which is an error code, not a measurement).
+fn frames_behind(avail: i64, buffer_size: u64) -> u64 {
+    if avail <= 0 {
+        return 0;
+    }
+    (avail as u64).saturating_sub(buffer_size)
 }
 
 // The player thread owns the sink and is the only user of the handle.
@@ -587,8 +628,62 @@ impl AlsaOutput {
             Ok(AlsaOutput {
                 pcm,
                 channels: channels as usize,
+                buffer_size,
+                rate,
+                report_next_write: false,
             })
         }
+    }
+
+    /// Read where the two pointers are. Cheap enough to call at a transition
+    /// (pause, and the first write after one), not per chunk.
+    fn pointers(&self) -> Pointers {
+        use alsa_sys as a;
+        unsafe {
+            let avail = a::snd_pcm_avail(self.pcm) as i64;
+            let mut delay: a::snd_pcm_sframes_t = 0;
+            if a::snd_pcm_delay(self.pcm, &mut delay) < 0 {
+                delay = 0;
+            }
+            Pointers {
+                avail,
+                delay: delay as i64,
+                // `snd_pcm_uframes_t` is `c_ulong`: already u64 here, but 32
+                // bits on armhf (which this project ships a .deb for), so the
+                // widening is real there and a no-op only on this target.
+                #[allow(clippy::useless_conversion)]
+                behind: frames_behind(avail, u64::from(self.buffer_size)),
+            }
+        }
+    }
+
+    /// The PCM state (`RUNNING`, `XRUN`, …) as ALSA names it.
+    fn state_name(&self) -> String {
+        unsafe {
+            let name = alsa_sys::snd_pcm_state_name(alsa_sys::snd_pcm_state(self.pcm));
+            if name.is_null() {
+                return "?".into();
+            }
+            CStr::from_ptr(name).to_string_lossy().into_owned()
+        }
+    }
+
+    /// Log where the pointers are at a transition — `what` names it.
+    ///
+    /// The number that matters is `behind`: it is zero for the whole of a
+    /// healthy session, and a long pause is the one thing known to drive it
+    /// up (see plans/20260809-01-long-pause-garbled-resume.md).
+    fn log_pointers(&self, what: &str) {
+        let p = self.pointers();
+        let behind_secs = p.behind as f32 / self.rate.max(1) as f32;
+        debug!(
+            "player: ALSA {what}: state={} avail={} delay={} buffer={} behind={} frames ({behind_secs:.1}s)",
+            self.state_name(),
+            p.avail,
+            p.delay,
+            self.buffer_size,
+            p.behind,
+        );
     }
 
     /// Write all interleaved samples, blocking to pace playback. The stream is
@@ -596,6 +691,10 @@ impl AlsaOutput {
     /// recovered; underruns don't stop it (stop-threshold = boundary).
     fn write(&mut self, samples: &[i16]) {
         use alsa_sys as a;
+        if self.report_next_write {
+            self.report_next_write = false;
+            self.log_pointers("first write after silence");
+        }
         let mut off = 0usize;
         unsafe {
             while off < samples.len() {
@@ -628,6 +727,10 @@ impl AlsaOutput {
                 let _ = a::snd_pcm_rewind(self.pcm, rewindable as a::snd_pcm_uframes_t);
             }
         }
+        // A pause starts here and the next write ends it: log both ends, so a
+        // capture shows what the silence in between did to the pointers.
+        self.log_pointers("after discard");
+        self.report_next_write = true;
     }
 }
 
@@ -734,6 +837,28 @@ mod tests {
         out.write(&vec![0i16; 4096]);
         out.discard();
         out.write(&vec![0i16; 4096]);
+        // The pointer reading is part of the same path (it runs on every
+        // discard and on the first write after one), so exercise it here too:
+        // a real device must answer without erroring the stream.
+        let _ = out.pointers();
+        assert!(!out.state_name().is_empty());
+    }
+
+    #[test]
+    fn frames_behind_is_the_avails_overshoot_of_the_ring() {
+        let buffer = 22_050u64; // ~0.5 s at 44.1 kHz
+
+        // Healthy readings: the ring is somewhere between full and empty.
+        assert_eq!(frames_behind(0, buffer), 0); // full
+        assert_eq!(frames_behind(11_025, buffer), 0); // half free
+        assert_eq!(frames_behind(22_050, buffer), 0); // empty, exactly
+
+        // Overshoot: the hardware pointer has run past the application
+        // pointer by the excess — 10 s of it after a long silence.
+        assert_eq!(frames_behind(22_050 + 441_000, buffer), 441_000);
+
+        // A negative `avail` is an error code, not a measurement.
+        assert_eq!(frames_behind(-libc::EPIPE as i64, buffer), 0);
     }
 
     #[test]
