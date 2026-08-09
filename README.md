@@ -214,7 +214,17 @@ build it from this repository:
 cargo build --release -p openairplay2-tui
 ```
 
-Then start the receiver with the endpoint on, and the display against it:
+On the machine the receiver runs on, that is the whole setup — the receiver
+serves a local socket by default and the display finds it on its own, whether
+the receiver is the packaged service or was started by hand, by any local
+user:
+
+```sh
+openairplay2-tui
+```
+
+For a display on **another machine**, start the receiver with the TCP
+endpoint on and point the display at it:
 
 ```sh
 openairplay2-receiver --tui-listen 127.0.0.1:7392
@@ -242,13 +252,15 @@ it).
 
 Because it talks to the receiver over a WebSocket rather than linking it, the
 display has no ALSA dependency and runs anywhere, macOS included: leave the
-receiver on a Pi and watch it from a laptop. The endpoint carries track
-metadata and cover art, so keep it on loopback (or behind an SSH tunnel) unless
-you mean otherwise; there is no authentication.
+receiver on a Pi and watch it from a laptop. On-device, the Unix socket's file
+permissions are the access control; the TCP endpoint carries track metadata
+and cover art, so keep it on loopback (or behind an SSH tunnel) unless you
+mean otherwise, and give it a password (`--tui-password`) if others can reach
+it.
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--connect ws://HOST:PORT` | Receiver endpoint to watch | `ws://127.0.0.1:7392` |
+| `--connect ENDPOINT` | Receiver endpoint to watch: a `ws://HOST:PORT` URL or a socket path | the receiver's default sockets, then `ws://127.0.0.1:7392` |
 | `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
 | `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
 | `--password PASS` | Password for a receiver whose endpoint requires one; falls back to `OPENAIRPLAY2_TUI_PASSWORD`, which unlike a flag is not visible in `ps` | none |

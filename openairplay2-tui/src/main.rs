@@ -1,10 +1,12 @@
 //! A full-screen now-playing display for an `openairplay2-receiver`.
 //!
-//! The receiver publishes what it is playing on a WebSocket
-//! (`--tui-listen`); this connects to it and draws the current track,
-//! its cover art, and the stream's details. It is a read-only view: it never
-//! sends the receiver anything, and it can be started, stopped and restarted
-//! independently of it.
+//! The receiver publishes what it is playing on a WebSocket — a local Unix
+//! socket by default, TCP with `--tui-listen` — and this connects to it and
+//! draws the current track, its cover art, and the stream's details. On the
+//! machine the receiver runs on, no flags are needed: the default socket is
+//! found on its own. It is a read-only view: it never sends the receiver
+//! anything, and it can be started, stopped and restarted independently of
+//! it.
 
 use std::process::ExitCode;
 
@@ -14,10 +16,8 @@ mod client;
 mod images;
 mod tui;
 
+use crate::client::Endpoint;
 use crate::images::{Graphics, Multiplexer, Passthrough, Protocol};
-
-/// Where a receiver serves its now-playing endpoint by default.
-const DEFAULT_ENDPOINT: &str = "ws://127.0.0.1:7392";
 
 /// How long the Kitty probe waits for an answer. Long enough for a round trip
 /// (through tmux too, which costs microseconds), short enough that a terminal
@@ -26,7 +26,9 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100)
 
 #[derive(Debug, PartialEq)]
 struct Args {
-    endpoint: String,
+    /// `--connect`: a `ws://` URL or a socket path. `None` means look for a
+    /// local receiver (see [`client::default_endpoints`]).
+    endpoint: Option<String>,
     /// Forced terminal-graphics protocol, or `None` to detect one.
     images: Option<Protocol>,
     /// Where log output goes. The display owns the screen, so logs are
@@ -52,9 +54,13 @@ openairplay2-tui — full-screen now-playing display for an openairplay2 receive
 usage: openairplay2-tui [options]
 
 options:
-  --connect ws://HOST:PORT  the receiver's now-playing endpoint — start the
-                            receiver with --tui-listen to have one
-                            (default ws://127.0.0.1:7392)
+  --connect ENDPOINT        the receiver's now-playing endpoint: a
+                            ws://HOST:PORT URL (the receiver's --tui-listen)
+                            or the path of its local socket (--tui-socket).
+                            By default a local receiver is found on its own:
+                            $XDG_RUNTIME_DIR/openairplay2/tui.sock, then
+                            /run/openairplay2/tui.sock, then
+                            ws://127.0.0.1:7392
   --images auto|kitty|iterm2|none
                             terminal-graphics protocol for the cover art:
                             auto probes the terminal, none is text-only
@@ -73,7 +79,7 @@ options:
 /// Errors are the message alone; `main` appends the usage line.
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     let mut args = Args {
-        endpoint: DEFAULT_ENDPOINT.to_string(),
+        endpoint: None,
         images: None,
         log_file: None,
         password: None,
@@ -83,7 +89,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--connect" => args.endpoint = value("--connect", &mut it)?,
+            "--connect" => args.endpoint = Some(value("--connect", &mut it)?),
             "--images" => {
                 let v = value("--images", &mut it)?;
                 args.images = match v.as_str() {
@@ -183,9 +189,25 @@ async fn main() -> ExitCode {
         }
     }
 
+    // The endpoints to try: an explicit --connect alone, or the local
+    // candidates a zero-config receiver serves by default. The label is
+    // what the screen shows until (and about) a connection.
+    let endpoints = match &args.endpoint {
+        Some(value) => vec![Endpoint::parse(value)],
+        None => client::default_endpoints(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()),
+    };
+    let label = match &args.endpoint {
+        Some(value) => value.clone(),
+        None => "local receiver".to_string(),
+    };
+
     info!(
         "connecting to {}, terminal graphics: {images}",
-        args.endpoint
+        endpoints
+            .iter()
+            .map(Endpoint::label)
+            .collect::<Vec<_>>()
+            .join(" or ")
     );
 
     // The flag wins; the variable is the ps-safe way to hand it over.
@@ -209,9 +231,9 @@ async fn main() -> ExitCode {
     }
 
     let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(client::run(args.endpoint.clone(), password, updates_tx));
+    tokio::spawn(client::run(endpoints, password, updates_tx));
 
-    match tui::run(updates_rx, args.endpoint, images).await {
+    match tui::run(updates_rx, label, images).await {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("display error: {e}");
@@ -238,7 +260,8 @@ mod tests {
     #[test]
     fn no_arguments_yields_the_defaults() {
         let args = run_args(&[]);
-        assert_eq!(args.endpoint, DEFAULT_ENDPOINT);
+        // No endpoint: the client searches the local candidates.
+        assert_eq!(args.endpoint, None);
         assert_eq!(args.images, None);
         assert_eq!(args.log_file, None);
     }
@@ -253,9 +276,19 @@ mod tests {
             "--log-file",
             "/tmp/tui.log",
         ]);
-        assert_eq!(args.endpoint, "ws://10.0.0.5:7392");
+        assert_eq!(args.endpoint.as_deref(), Some("ws://10.0.0.5:7392"));
         assert_eq!(args.images, Some(Protocol::Kitty));
         assert_eq!(args.log_file.as_deref(), Some("/tmp/tui.log"));
+    }
+
+    #[test]
+    fn connect_takes_a_socket_path_too() {
+        assert_eq!(
+            run_args(&["--connect", "/run/openairplay2/tui.sock"])
+                .endpoint
+                .as_deref(),
+            Some("/run/openairplay2/tui.sock")
+        );
     }
 
     #[test]
