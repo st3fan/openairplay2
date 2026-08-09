@@ -249,16 +249,16 @@ Three distinct jobs, each in exactly one layer:
 Each phase is one PR stacked on the previous, buildable and green on its own;
 the wire behavior is identical after every phase.
 
-1. **`commands-foundations`** — `errors.rs`, `types.rs` (`VolumeDb`),
-   the `validator` dependency, and `handlers/` with the dispatch table.
-   The stateless endpoints move first (`info.rs`, `fp_setup.rs`,
-   `feedback.rs`, `pair_pin_start.rs`); `dispatch` disappears from
-   `server.rs`; `dispatch_session` survives temporarily behind the new
-   `handlers::dispatch`.
+1. **`commands-foundations`** — `errors.rs` and `handlers/` with the
+   dispatch table. The stateless endpoints move first (`info.rs`,
+   `fp_setup.rs`, `feedback.rs`, `pair_pin_start.rs`); `dispatch`
+   disappears from `server.rs`; `dispatch_session` survives temporarily
+   behind the new `handlers::dispatch`.
 2. **`commands-parameters`** — the SET_PARAMETER/GET_PARAMETER family:
    `set_volume`, `set_progress`, `set_metadata`, `set_artwork`,
    `get_volume` commands; `set_parameter.rs`/`get_parameter.rs` handlers
    with the content-type dispatch and the stated always-200 policy;
+   `types.rs` + the `validator` dependency land here (see decisions), and
    `VolumeDb` replaces `sanitize_volume`; the volume/progress/metadata
    session tests migrate.
 3. **`commands-transport`** — `set_rate_anchor`, `flush_buffered`,
@@ -268,3 +268,27 @@ the wire behavior is identical after every phase.
    `setup_timing`/`setup_streams` commands and the `setup.rs` handler;
    `pair_setup.rs`; `session.rs` reduced to state + pipeline; CLAUDE.md
    updated; the full hardware check.
+
+## Decisions recorded during implementation
+
+- **`CommandError` grows a variant per phase** instead of arriving complete
+  in phase 1: CI's `-D warnings` flags never-constructed variants, and the
+  reference projects' `#[allow(dead_code)]` idiom is exactly what a fresh
+  structure shouldn't need. Consequently `types.rs` and the `validator`
+  dependency land in phase 2, with their first user, not in phase 1.
+- **One deliberate wire-visible change**, the only one in the stack: a
+  `SETUP` whose socket *bind* fails now answers `500 Internal Server Error`
+  (`CommandError::Io`) where the old code folded it into the same 400 as a
+  parse failure. Parse failures keep their 400. Unobservable in practice —
+  binding an ephemeral port does not fail — and 400 for a receiver-side
+  fault was simply wrong.
+- **Commands reach session state through `pub(crate)` fields** on `Session`
+  rather than accessor methods — the commands *are* the business layer over
+  that state, exactly as tqs commands own their SQL; hiding the fields
+  behind getters would just reintroduce the old `Session` method surface
+  under new names.
+- **`handle_pair_setup` returns `(Response, Option<[u8; 64]>)`** — the SRP
+  shared secret rides back to the connection loop, which installs the
+  cipher after writing the plaintext M4 response. The takeover claim at
+  `SETUP` likewise stays in the loop: both are connection-level acts, which
+  is the boundary between `server.rs` and `handlers/`.
