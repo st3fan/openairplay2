@@ -1,5 +1,11 @@
 # Sender takeover: last stream wins
 
+> **Done (2026-08-09).** Implemented in #120 (the library's active-session
+> slot) and #122 (the receiver's process-lifetime ALSA device), and
+> **verified on hardware** — a real sender takeover works, and the
+> `EBUSY` → decode-only failure it was also aimed at is gone (#110 closed;
+> what remains of it is the first open at process start, #123).
+
 Playing from a second sender while a first is streaming should **interrupt
 the first and take over**. Today it doesn't: play from an iPhone, then play
 from a Mac, and the Mac does not take over.
@@ -222,3 +228,26 @@ Consequences worth naming:
    sinks as handles onto it, tests; update #110 to its narrowed scope, and
    note the DAC-standby side effect on the roadmap item once confirmed on
    hardware.
+
+## Outcome
+
+Met. Both phases landed and behave as intended on hardware.
+
+Two things the work turned up that the plan did not anticipate:
+
+- **The `EBUSY` failure reproduced itself during development**, which is how
+  we know the persistent device matters: pointing the new build at the
+  desktop's own card found PipeWire already holding it *at startup*, before
+  any sender existed. The startup hold is therefore best-effort — it warns
+  and retries at the first stream — leaving exactly one moment unprotected.
+  That, and whether an operator should be able to turn the hold off, is
+  #123.
+- **The library needed tokio's `macros` feature declared.** `tokio::select!`
+  in the connection loop compiled locally through workspace feature
+  unification but could not package standalone; CI's
+  `cargo package --workspace` gate (from #74) caught it before release, which
+  is precisely the job that gate was added for.
+
+The DAC-standby side effect is recorded on the roadmap item rather than
+retiring it: a card held open playing silence is the mechanism that item
+asks for, but nothing here was tested against a DAC that actually sleeps.
