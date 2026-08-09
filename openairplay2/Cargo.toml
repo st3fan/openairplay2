@@ -26,6 +26,7 @@ num-bigint = "0.4"
 plist = "1"
 rand = "0.8"
 sha2 = "0.10"
+thiserror = "2"
 # macros: `tokio::select!` in the control-connection loop, which races the
 # next request against a takeover by another sender. (Without it the crate
 # builds here through workspace feature unification but fails to package

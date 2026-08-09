@@ -1,8 +1,8 @@
-//! AirPlay 2 control server: accept loop and request dispatch.
-//!
-//! Milestone 2: `GET /info`, transient `POST /pair-setup`, and the switch to
-//! the encrypted channel once pairing completes. Everything else is logged and
-//! `501`'d so later milestones can see the real request sequence.
+//! AirPlay 2 control server: the accept loop and the per-connection concerns
+//! that live *below* request dispatch — the handshake timeout, the cipher
+//! install after `pair-setup`, the `SETUP` takeover claim, and the headers
+//! every response carries. Requests themselves are routed by
+//! [`crate::handlers::dispatch`].
 
 use std::io;
 use std::net::SocketAddr;
@@ -30,10 +30,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 use crate::cipher::control_channel;
 use crate::crypto_stream::ControlConnection;
 use crate::events::EventSender;
-use crate::fairplay;
+use crate::handlers::{self, PAIRING_CONTENT_TYPE};
 use crate::http::{Request, Response};
 use crate::identity::Identity;
-use crate::info::info_plist;
 use crate::pairing::{Outcome, PairSetup};
 use crate::session::Session;
 use crate::sink::SinkFactory;
@@ -41,9 +40,6 @@ use crate::takeover::{next_connection_id, ActiveSlot};
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
-pub const INFO_CONTENT_TYPE: &str = "application/x-apple-binary-plist";
-pub const PAIRING_CONTENT_TYPE: &str = "application/octet-stream";
-pub const PARAMETERS_CONTENT_TYPE: &str = "text/parameters";
 
 pub struct Context {
     pub config: Config,
@@ -188,19 +184,6 @@ async fn handle_connection(
             continue;
         }
 
-        // `pair-pin-start`: a sender that sees status-flag bit 7 (password
-        // required) asks the receiver to make the code available before
-        // `pair-setup`. Answer an empty 200 (shairport does the same); the
-        // actual code is the configured password, which the user types on
-        // the sender, and is used as the SRP password in the `pair-setup`
-        // that follows.
-        if request.method == "POST" && request.target == "/pair-pin-start" {
-            debug!("pair-pin-start: asking the sender for the password");
-            let response = finalize(Response::ok(&request.protocol), &request);
-            conn.write_response(&response).await?;
-            continue;
-        }
-
         // A `SETUP` is a sender saying it intends to play, and AirPlay 2 is
         // last-stream-wins: take the session from whoever holds it. This is
         // the first SETUP (phase 1, ports only) in the normal sequence, so
@@ -214,10 +197,7 @@ async fn handle_connection(
             }
         }
 
-        let response = match dispatch_session(&mut session, &request).await {
-            Some(response) => response,
-            None => dispatch(&request, &context),
-        };
+        let response = handlers::dispatch(&request, &mut session, &context).await;
         let response = finalize(response, &request);
         debug!("[{peer}] -> {} {}", request.method, response.status());
         conn.write_response(&response).await?;
@@ -242,78 +222,6 @@ fn log_request(peer: &SocketAddr, request: &Request, encrypted: bool) {
             request.body.len(),
             hex::encode(&request.body)
         );
-    }
-}
-
-/// Handle the streaming-session methods (SETUP and the control verbs) that
-/// operate on the per-connection [`Session`]. Returns `None` if `request`
-/// isn't one of them, so the caller can fall back to the stateless dispatch.
-async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Response> {
-    let proto = &request.protocol;
-    match request.method.as_str() {
-        "SETUP" => Some(match session.handle_setup(&request.body).await {
-            Ok(body) => Response::ok(proto).body(INFO_CONTENT_TYPE, body),
-            Err(e) => {
-                warn!("SETUP failed: {e}");
-                Response::new(proto, 400, "Bad Request")
-            }
-        }),
-        // A sender queries the current volume during setup and expects a
-        // `text/parameters` body back; an empty response makes it give up.
-        "GET_PARAMETER" => {
-            let body = session.get_parameter(&request.body);
-            Some(Response::ok(proto).body(PARAMETERS_CONTENT_TYPE, body))
-        }
-        "SET_PARAMETER" => {
-            session.set_parameter(request.headers.get("Content-Type"), &request.body);
-            Some(Response::ok(proto))
-        }
-        // Transport control: play/pause rate and the RTP anchor.
-        "SETRATEANCHORTIME" => {
-            session.set_rate_anchor(&request.body);
-            Some(Response::ok(proto))
-        }
-        // Seek/skip: drop buffered audio.
-        "FLUSHBUFFERED" => {
-            session.flush(&request.body);
-            Some(Response::ok(proto))
-        }
-        // The sender is done with the stream.
-        "TEARDOWN" => {
-            session.teardown();
-            Some(Response::ok(proto))
-        }
-        // Other session control verbs: acknowledge so the sender proceeds.
-        "RECORD" | "SETPEERS" | "SETPEERSX" => {
-            session.ack(&request.method);
-            Some(Response::ok(proto))
-        }
-        _ => None,
-    }
-}
-
-fn dispatch(request: &Request, context: &Context) -> Response {
-    match (request.method.as_str(), request.target.as_str()) {
-        ("GET", "/info") => Response::ok(&request.protocol).body(
-            INFO_CONTENT_TYPE,
-            info_plist(&context.config, &context.identity),
-        ),
-        ("POST", "/fp-setup") => match fairplay::fp_setup(&request.body) {
-            Some(reply) => Response::ok(&request.protocol).body(PAIRING_CONTENT_TYPE, reply),
-            None => {
-                warn!("fp-setup: malformed FairPlay request");
-                Response::new(&request.protocol, 400, "Bad Request")
-            }
-        },
-        // Keep-alive / control methods a sender interleaves; acknowledge so the
-        // session survives long enough to reach SETUP.
-        ("POST", "/feedback") | ("POST", "/command") | ("POST", "/audioMode") => {
-            Response::ok(&request.protocol)
-        }
-        (method, target) => {
-            warn!("{method} {target} not implemented yet");
-            Response::new(&request.protocol, 501, "Not Implemented")
-        }
     }
 }
 
