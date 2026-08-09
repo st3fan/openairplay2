@@ -38,13 +38,14 @@ Neither is a behavior anyone chose.
   (2026-08-08).** Stefan tested against a HomePod: iPhone playing to it,
   then playing something different from the Mac — **the Mac takes over, the
   iPhone's audio stops, the iPhone's player sets itself to *paused*, and
-  the iPhone is no longer connected to that AirPlay receiver** (its output
-  route reverts away from the HomePod). The interrupted sender ends in a
-  clean paused-and-disconnected state, not an error; losing the receiver is
-  a normal event a sender is built for. That end state is the reference
+  the iPhone disconnects from the AirPlay receiver entirely**: its output
+  route reverts to the phone itself, and pressing play afterwards plays on
+  the iPhone's own speaker, not the HomePod. The interrupted sender ends in
+  a clean paused-and-disconnected state, not an error; losing the receiver
+  is a normal event a sender is built for. That end state is the reference
   this plan implements: our takeover closes the old connection, and the
   sender's own reaction to that is what produces the pause and the route
-  change.
+  change — it does not try to reclaim the receiver.
 
 Also observed in shairport-sync, and deliberately **not** part of this plan:
 while a session is active it mirrors the sender's `groupUUID` as its own
