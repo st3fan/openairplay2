@@ -36,6 +36,15 @@ pub fn session() -> (Session, UnboundedReceiver<Event>) {
     (Session::new(local(), peer(), factory, tx), rx)
 }
 
+/// Encode a plist dictionary the way a sender's body would arrive.
+pub fn plist_bytes(dict: &Dictionary) -> Vec<u8> {
+    let mut body = Vec::new();
+    Value::Dictionary(dict.clone())
+        .to_writer_binary(&mut body)
+        .unwrap();
+    body
+}
+
 /// Run a phase-2 SETUP for a buffered stream, starting the session.
 pub async fn start_stream(session: &mut Session) {
     let mut stream = Dictionary::new();
@@ -46,9 +55,7 @@ pub async fn start_stream(session: &mut Session) {
         "streams".into(),
         Value::Array(vec![Value::Dictionary(stream)]),
     );
-    let mut body = Vec::new();
-    Value::Dictionary(dict).to_writer_binary(&mut body).unwrap();
-    session.handle_setup(&body).await.unwrap();
+    session.handle_setup(&plist_bytes(&dict)).await.unwrap();
 }
 
 /// Build a request the way the wire would deliver it, through the real head

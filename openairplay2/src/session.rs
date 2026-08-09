@@ -294,45 +294,6 @@ impl Session {
         Ok(port)
     }
 
-    /// Handle `SETRATEANCHORTIME`: the sender's play/pause rate (and the RTP
-    /// anchor, which we log). The network-time fields matter only with a PTP
-    /// clock, so we ignore them (see notes/milestone-6.md). `rate=0` engages
-    /// the pause gate — the player *holds* queued and arriving audio (a
-    /// flush-less pause gives no licence to drop anything; the sender expects
-    /// it all to still be buffered at resume) — and `rate=1` releases it,
-    /// playing the held audio from where playback stopped.
-    pub fn set_rate_anchor(&mut self, body: &[u8]) {
-        let Some((rate, rtp)) = parse_rate_anchor(body) else {
-            warn!("SETRATEANCHORTIME: could not parse body");
-            return;
-        };
-        debug!("SETRATEANCHORTIME rate={rate} rtpTime={rtp}");
-        if let Some(ctrl) = &self.player_control {
-            ctrl.set_paused(rate == 0);
-        }
-        self.send_event(Event::Paused(rate == 0));
-    }
-
-    /// Handle `FLUSHBUFFERED` (seek/skip): discard exactly the audio the
-    /// sender names — queued/held packets with a sequence stamp below
-    /// `flushUntilSeq`, plus the stale audio still arriving over TCP (the
-    /// sender buffers far ahead) — while retaining everything at or after
-    /// the boundary. A body without a boundary discards all queued audio.
-    pub fn flush(&mut self, body: &[u8]) {
-        let boundary = parse_flush_until_seq(body);
-        match boundary {
-            Some(seq) => {
-                self.flush_until_seq.store(seq, Ordering::Relaxed);
-                debug!("FLUSHBUFFERED until seq {seq}");
-            }
-            None => debug!("FLUSHBUFFERED (no seq boundary)"),
-        }
-        if let Some(ctrl) = &self.player_control {
-            ctrl.flush(boundary);
-        }
-        self.send_event(Event::Flushed);
-    }
-
     /// Deliver an event the host expects only inside a session; before
     /// `SessionStarted` it is latched (latest wins) and replayed once the
     /// session starts.
@@ -346,19 +307,8 @@ impl Session {
         }
     }
 
-    /// Acknowledge a session control method that needs no body.
-    pub fn ack(&self, method: &str) {
-        debug!("ack {method}");
-    }
-
-    /// Handle `TEARDOWN`: the sender is done with the stream.
-    pub fn teardown(&mut self) {
-        debug!("ack TEARDOWN");
-        self.end_session();
-    }
-
     /// Report `SessionEnded` once per started session.
-    fn end_session(&mut self) {
+    pub(crate) fn end_session(&mut self) {
         if self.session_active {
             self.session_active = false;
             self.send_event(Event::SessionEnded);
@@ -433,32 +383,6 @@ async fn audio_channel(socket: UdpSocket, label: &'static str) {
 /// negotiated yet, so default to that.
 pub(crate) fn aac_params(_audio_format: Option<u64>) -> (u32, u8) {
     (44100, 2)
-}
-
-/// Parse a `SETRATEANCHORTIME` plist into `(rate, rtpTime)`. `rate` is 0
-/// (pause) or 1 (play); `rtpTime` is the anchor timestamp.
-fn parse_rate_anchor(body: &[u8]) -> Option<(u64, u64)> {
-    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
-    let dict = value.as_dictionary()?;
-    let rate = dict.get("rate").and_then(int_field)?;
-    let rtp = dict.get("rtpTime").and_then(int_field).unwrap_or(0);
-    Some((rate, rtp))
-}
-
-/// Read an integer plist field whether it was encoded signed or unsigned.
-fn int_field(v: &Value) -> Option<u64> {
-    v.as_unsigned_integer()
-        .or_else(|| v.as_signed_integer().map(|s| s as u64))
-}
-
-/// Parse a `FLUSHBUFFERED` plist for its `flushUntilSeq` boundary (drop all
-/// packets with a lower sequence number).
-fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
-    let value = Value::from_reader(io::Cursor::new(body)).ok()?;
-    value
-        .as_dictionary()?
-        .get("flushUntilSeq")
-        .and_then(int_field)
 }
 
 /// The buffered-audio pipeline: accept the sender's TCP connection, frame the
@@ -669,27 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_real_setrateanchortime() {
-        // The exact fields a real Mac sent (milestone-5 capture).
-        let mut dict = Dictionary::new();
-        dict.insert("rate".into(), Value::Integer(1u64.into()));
-        dict.insert(
-            "networkTimeTimelineID".into(),
-            Value::Integer((-2116301217048756216i64).into()),
-        );
-        dict.insert("networkTimeSecs".into(), Value::Integer(1323152u64.into()));
-        dict.insert(
-            "networkTimeFrac".into(),
-            Value::Integer(6275326383463858176u64.into()),
-        );
-        dict.insert("networkTimeFlags".into(), Value::Integer(0u64.into()));
-        dict.insert("rtpTime".into(), Value::Integer(3174381381u64.into()));
-        let body = encode_plist(&dict).unwrap();
-
-        assert_eq!(parse_rate_anchor(&body), Some((1, 3174381381)));
-    }
-
-    #[test]
     fn flush_boundary_is_not_sticky() {
         let boundary = AtomicU64::new(100);
         // Stale in-flight audio below the boundary is skipped.
@@ -704,32 +607,5 @@ mod tests {
 
         // No boundary set: nothing is skipped.
         assert!(!skip_before_boundary(&AtomicU64::new(0), 7));
-    }
-
-    #[test]
-    fn parses_real_flushbuffered() {
-        // The exact fields a real Mac sent on skip (log capture).
-        let mut dict = Dictionary::new();
-        dict.insert("flushUntilSeq".into(), Value::Integer(5179978u64.into()));
-        dict.insert("flushUntilTS".into(), Value::Integer(2204469244u64.into()));
-        let body = encode_plist(&dict).unwrap();
-        assert_eq!(parse_flush_until_seq(&body), Some(5179978));
-
-        // A body without the field yields None (no boundary set).
-        let empty = encode_plist(&Dictionary::new()).unwrap();
-        assert_eq!(parse_flush_until_seq(&empty), None);
-    }
-
-    #[test]
-    fn rate_anchor_pause_and_missing_fields() {
-        // rate 0 = pause; rtpTime defaults to 0 when absent.
-        let mut dict = Dictionary::new();
-        dict.insert("rate".into(), Value::Integer(0u64.into()));
-        let body = encode_plist(&dict).unwrap();
-        assert_eq!(parse_rate_anchor(&body), Some((0, 0)));
-
-        // No rate field at all → None.
-        let empty = encode_plist(&Dictionary::new()).unwrap();
-        assert_eq!(parse_rate_anchor(&empty), None);
     }
 }

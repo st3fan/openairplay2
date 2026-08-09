@@ -10,11 +10,16 @@
 //! claim, the `CSeq`/`Server` echo) stay in [`crate::server`].
 
 mod feedback;
+mod flush_buffered;
 mod fp_setup;
 mod get_parameter;
 mod info;
 mod pair_pin_start;
+mod plist;
+mod record;
 mod set_parameter;
+mod set_rate_anchor;
+mod teardown;
 
 use log::warn;
 
@@ -31,8 +36,25 @@ pub const PARAMETERS_CONTENT_TYPE: &str = "text/parameters";
 /// target. Anything unknown answers 501 so a real sender's next move shows
 /// up in the logs.
 pub async fn dispatch(request: &Request, session: &mut Session, context: &Context) -> Response {
-    if let Some(response) = dispatch_session(session, request).await {
-        return response;
+    match request.method.as_str() {
+        // Temporary: SETUP still dispatches to a Session method; phase 4 of
+        // plan 20260809-03 gives it a handler and commands like the rest.
+        "SETUP" => {
+            return match session.handle_setup(&request.body).await {
+                Ok(body) => Response::ok(&request.protocol).body(INFO_CONTENT_TYPE, body),
+                Err(e) => {
+                    warn!("SETUP failed: {e}");
+                    Response::new(&request.protocol, 400, "Bad Request")
+                }
+            }
+        }
+        "GET_PARAMETER" => return get_parameter::handle_get_parameter(request, session),
+        "SET_PARAMETER" => return set_parameter::handle_set_parameter(request, session),
+        "SETRATEANCHORTIME" => return set_rate_anchor::handle_set_rate_anchor(request, session),
+        "FLUSHBUFFERED" => return flush_buffered::handle_flush_buffered(request, session),
+        "TEARDOWN" => return teardown::handle_teardown(request, session),
+        "RECORD" | "SETPEERS" | "SETPEERSX" => return record::handle_record(request),
+        _ => {}
     }
     match (request.method.as_str(), request.target.as_str()) {
         ("GET", "/info") => info::handle_info(request, context),
@@ -45,44 +67,5 @@ pub async fn dispatch(request: &Request, session: &mut Session, context: &Contex
             warn!("{method} {target} not implemented yet");
             Response::new(&request.protocol, 501, "Not Implemented")
         }
-    }
-}
-
-/// The streaming-session verbs, still dispatched to [`Session`] methods.
-/// Temporary: phases 2–4 of plan `20260809-03` dissolve these into per-verb
-/// handlers and commands, and this function with them.
-async fn dispatch_session(session: &mut Session, request: &Request) -> Option<Response> {
-    let proto = &request.protocol;
-    match request.method.as_str() {
-        "SETUP" => Some(match session.handle_setup(&request.body).await {
-            Ok(body) => Response::ok(proto).body(INFO_CONTENT_TYPE, body),
-            Err(e) => {
-                warn!("SETUP failed: {e}");
-                Response::new(proto, 400, "Bad Request")
-            }
-        }),
-        "GET_PARAMETER" => Some(get_parameter::handle_get_parameter(request, session)),
-        "SET_PARAMETER" => Some(set_parameter::handle_set_parameter(request, session)),
-        // Transport control: play/pause rate and the RTP anchor.
-        "SETRATEANCHORTIME" => {
-            session.set_rate_anchor(&request.body);
-            Some(Response::ok(proto))
-        }
-        // Seek/skip: drop buffered audio.
-        "FLUSHBUFFERED" => {
-            session.flush(&request.body);
-            Some(Response::ok(proto))
-        }
-        // The sender is done with the stream.
-        "TEARDOWN" => {
-            session.teardown();
-            Some(Response::ok(proto))
-        }
-        // Other session control verbs: acknowledge so the sender proceeds.
-        "RECORD" | "SETPEERS" | "SETPEERSX" => {
-            session.ack(&request.method);
-            Some(Response::ok(proto))
-        }
-        _ => None,
     }
 }
