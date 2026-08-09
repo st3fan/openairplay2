@@ -7,6 +7,17 @@
 //! (see [`crate::errors`]); they apply validated params to session state and
 //! report the resulting [`crate::events::Event`]s to the host.
 
+// Transport control
+
+pub mod flush_buffered;
+pub use flush_buffered::{flush_buffered, FlushBufferedParams};
+
+pub mod set_rate_anchor;
+pub use set_rate_anchor::{set_rate_anchor, SetRateAnchorParams};
+
+pub mod teardown;
+pub use teardown::teardown;
+
 // SET_PARAMETER / GET_PARAMETER
 
 pub mod get_volume;
