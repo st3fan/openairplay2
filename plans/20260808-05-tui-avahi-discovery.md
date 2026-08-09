@@ -30,6 +30,9 @@ receivers.
   full-screen picker. Selecting an entry connects to it (with the existing
   reconnect loop); the zero-config local case keeps working unchanged —
   a local receiver that appears while the picker is up wins automatically.
+  A new `--discover` flag forces the picker: the local candidates are
+  skipped entirely and the network's receivers are the offer (mutually
+  exclusive with an endpoint argument, which already names the receiver).
 
 ### Out of scope
 
@@ -109,6 +112,12 @@ AirPlay registration; the wildcard bind is the documented, common case.
 4. After a selection, the chosen endpoint behaves like an explicit one:
    the existing reconnect loop, the existing unauthorized state on 401.
 
+With `--discover` the flow starts at step 2 with an empty local list: the
+picker is up immediately, nothing is probed in the background, and its
+"no local receiver" framing is dropped — the picker is the point, not a
+fallback. Combining `--discover` with an endpoint argument is a usage
+error.
+
 **Modules.** A new `discover.rs` in `openairplay2-tui` owns the Avahi
 D-Bus browsing (`ServiceBrowserNew` on `_openairplay2._tcp`, resolve on
 `ItemNew`, drop on `ItemRemove`, dedupe by instance name across
@@ -142,9 +151,10 @@ NEWS.Debian entry for both packages.
   lock marker, ordering stable while navigating); classification of
   resolved services into `Endpoint::Url`; the local-first flow as a state
   test over the client's updates (no local → picker; local appears →
-  auto-connect; selection → connect). D-Bus itself is not mocked — the
-  browsing module is kept thin and its logic (dedupe, TXT parsing) is pure
-  and tested.
+  auto-connect; selection → connect); `--discover` parsing, its mutual
+  exclusion with an endpoint, and its picker-without-local-framing screen.
+  D-Bus itself is not mocked — the browsing module is kept thin and its
+  logic (dedupe, TXT parsing) is pure and tested.
 - **macOS CI**: `cargo test -p openairplay2-tui` keeps passing — `zbus`
   compiles there; nothing in tests touches a live bus.
 - **Hardware acceptance (skynet)**: receiver with `--tui-listen
@@ -164,6 +174,8 @@ NEWS.Debian entry for both packages.
 - `openairplay2-tui` with no arguments: connects to a local receiver when
   one exists (unchanged); otherwise presents discovered receivers and
   connects to the chosen one; a local receiver appearing later still wins.
+- `openairplay2-tui --discover` goes straight to the picker, probing no
+  local candidate.
 - Explicit endpoints, passwords, and every current flag behave as today;
   the protocol crate is unchanged; macOS CI stays green.
 
