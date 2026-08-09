@@ -257,6 +257,7 @@ impl Receiver {
             identity: self.identity,
             sink_factory,
             events,
+            active: Arc::default(),
         });
         serve(listener, context).await
     }

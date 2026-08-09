@@ -22,6 +22,7 @@ use crate::dmap;
 use crate::events::{Event, EventSender};
 use crate::player::{frames_to_duration, Player, PlayerSender, Position, Track, TrackAnchor};
 use crate::sink::{AudioSink, SinkFactory};
+use crate::takeover::ActiveGuard;
 
 /// Stream type constants from the SETUP `streams` array.
 const TYPE_REALTIME: u64 = 96;
@@ -69,6 +70,10 @@ pub struct Session {
     /// `progress:` line. Shared with the playback thread, which turns it into
     /// a position that follows the audio.
     track: TrackAnchor,
+    /// Proof that this connection owns the active-session slot, held here so
+    /// that it is released only once this session has fully torn down — see
+    /// [`Drop`] and [`crate::takeover`].
+    active_guard: Option<ActiveGuard>,
 }
 
 impl Session {
@@ -95,7 +100,15 @@ impl Session {
             player_control: None,
             flush_until_seq: Arc::new(AtomicU64::new(0)),
             track: TrackAnchor::default(),
+            active_guard: None,
         }
+    }
+
+    /// Take ownership of the active-session slot (the caller claimed it at
+    /// `SETUP`). Kept until this session is dropped, which is what tells a
+    /// sender taking over that the audio device is free.
+    pub fn set_active_guard(&mut self, guard: ActiveGuard) {
+        self.active_guard = Some(guard);
     }
 
     /// Report a session milestone; a host that dropped its receiver is fine.
@@ -475,6 +488,14 @@ impl Drop for Session {
         for task in self.tasks.drain(..) {
             task.abort();
         }
+        // Order matters when a sender is taking this session over: dropping
+        // the player joins the playback thread, which releases the host's
+        // sink and with it the audio device. Only then is the active-session
+        // guard released, because that is what the new stream is waiting for
+        // — and an exclusive ALSA device would refuse it if we still held it.
+        self.player_control = None;
+        self.player = None;
+        self.active_guard = None;
     }
 }
 

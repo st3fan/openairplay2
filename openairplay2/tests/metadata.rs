@@ -44,6 +44,7 @@ async fn start() -> (SocketAddr, UnboundedReceiver<Event>) {
         identity: Identity::generate(),
         sink_factory,
         events,
+        active: std::sync::Arc::default(),
     });
     tokio::spawn(serve(listener, context));
     (addr, rx)

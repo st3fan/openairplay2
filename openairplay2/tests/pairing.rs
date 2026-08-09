@@ -48,6 +48,7 @@ async fn start_with_password(status_extra: u32, password: Option<&str>) -> Socke
         identity: Identity::generate(),
         sink_factory,
         events,
+        active: std::sync::Arc::default(),
     });
     tokio::spawn(serve(listener, context));
     addr
