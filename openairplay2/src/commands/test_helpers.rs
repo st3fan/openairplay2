@@ -8,9 +8,10 @@ use std::sync::Arc;
 use plist::{Dictionary, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::commands::{setup_streams, SetupStreamsParams};
 use crate::events::Event;
 use crate::http::{parse_head, Request};
-use crate::session::Session;
+use crate::session::{Session, TYPE_BUFFERED};
 use crate::sink::{AudioSink, SinkFactory};
 
 pub struct TestSink;
@@ -47,15 +48,13 @@ pub fn plist_bytes(dict: &Dictionary) -> Vec<u8> {
 
 /// Run a phase-2 SETUP for a buffered stream, starting the session.
 pub async fn start_stream(session: &mut Session) {
-    let mut stream = Dictionary::new();
-    stream.insert("type".into(), Value::Integer(103u64.into()));
-    stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
-    let mut dict = Dictionary::new();
-    dict.insert(
-        "streams".into(),
-        Value::Array(vec![Value::Dictionary(stream)]),
-    );
-    session.handle_setup(&plist_bytes(&dict)).await.unwrap();
+    let params = SetupStreamsParams {
+        stream_type: Some(TYPE_BUFFERED),
+        audio_format: None,
+        shared_key: Some(vec![7u8; 32]),
+        spf: None,
+    };
+    setup_streams(session, params).await.unwrap();
 }
 
 /// Build a request the way the wire would deliver it, through the real head

@@ -82,13 +82,25 @@ One TCP control connection carries the whole session, in three regimes on the sa
 
 Request flow: [crypto_stream.rs](openairplay2/src/crypto_stream.rs) (`ControlConnection`) frames
 and decrypts → [http.rs](openairplay2/src/http.rs) parses the hybrid HTTP/RTSP message →
-[server.rs](openairplay2/src/server.rs) `handle_connection` special-cases `/pair-setup`, then
-tries `dispatch_session` (per-connection `Session` state) and falls back to `dispatch`
-(stateless: `/info`, `/fp-setup`, keep-alives).
+[server.rs](openairplay2/src/server.rs) `handle_connection` (connection-level concerns only: the
+handshake timeout, the `/pair-setup` cipher install, the `SETUP` takeover claim, the
+`CSeq`/`Server` echo) → `handlers::dispatch`, the routing table in
+[handlers/](openairplay2/src/handlers/) — one file per verb/endpoint. **Handlers, commands,
+errors, types** (the tqs/tdb layering): a handler parses the wire body and builds a `Params`
+struct; a command in [commands/](openairplay2/src/commands/) — `#[derive(Validate)]` params, a
+function over `(&mut Session, params)` whose first line is `params.validate()?` — applies it to
+session state. Parsing lives in handlers, normalization in
+[types.rs](openairplay2/src/types.rs) constructors (`VolumeDb`), validation in commands — each
+in exactly one place. [errors.rs](openairplay2/src/errors.rs) `CommandError` is the one spot an
+error chooses a status code; handlers where garbage must answer 200 anyway (`SET_PARAMETER`,
+`GET_PARAMETER`, transport control — metadata is decoration, and a refused volume must not
+poison the session) state that **tolerance policy** at the top of the file and log instead.
 
-[session.rs](openairplay2/src/session.rs) owns the streaming session. `SETUP` arrives in two
-phases, distinguished by the presence of a `streams` array: phase 1 binds the event channel and
-reports `eventPort`; phase 2 captures `shk`/`audioFormat`, binds the data + control channels, and
+[session.rs](openairplay2/src/session.rs) holds the session state and the audio pipeline.
+`SETUP` arrives in two phases, distinguished by the presence of a `streams` array
+([handlers/setup.rs](openairplay2/src/handlers/setup.rs) picks; each phase is a command):
+phase 1 binds the event channel and reports `eventPort`; phase 2 captures `shk`/`audioFormat`,
+binds the data + control channels, and
 for buffered audio (`type` 103) starts the pipeline. The audio path is
 TCP → [buffered.rs](openairplay2/src/buffered.rs) (block framing `[u16 len BE][packet]`,
 per-packet ChaCha20-Poly1305) → [decode.rs](openairplay2/src/decode.rs) (raw AAC-LC, no ADTS,

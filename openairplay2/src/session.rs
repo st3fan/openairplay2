@@ -24,8 +24,8 @@ use crate::sink::{AudioSink, SinkFactory};
 use crate::takeover::ActiveGuard;
 
 /// Stream type constants from the SETUP `streams` array.
-const TYPE_REALTIME: u64 = 96;
-const TYPE_BUFFERED: u64 = 103;
+pub(crate) const TYPE_REALTIME: u64 = 96;
+pub(crate) const TYPE_BUFFERED: u64 = 103;
 
 /// The per-connection session state the commands operate on
 /// ([`crate::commands`] is the only place outside this module that touches
@@ -117,127 +117,10 @@ impl Session {
         let _ = self.events.send(event);
     }
 
-    /// Handle a `SETUP` request. Returns the response plist bytes. Phase 1
-    /// (no `streams`) sets up the event/timing channels; phase 2 (`streams`
-    /// array) sets up the audio data/control channels.
-    pub async fn handle_setup(&mut self, body: &[u8]) -> io::Result<Vec<u8>> {
-        let request = Value::from_reader(io::Cursor::new(body))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("SETUP plist: {e}")))?;
-        let dict = request
-            .as_dictionary()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SETUP body not a dict"))?;
-
-        if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
-            self.setup_streams(streams).await
-        } else {
-            self.setup_timing(dict).await
-        }
-    }
-
-    /// Phase 1: bind the event channel and report the event/timing ports.
-    async fn setup_timing(&mut self, dict: &Dictionary) -> io::Result<Vec<u8>> {
-        let timing = dict
-            .get("timingProtocol")
-            .and_then(|v| v.as_string())
-            .unwrap_or("(none)");
-        debug!("SETUP phase 1: timingProtocol={timing}");
-
-        let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let event_port = listener.local_addr()?.port();
-        debug!("SETUP phase 1: event port {event_port}");
-        self.tasks.push(tokio::spawn(event_channel(listener)));
-
-        let self_ip = self.local_ip.to_string();
-        let mut peer_info = Dictionary::new();
-        peer_info.insert(
-            "Addresses".into(),
-            Value::Array(vec![Value::String(self_ip.clone())]),
-        );
-        peer_info.insert("ID".into(), Value::String(self_ip));
-
-        let mut response = Dictionary::new();
-        response.insert(
-            "eventPort".into(),
-            Value::Integer(u64::from(event_port).into()),
-        );
-        response.insert("timingPort".into(), Value::Integer(0u64.into()));
-        response.insert("timingPeerInfo".into(), Value::Dictionary(peer_info));
-        encode_plist(&response)
-    }
-
-    /// Phase 2: bind the audio data + control channels for stream 0 and report
-    /// their ports.
-    async fn setup_streams(&mut self, streams: &[Value]) -> io::Result<Vec<u8>> {
-        let stream = streams
-            .first()
-            .and_then(|v| v.as_dictionary())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty streams array"))?;
-
-        let stream_type = stream.get("type").and_then(|v| v.as_unsigned_integer());
-        self.stream_type = stream_type;
-        self.audio_format = stream
-            .get("audioFormat")
-            .and_then(|v| v.as_unsigned_integer());
-        self.stream_key = stream
-            .get("shk")
-            .and_then(|v| v.as_data())
-            .map(<[u8]>::to_vec);
-        let spf = stream.get("spf").and_then(|v| v.as_unsigned_integer());
-        debug!(
-            "SETUP phase 2: type={stream_type:?} audioFormat={:?} spf={spf:?} shk={}",
-            self.audio_format,
-            self.stream_key.as_ref().map_or(0, Vec::len)
-        );
-
-        let control = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let control_port = control.local_addr()?.port();
-        self.tasks
-            .push(tokio::spawn(audio_channel(control, "control")));
-
-        // Buffered audio (type 103) uses a TCP data channel we decrypt, decode
-        // and play. Realtime (type 96) is UDP, still just logged for now.
-        let data_port = if stream_type == Some(TYPE_BUFFERED) {
-            self.start_buffered_audio().await?
-        } else {
-            let data = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-            let port = data.local_addr()?.port();
-            self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
-            port
-        };
-        debug!("SETUP phase 2: data port {data_port}, control port {control_port}");
-
-        let mut stream_response = Dictionary::new();
-        stream_response.insert(
-            "type".into(),
-            Value::Integer(stream_type.unwrap_or(TYPE_REALTIME).into()),
-        );
-        stream_response.insert(
-            "dataPort".into(),
-            Value::Integer(u64::from(data_port).into()),
-        );
-        stream_response.insert(
-            "controlPort".into(),
-            Value::Integer(u64::from(control_port).into()),
-        );
-        if stream_type == Some(TYPE_BUFFERED) {
-            // A buffered-audio ring the sender can push ahead into (~8 MB).
-            stream_response.insert(
-                "audioBufferSize".into(),
-                Value::Integer(8_388_608u64.into()),
-            );
-        }
-
-        let mut response = Dictionary::new();
-        response.insert(
-            "streams".into(),
-            Value::Array(vec![Value::Dictionary(stream_response)]),
-        );
-        encode_plist(&response)
-    }
-
     /// Bind the buffered-audio TCP data channel and start the
-    /// receive → decrypt → decode → play pipeline. Returns the bound port.
-    async fn start_buffered_audio(&mut self) -> io::Result<u16> {
+    /// receive → decrypt → decode → play pipeline (called by the
+    /// [`crate::commands::setup_streams`] command). Returns the bound port.
+    pub(crate) async fn start_buffered_audio(&mut self) -> io::Result<u16> {
         let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let port = listener.local_addr()?.port();
 
@@ -333,7 +216,7 @@ impl Drop for Session {
     }
 }
 
-fn encode_plist(dict: &Dictionary) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_plist(dict: &Dictionary) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     Value::Dictionary(dict.clone())
         .to_writer_binary(&mut buf)
@@ -343,7 +226,7 @@ fn encode_plist(dict: &Dictionary) -> io::Result<Vec<u8>> {
 
 /// Accept the sender's event channel and drain it (we don't emit events for
 /// basic playback). Keeps the AirPlay session healthy.
-async fn event_channel(listener: TcpListener) {
+pub(crate) async fn event_channel(listener: TcpListener) {
     let Ok((mut stream, peer)) = listener.accept().await else {
         return;
     };
@@ -359,7 +242,7 @@ async fn event_channel(listener: TcpListener) {
 }
 
 /// Receive and log packets on a realtime/control UDP socket.
-async fn audio_channel(socket: UdpSocket, label: &'static str) {
+pub(crate) async fn audio_channel(socket: UdpSocket, label: &'static str) {
     let mut buf = vec![0u8; 16 * 1024];
     let mut count: u64 = 0;
     loop {
@@ -494,90 +377,11 @@ async fn drain_tcp(listener: TcpListener) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_helpers::{peer, session};
+    use crate::commands::test_helpers::{session, start_stream};
     use crate::player::Track;
 
     #[tokio::test]
-    async fn phase1_response_has_event_and_timing_ports() {
-        let (mut session, _events) = session();
-        // Minimal phase-1 plist: timingProtocol=PTP, no streams.
-        let mut dict = Dictionary::new();
-        dict.insert("timingProtocol".into(), Value::String("PTP".into()));
-        let body = encode_plist(&dict).unwrap();
-
-        let response = session.handle_setup(&body).await.unwrap();
-        let value = Value::from_reader(io::Cursor::new(response)).unwrap();
-        let d = value.as_dictionary().unwrap();
-        assert!(d.get("eventPort").unwrap().as_unsigned_integer().unwrap() > 0);
-        assert_eq!(d.get("timingPort").unwrap().as_unsigned_integer(), Some(0));
-        assert!(d.get("timingPeerInfo").unwrap().as_dictionary().is_some());
-    }
-
-    #[tokio::test]
-    async fn phase2_response_binds_ports_and_echoes_type() {
-        let (mut session, mut events) = session();
-        let mut stream = Dictionary::new();
-        stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
-        stream.insert("audioFormat".into(), Value::Integer(0x400000u64.into()));
-        stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
-        let mut dict = Dictionary::new();
-        dict.insert(
-            "streams".into(),
-            Value::Array(vec![Value::Dictionary(stream)]),
-        );
-        let body = encode_plist(&dict).unwrap();
-
-        let response = session.handle_setup(&body).await.unwrap();
-        let value = Value::from_reader(io::Cursor::new(response)).unwrap();
-        let streams = value
-            .as_dictionary()
-            .unwrap()
-            .get("streams")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        let s = streams[0].as_dictionary().unwrap();
-        assert_eq!(
-            s.get("type").unwrap().as_unsigned_integer(),
-            Some(TYPE_BUFFERED)
-        );
-        assert!(s.get("dataPort").unwrap().as_unsigned_integer().unwrap() > 0);
-        assert!(s.get("controlPort").unwrap().as_unsigned_integer().unwrap() > 0);
-        assert!(s.get("audioBufferSize").is_some());
-        assert_eq!(session.stream_key, Some(vec![7u8; 32]));
-
-        // The host learned the stream started, with the negotiated format.
-        assert_eq!(
-            events.try_recv(),
-            Ok(Event::SessionStarted {
-                rate: 44100,
-                channels: 2,
-                peer: peer(),
-            })
-        );
-
-        // Dropping the session (connection closed) ends it exactly once.
-        drop(session);
-        assert_eq!(events.try_recv(), Ok(Event::SessionEnded));
-        assert!(events.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn phase_detection_uses_streams_presence() {
-        // A dict with no streams is phase 1 (event port), with streams is phase 2.
-        let (mut s1, _events) = session();
-        let empty = encode_plist(&Dictionary::new()).unwrap();
-        let r1 = s1.handle_setup(&empty).await.unwrap();
-        assert!(Value::from_reader(io::Cursor::new(r1))
-            .unwrap()
-            .as_dictionary()
-            .unwrap()
-            .contains_key("eventPort"));
-    }
-
-    #[tokio::test]
     async fn a_new_stream_drops_the_previous_tracks_extent() {
-        use crate::commands::test_helpers::start_stream;
         let (mut session, mut events) = session();
         start_stream(&mut session).await;
         *session.track.lock().unwrap() = Some(Track {

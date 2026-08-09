@@ -15,11 +15,17 @@ mod fp_setup;
 mod get_parameter;
 mod info;
 mod pair_pin_start;
+mod pair_setup;
 mod plist;
 mod record;
 mod set_parameter;
 mod set_rate_anchor;
+mod setup;
 mod teardown;
+
+// `pair-setup` is dispatched by the connection loop, not the table below: its
+// side effect (installing the cipher) is connection-level.
+pub use pair_setup::handle_pair_setup;
 
 use log::warn;
 
@@ -37,17 +43,7 @@ pub const PARAMETERS_CONTENT_TYPE: &str = "text/parameters";
 /// up in the logs.
 pub async fn dispatch(request: &Request, session: &mut Session, context: &Context) -> Response {
     match request.method.as_str() {
-        // Temporary: SETUP still dispatches to a Session method; phase 4 of
-        // plan 20260809-03 gives it a handler and commands like the rest.
-        "SETUP" => {
-            return match session.handle_setup(&request.body).await {
-                Ok(body) => Response::ok(&request.protocol).body(INFO_CONTENT_TYPE, body),
-                Err(e) => {
-                    warn!("SETUP failed: {e}");
-                    Response::new(&request.protocol, 400, "Bad Request")
-                }
-            }
-        }
+        "SETUP" => return setup::handle_setup(request, session).await,
         "GET_PARAMETER" => return get_parameter::handle_get_parameter(request, session),
         "SET_PARAMETER" => return set_parameter::handle_set_parameter(request, session),
         "SETRATEANCHORTIME" => return set_rate_anchor::handle_set_rate_anchor(request, session),
