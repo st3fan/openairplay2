@@ -166,8 +166,12 @@ pub fn card_name(device: &str) -> Option<String> {
 
 /// Convert an AirPlay volume in dB to a linear gain in `[0, 1]`. `0 dB` is full
 /// volume, `-144 dB` (and below) is muted; we never amplify above unity.
+///
+/// The library only ever hands us a finite dB, but this is `pub` and NaN would
+/// otherwise slip through `min(0.0)` as *full scale* — so a value that means
+/// nothing mutes rather than blares.
 pub fn volume_to_gain(db: f32) -> f32 {
-    if db <= -144.0 {
+    if !db.is_finite() || db <= -144.0 {
         return 0.0;
     }
     10f32.powf(db.min(0.0) / 20.0)
@@ -961,6 +965,12 @@ mod tests {
         assert_eq!(volume_to_gain(-144.0), 0.0); // muted
         assert_eq!(volume_to_gain(-200.0), 0.0); // below sentinel = muted
         assert!((volume_to_gain(6.0) - 1.0).abs() < 1e-6); // never amplify
+
+        // A value that means nothing mutes. NaN in particular used to come out
+        // as full scale, because `NaN.min(0.0)` is 0.0.
+        assert_eq!(volume_to_gain(f32::NAN), 0.0);
+        assert_eq!(volume_to_gain(f32::INFINITY), 0.0);
+        assert_eq!(volume_to_gain(f32::NEG_INFINITY), 0.0);
 
         // The shared gain clamps and round-trips.
         let gain = SharedGain::new();

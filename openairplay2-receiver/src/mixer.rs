@@ -110,7 +110,10 @@ impl HwVolume {
             );
             return;
         };
-        let result = if db <= MUTE_DB {
+        // The library guarantees a finite dB; belt and braces, because a NaN
+        // would clamp to NaN and land at an arbitrary point of the control's
+        // travel. Mute is the safe reading of a volume that means nothing.
+        let result = if !db.is_finite() || db <= MUTE_DB {
             self.gain.set(if self.has_switch { 1.0 } else { 0.0 });
             debug!("mixer: mute");
             mute(&selem, self.has_switch, self.db_range, self.raw_range)
@@ -286,6 +289,20 @@ mod tests {
         assert_eq!(slider_to_range(0.0, 0, 255), 255);
         assert_eq!(slider_to_range(-30.0, 0, 255), 0);
         assert_eq!(slider_to_range(-15.0, 0, 255), 128); // rounds to nearest
+    }
+
+    #[test]
+    fn slider_never_leaves_the_range_for_a_non_finite_volume() {
+        // `Mixer::set` mutes before a non-finite dB gets this far (and the
+        // library never emits one), but the mapping must not put the control
+        // at an arbitrary point of its travel if it ever does: NaN clamps to
+        // NaN, and `NaN as i64` saturates to 0 — i.e. the range minimum.
+        let (min, max) = (-10240, 0);
+        for db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let v = slider_to_range(db, min, max);
+            assert!((min..=max).contains(&v), "{db} mapped to {v}");
+        }
+        assert_eq!(slider_to_range(f32::NAN, min, max), min);
     }
 
     #[test]
