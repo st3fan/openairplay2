@@ -5,7 +5,7 @@
 #
 # This file is root-owned and mode 0640 because it can hold secrets. They are
 # passed to the daemon as environment variables, not command-line arguments,
-# so unlike a --pincode flag they are not visible to other users in `ps`.
+# so unlike a --password flag they are not visible to other users in `ps`.
 
 # Name senders see in the AirPlay menu. %h becomes this machine's hostname,
 # so one file can be deployed unedited across several machines. The default
@@ -24,8 +24,10 @@
 # above, else "default").
 #OPENAIRPLAY2_MIXER_DEVICE=
 
-# Require this code to pair. Without one, any device on the network can pair.
-#OPENAIRPLAY2_PINCODE=
+# Require this password to pair — iOS and macOS show a password dialog, so
+# it may be alphanumeric, not just digits. Without one, any device on the
+# network can pair. (OPENAIRPLAY2_PINCODE, the 0.4 name, is still honored.)
+#OPENAIRPLAY2_PASSWORD=
 
 # Control port.
 #OPENAIRPLAY2_PORT=7000

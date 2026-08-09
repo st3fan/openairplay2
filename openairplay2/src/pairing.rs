@@ -34,16 +34,16 @@ pub enum Outcome {
 pub struct PairSetup {
     srp: Option<SrpServer>,
     transient: bool,
-    /// The SRP password: `3939` for transient, or the configured pincode.
+    /// The SRP password: `3939` for transient, or the configured password.
     pin: String,
 }
 
 impl PairSetup {
-    pub fn new(pincode: Option<&str>) -> PairSetup {
+    pub fn new(password: Option<&str>) -> PairSetup {
         PairSetup {
             srp: None,
             transient: false,
-            pin: pincode.unwrap_or(PAIR_SETUP_PIN).to_string(),
+            pin: password.unwrap_or(PAIR_SETUP_PIN).to_string(),
         }
     }
 
@@ -215,10 +215,10 @@ mod tests {
         setup.handle(&m3.encode())
     }
 
-    /// A configured pincode becomes the SRP password: a client that presents
-    /// it pairs; the standard `3939` is refused.
+    /// A configured password becomes the SRP password: a client that
+    /// presents it pairs; the standard `3939` is refused.
     #[test]
-    fn configured_pincode_is_the_srp_password() {
+    fn configured_password_is_the_srp_password() {
         let mut setup = PairSetup::new(Some("1212"));
         assert!(matches!(
             run_setup(&mut setup, "1212"),
@@ -228,7 +228,7 @@ mod tests {
         let mut setup = PairSetup::new(Some("1212"));
         assert!(matches!(run_setup(&mut setup, "3939"), Outcome::Failed(_)));
 
-        // No pincode configured: the standard transient 3939 still pairs.
+        // No password configured: the standard transient 3939 still pairs.
         let mut setup = PairSetup::new(None);
         assert!(matches!(
             run_setup(&mut setup, "3939"),

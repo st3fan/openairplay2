@@ -46,8 +46,8 @@ struct Args {
     /// The mixer device holding that control; `None` → derived from the
     /// audio device (see [`default_mixer_device`]).
     mixer_device: Option<String>,
-    /// Require this pincode to pair; `None` → transient `3939`.
-    pincode: Option<String>,
+    /// Require this password to pair; `None` → transient `3939`.
+    password: Option<String>,
     /// The local now-playing Unix socket: a path, `off`, or `None` for the
     /// default path (see [`tui_socket_path`]).
     tui_socket: Option<String>,
@@ -160,8 +160,12 @@ options:
   --identity-file PATH      where the pairing identity lives — senders
                             remember this receiver by it, so keep it stable
                             (default ~/.config/openairplay2/identity)
-  --pincode CODE            require this code to pair; without it any device
-                            on the network can pair
+  --password PASS           require this password to pair — iOS/macOS show a
+                            password dialog (alphanumerics welcome); without
+                            one any device on the network can pair. Prefer
+                            the OPENAIRPLAY2_PASSWORD variable — a flag is
+                            visible in ps. (--pincode is the deprecated 0.4
+                            spelling of the same option)
   --no-avahi                do not advertise over mDNS
   --alsa-device NAME        ALSA playback device (default \"default\");
                             see --list-devices for what this machine has
@@ -203,7 +207,7 @@ options:
   -h, --help                print this help
 
 Each option can also come from the environment — OPENAIRPLAY2_NAME, _PORT,
-_MAC, _IDENTITY_FILE, _PINCODE, _AVAHI (on/off), _AUDIO (on/off),
+_MAC, _IDENTITY_FILE, _PASSWORD, _AVAHI (on/off), _AUDIO (on/off),
 _ALSA_DEVICE, _MIXER, _MIXER_DEVICE, _TUI_SOCKET, _TUI_LISTEN,
 _TUI_PASSWORD, _LOG_LEVEL — which is how
 /etc/default/openairplay2-receiver configures the service. A flag wins over its
@@ -237,7 +241,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         alsa_device: None,
         mixer: None,
         mixer_device: None,
-        pincode: None,
+        password: None,
         tui_socket: None,
         tui_listen: None,
         tui_password: None,
@@ -270,7 +274,10 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--no-audio" => args.audio = Some(false),
             "--mixer" => args.mixer = Some(value("--mixer", &mut it)?),
             "--mixer-device" => args.mixer_device = Some(value("--mixer-device", &mut it)?),
-            "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
+            "--password" => args.password = Some(value("--password", &mut it)?),
+            // The 0.4 spelling; kept so nobody's pairing protection silently
+            // vanishes on upgrade.
+            "--pincode" => args.password = Some(value("--pincode", &mut it)?),
             "--tui-socket" => args.tui_socket = Some(value("--tui-socket", &mut it)?),
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
             "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
@@ -365,8 +372,14 @@ fn resolve(mut args: Args, env: impl Fn(&str) -> Option<String>) -> Result<Args,
     if args.mixer_device.is_none() {
         args.mixer_device = get("OPENAIRPLAY2_MIXER_DEVICE");
     }
-    if args.pincode.is_none() {
-        args.pincode = get("OPENAIRPLAY2_PINCODE");
+    if args.password.is_none() {
+        args.password = get("OPENAIRPLAY2_PASSWORD");
+    }
+    // The 0.4 variable: dpkg preserves an edited options file across the
+    // rename, and a box that configured a pairing code must keep requiring
+    // it. The new name wins when both are set.
+    if args.password.is_none() {
+        args.password = get("OPENAIRPLAY2_PINCODE");
     }
     if args.tui_socket.is_none() {
         args.tui_socket = get("OPENAIRPLAY2_TUI_SOCKET");
@@ -401,6 +414,21 @@ fn legacy_args_notice(env: impl Fn(&str) -> Option<String>) -> Option<String> {
              OPENAIRPLAY2_* variable each in /etc/default/openairplay2-receiver \
              — see NEWS.Debian or the README, and migrate; running with what \
              is configured otherwise"
+                .to_string()
+        })
+}
+
+/// 0.5 renamed the pairing pincode to "password" — Apple's own word: iOS and
+/// macOS show a password dialog and accept alphanumerics. The old variable
+/// keeps working (see [`resolve`]) so an upgraded box keeps its protection,
+/// but say so, so options files migrate. Warn level: honored, not ignored —
+/// unlike `OPENAIRPLAY2_ARGS`.
+fn legacy_pincode_notice(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    env("OPENAIRPLAY2_PINCODE")
+        .filter(|v| !v.trim().is_empty())
+        .map(|_| {
+            "OPENAIRPLAY2_PINCODE is deprecated (still honored): rename it to \
+             OPENAIRPLAY2_PASSWORD in /etc/default/openairplay2-receiver"
                 .to_string()
         })
 }
@@ -556,6 +584,9 @@ async fn main() -> ExitCode {
     if let Some(msg) = legacy_args_notice(|k| std::env::var(k).ok()) {
         error!("{msg}");
     }
+    if let Some(msg) = legacy_pincode_notice(|k| std::env::var(k).ok()) {
+        warn!("{msg}");
+    }
     let alsa_device = effective_device(&args);
     // Resolved before `args` fields start moving into the builder below.
     let mixer_cfg = match mixer_config(&args) {
@@ -579,8 +610,8 @@ async fn main() -> ExitCode {
     if let Some(mac) = args.mac {
         builder = builder.mac(mac);
     }
-    if let Some(pincode) = args.pincode {
-        builder = builder.pincode(pincode);
+    if let Some(password) = args.password {
+        builder = builder.password(password);
     }
     let receiver = match builder.build() {
         Ok(receiver) => receiver,
@@ -597,10 +628,10 @@ async fn main() -> ExitCode {
         receiver.config().port,
         receiver.identity().public_key_hex()
     );
-    // The pincode is a secret: name the state, never the value.
-    match &receiver.config().pincode {
-        Some(_) => info!("pincode: required (senders must enter one to pair)"),
-        None => info!("pincode: off (transient 3939)"),
+    // The password is a secret: name the state, never the value.
+    match &receiver.config().password {
+        Some(_) => info!("password: required (senders must enter it to pair)"),
+        None => info!("password: none (open pairing, transient code 3939)"),
     }
     match &alsa_device {
         Some(dev) => match player::card_name(dev) {
@@ -834,7 +865,7 @@ mod tests {
         assert_eq!(args.avahi, None);
         assert_eq!(args.audio, None);
         assert_eq!(args.alsa_device, None);
-        assert_eq!(args.pincode, None);
+        assert_eq!(args.password, None);
         assert_eq!(args.tui_listen, None);
         assert_eq!(args.log_level, None);
         // The effective outcome: audio on, default device.
@@ -862,8 +893,8 @@ mod tests {
             "PCM",
             "--mixer-device",
             "hw:CARD=S2",
-            "--pincode",
-            "4821",
+            "--password",
+            "open sesame",
             "--tui-socket",
             "/run/x/tui.sock",
             "--tui-listen",
@@ -882,7 +913,7 @@ mod tests {
         assert_eq!(effective_device(&args).as_deref(), Some("hw:1"));
         assert_eq!(args.mixer.as_deref(), Some("PCM"));
         assert_eq!(args.mixer_device.as_deref(), Some("hw:CARD=S2"));
-        assert_eq!(args.pincode.as_deref(), Some("4821"));
+        assert_eq!(args.password.as_deref(), Some("open sesame"));
         assert_eq!(args.tui_socket.as_deref(), Some("/run/x/tui.sock"));
         assert_eq!(args.tui_listen.as_deref(), Some("127.0.0.1:7392"));
         // Normalized to lowercase.
@@ -928,7 +959,7 @@ mod tests {
             ("OPENAIRPLAY2_PORT", "7100"),
             ("OPENAIRPLAY2_MAC", "aa:bb:cc:dd:ee:ff"),
             ("OPENAIRPLAY2_IDENTITY_FILE", "/var/lib/x/identity"),
-            ("OPENAIRPLAY2_PINCODE", "4821"),
+            ("OPENAIRPLAY2_PASSWORD", "sesame42"),
             ("OPENAIRPLAY2_AVAHI", "off"),
             ("OPENAIRPLAY2_AUDIO", "off"),
             ("OPENAIRPLAY2_ALSA_DEVICE", "hw:1"),
@@ -947,7 +978,7 @@ mod tests {
             args.identity_file.as_deref(),
             Some(std::path::Path::new("/var/lib/x/identity"))
         );
-        assert_eq!(args.pincode.as_deref(), Some("4821"));
+        assert_eq!(args.password.as_deref(), Some("sesame42"));
         assert_eq!(args.avahi, Some(false));
         assert_eq!(args.mixer.as_deref(), Some("Master"));
         assert_eq!(args.mixer_device.as_deref(), Some("default"));
@@ -998,6 +1029,37 @@ mod tests {
             assert!(err.contains(var), "{err}");
             assert!(err.contains(value), "{err}");
         }
+    }
+
+    #[test]
+    fn the_pincode_spellings_still_configure_the_password() {
+        // The 0.4 flag is an alias.
+        assert_eq!(
+            run_args(&["--pincode", "1212"]).password.as_deref(),
+            Some("1212")
+        );
+        // The 0.4 variable still protects an upgraded box…
+        let env = [("OPENAIRPLAY2_PINCODE", "1212")];
+        let args = resolve(run_args(&[]), env_of(&env)).unwrap();
+        assert_eq!(args.password.as_deref(), Some("1212"));
+        // …and the new name wins when both are set.
+        let env = [
+            ("OPENAIRPLAY2_PASSWORD", "new"),
+            ("OPENAIRPLAY2_PINCODE", "old"),
+        ];
+        let args = resolve(run_args(&[]), env_of(&env)).unwrap();
+        assert_eq!(args.password.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn legacy_pincode_trips_only_when_set_and_nonempty() {
+        assert!(legacy_pincode_notice(env_of(&[])).is_none());
+        assert!(legacy_pincode_notice(env_of(&[("OPENAIRPLAY2_PINCODE", " ")])).is_none());
+        let msg = legacy_pincode_notice(env_of(&[("OPENAIRPLAY2_PINCODE", "1212")])).unwrap();
+        assert!(msg.contains("OPENAIRPLAY2_PASSWORD"), "{msg}");
+        assert!(msg.contains("still honored"), "{msg}");
+        // Never the value itself: it is a secret.
+        assert!(!msg.contains("1212"), "{msg}");
     }
 
     #[test]
@@ -1142,6 +1204,7 @@ mod tests {
             &["--port", "7000"],
             &["--mac", "aa:bb:cc:dd:ee:ff"],
             &["--identity-file", "x"],
+            &["--password", "x"],
             &["--pincode", "x"],
             &["--no-avahi"],
             &["--alsa-device", "x"],

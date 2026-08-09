@@ -69,10 +69,12 @@ option list is in the [README](README.md).
 One TCP control connection carries the whole session, in three regimes on the same socket:
 
 1. **Plaintext HTTP/RTSP** — `GET /info`, `POST /pair-setup`.
-2. **Transient pairing** — SRP-6a (3072-bit group, SHA-512, fixed code `3939`, or the configured `--pincode`), M1→M2, M3→M4.
-   The SRP session key `K` becomes the channel secret. A configured pincode
-   sets status-flag bit 7 ("password required") and answers `pair-pin-start`
-   with an empty 200, so a sender prompts for and enters the pincode, which
+2. **Transient pairing** — SRP-6a (3072-bit group, SHA-512, fixed code `3939`, or the configured `--password`), M1→M2, M3→M4.
+   The SRP session key `K` becomes the channel secret. A configured password
+   (Apple's word — the iOS/macOS dialog is free-text, alphanumerics welcome;
+   `--pincode` is the deprecated 0.4 spelling) sets status-flag bit 7
+   ("password required") and answers `pair-pin-start`
+   with an empty 200, so a sender prompts for and enters the password, which
    becomes the SRP password; iOS pairs at M4 + the encrypted channel (no
    M5/M6 in this flow). See `notes/protocol.md`.
 3. **Encrypted** — everything after M4 is ChaCha20-Poly1305 in HomeKit block framing
@@ -115,7 +117,7 @@ thread from the RTP timestamp it is feeding the sink, against the track extent t
 extrapolate: a pause simply stops the reports, which is what freezes the clock.
 
 The embedding facade is [receiver.rs](openairplay2/src/receiver.rs): `Receiver::builder()`
-(name/port/mac/identity/pincode/advertise) → `build()` → `run(sink_factory, events)` on the caller's
+(name/port/mac/identity/password/advertise) → `build()` → `run(sink_factory, events)` on the caller's
 runtime. `advertise(false)` + `Receiver::txt_records()` supports hosts that own their mDNS.
 
 Timing is "soft": the sink prebuffers ~0.5 s and blocking ALSA writes pace playback, while the
