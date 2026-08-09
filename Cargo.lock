@@ -1174,6 +1174,7 @@ dependencies = [
  "rand 0.8.7",
  "sha2",
  "symphonia",
+ "thiserror",
  "tokio",
  "uuid",
  "zbus",
