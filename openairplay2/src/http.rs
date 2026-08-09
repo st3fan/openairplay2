@@ -234,6 +234,12 @@ impl Response {
         self.status
     }
 
+    /// Test-only: the body a sender would parse out of this response.
+    #[cfg(test)]
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
     /// Serialize to the wire form. AirPlay senders expect a `Content-Length`
     /// on every response, including empty ones.
     pub fn to_bytes(&self) -> Vec<u8> {

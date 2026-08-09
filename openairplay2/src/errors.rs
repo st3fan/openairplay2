@@ -19,6 +19,9 @@ pub enum CommandError {
     /// which body, and what was wrong with it.
     #[error("malformed {0} body: {1}")]
     MalformedBody(&'static str, String),
+    /// A params struct that failed its command's validation.
+    #[error("validation: {0}")]
+    Validation(#[from] validator::ValidationErrors),
 }
 
 impl CommandError {
@@ -28,7 +31,7 @@ impl CommandError {
     /// `RTSP/1.0`); see [`crate::http::Response::new`].
     pub fn response(&self, protocol: &str) -> Response {
         let (status, reason) = match self {
-            CommandError::MalformedBody(..) => (400, "Bad Request"),
+            CommandError::MalformedBody(..) | CommandError::Validation(_) => (400, "Bad Request"),
         };
         Response::new(protocol, status, reason)
     }
@@ -41,10 +44,16 @@ mod tests {
     #[test]
     fn status_mapping() {
         // One table, one place: every variant and the status it answers.
-        let cases = [(
-            CommandError::MalformedBody("fp-setup", "not FairPlay".into()),
-            400,
-        )];
+        let cases = [
+            (
+                CommandError::MalformedBody("fp-setup", "not FairPlay".into()),
+                400,
+            ),
+            (
+                CommandError::Validation(validator::ValidationErrors::new()),
+                400,
+            ),
+        ];
         for (error, status) in cases {
             assert_eq!(error.response("RTSP/1.0").status(), status, "{error}");
         }
