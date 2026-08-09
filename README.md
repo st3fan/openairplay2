@@ -228,7 +228,7 @@ endpoint on and point the display at it:
 
 ```sh
 openairplay2-receiver --tui-listen 127.0.0.1:7392
-openairplay2-tui --connect ws://127.0.0.1:7392
+openairplay2-tui ws://127.0.0.1:7392
 ```
 
 ```
@@ -258,9 +258,13 @@ and cover art, so keep it on loopback (or behind an SSH tunnel) unless you
 mean otherwise, and give it a password (`--tui-password`) if others can reach
 it.
 
+The endpoint to watch is the one optional positional argument — a
+`ws://HOST:PORT` URL or a socket path, e.g. `openairplay2-tui
+ws://10.0.0.5:7392`. Without it, the receiver's default sockets are tried,
+then `ws://127.0.0.1:7392`.
+
 | Option | Description | Default |
 | --- | --- | --- |
-| `--connect ENDPOINT` | Receiver endpoint to watch: a `ws://HOST:PORT` URL or a socket path | the receiver's default sockets, then `ws://127.0.0.1:7392` |
 | `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
 | `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
 | `--password PASS` | Password for a receiver whose endpoint requires one; falls back to `OPENAIRPLAY2_TUI_PASSWORD`, which unlike a flag is not visible in `ps` | none |
