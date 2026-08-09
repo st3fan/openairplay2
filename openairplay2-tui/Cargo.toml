@@ -48,7 +48,8 @@ openairplay2-tui-protocol = { path = "../openairplay2-tui-protocol", version = "
 base64 = "0.22"
 crossterm = { version = "0.29", features = ["event-stream"] }
 env_logger = "0.11"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# "sink" is for the tests, which play the receiver's side of the WebSocket.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 # One format, one small decoder: Kitty wants raw pixels and senders send JPEG.
 # The `image` crate would pull in far more for this.
 jpeg-decoder = { version = "0.3", default-features = false }
@@ -68,3 +69,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
     "connect",
 ] }
+# Browsing _openairplay2._tcp through the Avahi daemon's D-Bus API — the
+# same door the receiver advertises through. Compiles on macOS (CI needs
+# that); there is simply no Avahi daemon there to answer at runtime.
+zbus = { version = "5", default-features = false, features = ["tokio"] }

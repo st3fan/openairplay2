@@ -1,3 +1,16 @@
+openairplay2-receiver (0.6.0-1) unstable; urgency=medium
+
+  A non-loopback now-playing endpoint (OPENAIRPLAY2_TUI_LISTEN, e.g.
+  0.0.0.0:7392) is now advertised over mDNS as _openairplay2._tcp, and
+  openairplay2-tui finds it on its own: started with no arguments on a
+  machine without a local receiver, it lists the advertised receivers
+  and connects to the one you pick (openairplay2-tui --discover goes
+  straight to that picker). Loopback endpoints stay unadvertised, and
+  OPENAIRPLAY2_AVAHI=off now covers this advertisement as well as the
+  AirPlay one.
+
+ -- Stefan Arentz <stefan.arentz@gmail.com>  Sat, 08 Aug 2026 23:00:00 -0400
+
 openairplay2-receiver (0.5.0-1) unstable; urgency=medium
 
   The now-playing display works on-device with no configuration: the

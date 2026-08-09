@@ -23,9 +23,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::client::Update;
+use crate::client::{Endpoint, Update};
+use crate::discover::{self, Discovery};
 use crate::images::{self, Graphics, Placement};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -83,6 +84,13 @@ pub struct Artwork {
     pub data: Vec<u8>,
 }
 
+/// The picker screen: which discovered receiver is highlighted. Present
+/// while the screen is the picker rather than the now-playing view.
+#[derive(Debug, Default)]
+struct Picker {
+    cursor: usize,
+}
+
 /// Everything the screen shows, updated from the message stream.
 #[derive(Debug, Default)]
 pub struct NowPlaying {
@@ -105,6 +113,20 @@ pub struct NowPlaying {
     /// Whether the sender has playback paused. AirPlay 2 says this on the
     /// wire, so the clock freezing is explained rather than mysterious.
     paused: bool,
+    /// Up while the screen is the receiver picker: no endpoint was given, no
+    /// local receiver answers, and the network's are on offer.
+    picker: Option<Picker>,
+    /// What discovery has found, kept current whether or not the picker is
+    /// up, so a picker that (re)appears is full immediately.
+    discovered: Vec<discover::Receiver>,
+    /// Why the network cannot be browsed here (no Avahi daemon — macOS).
+    discovery_error: Option<String>,
+    /// A receiver was chosen from the picker. From here on the choice
+    /// behaves like an explicit endpoint argument: the picker never returns.
+    chosen: bool,
+    /// `--discover`: no local candidates are being probed, so the picker
+    /// drops the "no local receiver" framing.
+    forced_discovery: bool,
 }
 
 impl NowPlaying {
@@ -122,6 +144,14 @@ impl NowPlaying {
         self.artwork.is_some() && self.images.draws()
     }
 
+    /// `--discover`: the picker is the point. Straight to it, without the
+    /// "no local receiver" framing and without waiting to be told there is
+    /// none.
+    pub fn force_discovery(&mut self) {
+        self.picker = Some(Picker::default());
+        self.forced_discovery = true;
+    }
+
     /// Fold one client update into the display state.
     pub fn apply(&mut self, update: Update) {
         match update {
@@ -130,11 +160,67 @@ impl NowPlaying {
                 // Which endpoint answered — with several candidates tried,
                 // a later "connection lost" names the one that was live.
                 self.endpoint = endpoint;
+                // A local receiver appearing wins over the picker.
+                self.picker = None;
             }
             Update::Disconnected => self.connection = Connection::Lost,
             Update::Unauthorized => self.connection = Connection::Unauthorized,
             Update::Message(message) => self.apply_message(*message),
+            Update::NoLocalReceiver => {
+                // Time to offer the network's receivers — unless one was
+                // already chosen, after which the choice is the endpoint and
+                // its downs are shown as such.
+                if !self.chosen {
+                    self.picker.get_or_insert_with(Picker::default);
+                }
+            }
+            Update::Discovery(discovery) => self.apply_discovery(discovery),
         }
+    }
+
+    fn apply_discovery(&mut self, discovery: Discovery) {
+        match discovery {
+            Discovery::Receivers(receivers) => {
+                if let Some(picker) = &mut self.picker {
+                    // Keep the highlight on the same receiver while the
+                    // list shifts underneath it.
+                    picker.cursor = self
+                        .discovered
+                        .get(picker.cursor)
+                        .and_then(|current| receivers.iter().position(|r| r.name == current.name))
+                        .unwrap_or(0)
+                        .min(receivers.len().saturating_sub(1));
+                }
+                self.discovered = receivers;
+            }
+            Discovery::Unavailable(message) => self.discovery_error = Some(message),
+        }
+    }
+
+    /// Move the picker highlight, clamped to the list.
+    fn picker_move(&mut self, delta: isize) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        if self.discovered.is_empty() {
+            return;
+        }
+        let last = self.discovered.len() as isize - 1;
+        picker.cursor = (picker.cursor as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// Enter on the picker: the highlighted receiver becomes the endpoint,
+    /// from here on treated like an explicit argument. Returns what the
+    /// client should connect to.
+    fn choose(&mut self) -> Option<Endpoint> {
+        let picker = self.picker.as_ref()?;
+        let receiver = self.discovered.get(picker.cursor)?;
+        let endpoint = Endpoint::parse(&receiver.url);
+        self.endpoint = receiver.url.clone();
+        self.connection = Connection::Connecting;
+        self.chosen = true;
+        self.picker = None;
+        Some(endpoint)
     }
 
     fn apply_message(&mut self, message: Message) {
@@ -232,10 +318,50 @@ impl NowPlaying {
         Some((progress.elapsed.min(progress.duration), progress.duration))
     }
 
+    /// The picker screen: the discovered receivers, one row each, the
+    /// highlighted one marked. Wordings for the empty states matter: a
+    /// search that found nothing yet and a machine that cannot search at
+    /// all must not look alike.
+    fn picker_lines(&self, picker: &Picker) -> Vec<Line<'_>> {
+        let mut lines = vec![
+            Line::from("receivers on the network".bold()),
+            Line::from(""),
+        ];
+        if let Some(error) = &self.discovery_error {
+            lines.push(Line::from("cannot browse the network here".dim()));
+            lines.push(Line::from(error.as_str().dim()));
+        } else if self.discovered.is_empty() {
+            lines.push(Line::from("searching…".dim()));
+        } else {
+            for (index, receiver) in self.discovered.iter().enumerate() {
+                let lock = if receiver.password { " 🔒" } else { "" };
+                let address = receiver.url.strip_prefix("ws://").unwrap_or(&receiver.url);
+                let text = format!("{} — {}{}", receiver.name, address, lock);
+                lines.push(if index == picker.cursor {
+                    Line::from(format!("▸ {text}").bold())
+                } else {
+                    Line::from(text)
+                });
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("↑/↓ choose · enter connects".dim()));
+        }
+        if !self.forced_discovery {
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "no receiver on this machine — a local one still connects on its own".dim(),
+            ));
+        }
+        lines
+    }
+
     /// The centered block of text: title/artist/album (or the idle message),
     /// the progress clock, and the status line.
     fn lines(&self, width: u16) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
+        if let Some(picker) = &self.picker {
+            return self.picker_lines(picker);
+        }
         if self.connection != Connection::Connected {
             lines.push(Line::from(self.endpoint.as_str().bold()));
             lines.push(Line::from(""));
@@ -582,6 +708,8 @@ pub async fn run(
     mut updates: UnboundedReceiver<Update>,
     endpoint: String,
     images: Graphics,
+    selections: UnboundedSender<Endpoint>,
+    discover: bool,
 ) -> std::io::Result<Exit> {
     // Cell size has to be read before ratatui takes the terminal over; it
     // doesn't change unless the font does.
@@ -594,7 +722,16 @@ pub async fn run(
     if images.tmux() {
         crossterm::execute!(std::io::stdout(), EnableFocusChange)?;
     }
-    event_loop(&mut terminal, &mut updates, endpoint, images, cell_aspect).await
+    event_loop(
+        &mut terminal,
+        &mut updates,
+        endpoint,
+        images,
+        cell_aspect,
+        selections,
+        discover,
+    )
+    .await
 }
 
 async fn event_loop(
@@ -603,8 +740,13 @@ async fn event_loop(
     endpoint: String,
     images: Graphics,
     cell_aspect: f32,
+    selections: UnboundedSender<Endpoint>,
+    discover: bool,
 ) -> std::io::Result<Exit> {
     let mut state = NowPlaying::new(endpoint, images);
+    if discover {
+        state.force_discovery();
+    }
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     // Raw mode means the terminal sends no SIGINT, but `kill` and systemd
@@ -633,6 +775,20 @@ async fn event_loop(
                         && key.modifiers.contains(KeyModifiers::CONTROL);
                     if ctrl_c || matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                         return Ok(Exit::Quit);
+                    }
+                    if state.picker.is_some() {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.picker_move(-1),
+                            KeyCode::Down | KeyCode::Char('j') => state.picker_move(1),
+                            KeyCode::Enter => {
+                                if let Some(endpoint) = state.choose() {
+                                    // The client hanging up is handled where
+                                    // its updates channel closes.
+                                    let _ = selections.send(endpoint);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 // Under tmux these mean the pane stopped (or started) being
@@ -1128,6 +1284,158 @@ mod tests {
             data_base64: String::new(),
         }));
         assert!(state.artwork.is_none(), "image/none must clear the art");
+    }
+
+    fn found(name: &str, url: &str, password: bool) -> discover::Receiver {
+        discover::Receiver {
+            name: name.into(),
+            url: url.into(),
+            password,
+        }
+    }
+
+    /// A display in no-endpoint mode with two receivers on the network and
+    /// no local one: the picker screen.
+    fn picking() -> NowPlaying {
+        let mut state = NowPlaying::new("local receiver".into(), kitty());
+        state.apply(Update::Discovery(Discovery::Receivers(vec![
+            found("Attic", "ws://10.0.0.3:7392", false),
+            found("Kitchen", "ws://10.0.0.2:7392", true),
+        ])));
+        state.apply(Update::NoLocalReceiver);
+        state
+    }
+
+    #[test]
+    fn no_local_receiver_brings_up_the_picker() {
+        // The roster alone must not switch screens — the local receiver may
+        // yet answer; only "no local receiver" does.
+        let mut state = NowPlaying::new("local receiver".into(), kitty());
+        state.apply(Update::Discovery(Discovery::Receivers(vec![found(
+            "Kitchen",
+            "ws://10.0.0.2:7392",
+            false,
+        )])));
+        let screen = draw(&state, 60, 12);
+        assert!(screen.contains("connecting"), "{screen}");
+        assert!(!screen.contains("Kitchen"), "{screen}");
+
+        state.apply(Update::NoLocalReceiver);
+        let screen = draw(&state, 70, 14);
+        assert!(screen.contains("receivers on the network"), "{screen}");
+        assert!(screen.contains("▸ Kitchen — 10.0.0.2:7392"), "{screen}");
+        // The zero-config promise, said out loud.
+        assert!(screen.contains("a local one still connects"), "{screen}");
+    }
+
+    #[test]
+    fn the_picker_marks_the_highlight_and_password() {
+        let screen = draw(&picking(), 70, 14);
+        // First row highlighted, second not; the protected one is marked.
+        assert!(screen.contains("▸ Attic — 10.0.0.3:7392"), "{screen}");
+        assert!(screen.contains("Kitchen — 10.0.0.2:7392 🔒"), "{screen}");
+        assert!(!screen.contains("▸ Kitchen"), "{screen}");
+        assert!(screen.contains("enter connects"), "{screen}");
+    }
+
+    #[test]
+    fn the_picker_moves_within_bounds() {
+        let mut state = picking();
+        state.picker_move(-1); // clamped at the top
+        assert_eq!(state.picker.as_ref().unwrap().cursor, 0);
+        state.picker_move(1);
+        assert_eq!(state.picker.as_ref().unwrap().cursor, 1);
+        state.picker_move(1); // clamped at the bottom
+        assert_eq!(state.picker.as_ref().unwrap().cursor, 1);
+        assert!(draw(&state, 70, 14).contains("▸ Kitchen"));
+    }
+
+    #[test]
+    fn the_highlight_follows_its_receiver_when_the_list_shifts() {
+        let mut state = picking();
+        state.picker_move(1); // on Kitchen
+        state.apply(Update::Discovery(Discovery::Receivers(vec![
+            found("Basement", "ws://10.0.0.9:7392", false),
+            found("Kitchen", "ws://10.0.0.2:7392", true),
+        ])));
+        assert!(draw(&state, 70, 14).contains("▸ Kitchen"));
+        // Its receiver disappearing parks the highlight at the top.
+        state.apply(Update::Discovery(Discovery::Receivers(vec![found(
+            "Basement",
+            "ws://10.0.0.9:7392",
+            false,
+        )])));
+        assert!(draw(&state, 70, 14).contains("▸ Basement"));
+    }
+
+    #[test]
+    fn choosing_connects_and_retires_the_picker() {
+        let mut state = picking();
+        state.picker_move(1);
+        let endpoint = state.choose().expect("a row is highlighted");
+        assert_eq!(
+            endpoint,
+            crate::client::Endpoint::Url("ws://10.0.0.2:7392".into())
+        );
+        // The choice behaves like an explicit endpoint: a connecting
+        // screen for it, and no picker ever again — its downs are shown
+        // as connection state, the way an explicit endpoint's are.
+        let screen = draw(&state, 60, 12);
+        assert!(screen.contains("ws://10.0.0.2:7392"), "{screen}");
+        assert!(screen.contains("connecting"), "{screen}");
+        state.apply(Update::NoLocalReceiver);
+        assert!(!draw(&state, 60, 12).contains("receivers on the network"));
+    }
+
+    #[test]
+    fn a_local_receiver_wins_over_the_picker() {
+        let mut state = picking();
+        state.apply(Update::Connected("/run/openairplay2/tui.sock".into()));
+        state.apply(msg(Message::Snapshot(
+            openairplay2_tui_protocol::Snapshot {
+                receiver: openairplay2_tui_protocol::ReceiverInfo {
+                    name: "Living Room".into(),
+                    version: "0.5.0".into(),
+                },
+                ..Default::default()
+            },
+        )));
+        let screen = draw(&state, 60, 12);
+        assert!(screen.contains("waiting for a sender"), "{screen}");
+        assert!(!screen.contains("receivers on the network"), "{screen}");
+    }
+
+    #[test]
+    fn an_empty_search_and_an_impossible_one_look_different() {
+        let mut state = NowPlaying::new("local receiver".into(), kitty());
+        state.apply(Update::NoLocalReceiver);
+        assert!(draw(&state, 70, 14).contains("searching"), "still looking");
+
+        state.apply(Update::Discovery(Discovery::Unavailable(
+            "no Avahi daemon".into(),
+        )));
+        let screen = draw(&state, 70, 14);
+        assert!(
+            screen.contains("cannot browse the network here"),
+            "{screen}"
+        );
+        assert!(screen.contains("no Avahi daemon"), "{screen}");
+    }
+
+    #[test]
+    fn forced_discovery_skips_the_local_framing() {
+        // --discover: the picker is the point, so it is up before any "no
+        // local receiver" report, and the local-fallback line would lie.
+        let mut state = NowPlaying::new("receivers on the network".into(), kitty());
+        state.force_discovery();
+        state.apply(Update::Discovery(Discovery::Receivers(vec![found(
+            "Kitchen",
+            "ws://10.0.0.2:7392",
+            false,
+        )])));
+        let screen = draw(&state, 70, 14);
+        assert!(screen.contains("▸ Kitchen"), "{screen}");
+        assert!(!screen.contains("a local one still connects"), "{screen}");
     }
 
     #[test]

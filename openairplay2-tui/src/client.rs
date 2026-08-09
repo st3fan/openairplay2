@@ -14,7 +14,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use log::{debug, info, warn};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
@@ -92,6 +92,13 @@ pub enum Update {
     /// wrong). Retrying slowly — the answer will not change until someone
     /// changes a configuration.
     Unauthorized,
+    /// No-endpoint mode only: a full round of the local candidates found no
+    /// receiver, so the display should offer the network's instead.
+    NoLocalReceiver,
+    /// What browsing the network has turned up (or that it cannot happen
+    /// here). Sent by [`discover`](crate::discover), on the same channel so
+    /// the display has one stream of truth.
+    Discovery(crate::discover::Discovery),
 }
 
 /// Try `endpoints` in order, forward everything from the first that answers
@@ -131,6 +138,66 @@ pub async fn run(
             return;
         }
         tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// The no-endpoint mode: keep trying the `local` candidates, and while none
+/// answers, let the display offer what discovery found — a receiver chosen
+/// there arrives on `selections` and becomes the endpoint, from then on
+/// treated exactly like an explicit argument. Until a choice is made, a
+/// *local* receiver appearing wins automatically: the zero-config case must
+/// survive the display being started before its receiver. A discovered
+/// (network) receiver is never auto-connected — that is a choice, not a
+/// default.
+pub async fn run_local_or_selected(
+    local: Vec<Endpoint>,
+    password: Option<String>,
+    updates: UnboundedSender<Update>,
+    mut selections: UnboundedReceiver<Endpoint>,
+) {
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        for endpoint in &local {
+            // A choice made while we were probing wins over more probing.
+            match selections.try_recv() {
+                Ok(selected) => return run(vec![selected], password, updates).await,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            }
+            match session(endpoint, password.as_deref(), &updates).await {
+                Ok(true) => {
+                    // Connected and later dropped: say so now — the round
+                    // continues, and a stale "connected" screen would lie —
+                    // then look local-first again from a fresh backoff.
+                    backoff = FIRST_BACKOFF;
+                    if updates.send(Update::Disconnected).is_err() {
+                        return;
+                    }
+                }
+                Ok(false) => return, // the display hung up
+                Err(e) => {
+                    debug!("connection to {} failed: {e}", endpoint.label());
+                    // A local endpoint that *refuses* us (the legacy TCP one
+                    // with a password) is not one we can silently use — the
+                    // picker is still the right screen, just without the
+                    // hammering.
+                    if is_unauthorized(&e) {
+                        backoff = MAX_BACKOFF;
+                    }
+                }
+            }
+        }
+        if updates.send(Update::NoLocalReceiver).is_err() {
+            return;
+        }
+        tokio::select! {
+            selected = selections.recv() => match selected {
+                Some(endpoint) => return run(vec![endpoint], password, updates).await,
+                None => return, // the display is gone
+            },
+            _ = tokio::time::sleep(backoff) => {}
+        }
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -236,6 +303,59 @@ mod tests {
         assert_eq!(
             Endpoint::parse("tui.sock"),
             Endpoint::Socket(PathBuf::from("tui.sock"))
+        );
+    }
+
+    #[tokio::test]
+    async fn no_local_receiver_is_reported_and_a_choice_connects() {
+        // The no-endpoint flow end to end: local candidates that answer
+        // nothing, the "offer the network" signal, then a picker choice
+        // arriving and behaving like an explicit endpoint.
+        let missing = std::env::temp_dir().join(format!(
+            "openairplay2-tui-test-{}-no-receiver.sock",
+            std::process::id()
+        ));
+        let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (selections_tx, selections_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(run_local_or_selected(
+            vec![Endpoint::Socket(missing)],
+            None,
+            updates_tx,
+            selections_rx,
+        ));
+
+        // A full local round found nothing.
+        assert_eq!(updates_rx.recv().await, Some(Update::NoLocalReceiver));
+
+        // A receiver on the network, as the picker would name it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            use futures_util::SinkExt;
+            let text = serde_json::to_string(&Message::Paused { paused: true }).unwrap();
+            socket.send(WsMessage::Text(text.into())).await.unwrap();
+            // Hold the connection open until the test is done with it.
+            while socket.next().await.is_some() {}
+        });
+        selections_tx.send(Endpoint::parse(&url)).unwrap();
+
+        // The choice connects (skipping however many more empty local
+        // rounds finished first) and its messages flow.
+        loop {
+            match updates_rx.recv().await.expect("the client stays up") {
+                Update::NoLocalReceiver => continue,
+                Update::Connected(label) => {
+                    assert_eq!(label, url);
+                    break;
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
+        }
+        assert_eq!(
+            updates_rx.recv().await,
+            Some(Update::Message(Box::new(Message::Paused { paused: true })))
         );
     }
 
