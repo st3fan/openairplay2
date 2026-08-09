@@ -125,7 +125,12 @@ impl NowPlaying {
     /// Fold one client update into the display state.
     pub fn apply(&mut self, update: Update) {
         match update {
-            Update::Connected => self.connection = Connection::Connected,
+            Update::Connected(endpoint) => {
+                self.connection = Connection::Connected;
+                // Which endpoint answered — with several candidates tried,
+                // a later "connection lost" names the one that was live.
+                self.endpoint = endpoint;
+            }
             Update::Disconnected => self.connection = Connection::Lost,
             Update::Unauthorized => self.connection = Connection::Unauthorized,
             Update::Message(message) => self.apply_message(*message),
@@ -789,7 +794,7 @@ mod tests {
     /// Connected, with the receiver's snapshot but nothing playing.
     fn connected() -> NowPlaying {
         let mut state = NowPlaying::new("ws://127.0.0.1:7392".into(), kitty());
-        state.apply(Update::Connected);
+        state.apply(Update::Connected("ws://test".into()));
         state.apply(msg(Message::Snapshot(
             openairplay2_tui_protocol::Snapshot {
                 receiver: openairplay2_tui_protocol::ReceiverInfo {
@@ -868,7 +873,7 @@ mod tests {
         // What a display started mid-track gets: everything at once.
         use openairplay2_tui_protocol as proto;
         let mut state = NowPlaying::new("ws://host:7392".into(), kitty());
-        state.apply(Update::Connected);
+        state.apply(Update::Connected("ws://test".into()));
         state.apply(msg(Message::Snapshot(proto::Snapshot {
             receiver: proto::ReceiverInfo {
                 name: "Living Room".into(),
@@ -1249,7 +1254,7 @@ mod tests {
         // playing.
         use openairplay2_tui_protocol as proto;
         let mut state = NowPlaying::new("ws://host:7392".into(), kitty());
-        state.apply(Update::Connected);
+        state.apply(Update::Connected("ws://test".into()));
         state.apply(msg(Message::Snapshot(proto::Snapshot {
             receiver: proto::ReceiverInfo {
                 name: "Living Room".into(),
