@@ -4,9 +4,9 @@
 //! The receiver may be down when the display starts, may restart under it,
 //! or may live on a machine that reboots — so this reconnects for as long as
 //! the display runs, and the display shows the connection state rather than
-//! a stale screen or an exit. With no `--connect`, it looks for a local
-//! receiver first: the Unix socket the receiver serves by default, then the
-//! legacy loopback TCP endpoint.
+//! a stale screen or an exit. With no endpoint argument, it looks for a
+//! local receiver first: the Unix socket the receiver serves by default,
+//! then the legacy loopback TCP endpoint.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -41,8 +41,8 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    /// Classify a `--connect` value: `ws://` and `wss://` are URLs, anything
-    /// else is a socket path.
+    /// Classify an endpoint argument: `ws://` and `wss://` are URLs,
+    /// anything else is a socket path.
     pub fn parse(value: &str) -> Endpoint {
         if value.starts_with("ws://") || value.starts_with("wss://") {
             Endpoint::Url(value.to_string())
@@ -60,9 +60,9 @@ impl Endpoint {
     }
 }
 
-/// Where to look when `--connect` says nothing: the receiver's default
-/// socket paths — per-user first (a receiver run by hand), then the system
-/// one (the packaged service) — and finally the legacy TCP default.
+/// Where to look when no endpoint was given: the receiver's default socket
+/// paths — per-user first (a receiver run by hand), then the system one
+/// (the packaged service) — and finally the legacy TCP default.
 pub fn default_endpoints(xdg_runtime_dir: Option<&str>) -> Vec<Endpoint> {
     let mut endpoints = Vec::new();
     if let Some(dir) = xdg_runtime_dir.filter(|dir| !dir.is_empty()) {

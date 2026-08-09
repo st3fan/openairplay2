@@ -27,8 +27,10 @@ extended-description = """\
 A full-screen now-playing display for an openairplay2 receiver: track title, \
 artist and album, playback position, volume, and the cover art drawn as a \
 real image on terminals that support Kitty or iTerm2 graphics. It watches a \
-receiver over a WebSocket — start openairplay2-receiver with --tui-listen \
-(on this or any other machine) and point openairplay2-tui --connect at it."""
+receiver over a WebSocket. On the machine the receiver runs on it needs no \
+arguments at all — the receiver's local socket is found on its own; for a \
+receiver elsewhere, start it with --tui-listen and name its ws:// endpoint \
+as the one argument."""
 section = "sound"
 priority = "optional"
 depends = "libc6"

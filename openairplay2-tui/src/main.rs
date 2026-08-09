@@ -26,8 +26,8 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100)
 
 #[derive(Debug, PartialEq)]
 struct Args {
-    /// `--connect`: a `ws://` URL or a socket path. `None` means look for a
-    /// local receiver (see [`client::default_endpoints`]).
+    /// The positional endpoint: a `ws://` URL or a socket path. `None`
+    /// means look for a local receiver (see [`client::default_endpoints`]).
     endpoint: Option<String>,
     /// Forced terminal-graphics protocol, or `None` to detect one.
     images: Option<Protocol>,
@@ -46,21 +46,20 @@ enum Action {
     Version,
 }
 
-const USAGE: &str = "usage: openairplay2-tui [options] — run with --help for the list";
+const USAGE: &str = "usage: openairplay2-tui [options] [endpoint] — run with --help for the list";
 
 const HELP: &str = "\
 openairplay2-tui — full-screen now-playing display for an openairplay2 receiver
 
-usage: openairplay2-tui [options]
+usage: openairplay2-tui [options] [endpoint]
+
+The endpoint is the receiver's now-playing endpoint: a ws://HOST:PORT URL
+(the receiver's --tui-listen) or the path of its local socket (its
+--tui-socket). Without one, a local receiver is found on its own:
+$XDG_RUNTIME_DIR/openairplay2/tui.sock, then /run/openairplay2/tui.sock,
+then ws://127.0.0.1:7392.
 
 options:
-  --connect ENDPOINT        the receiver's now-playing endpoint: a
-                            ws://HOST:PORT URL (the receiver's --tui-listen)
-                            or the path of its local socket (--tui-socket).
-                            By default a local receiver is found on its own:
-                            $XDG_RUNTIME_DIR/openairplay2/tui.sock, then
-                            /run/openairplay2/tui.sock, then
-                            ws://127.0.0.1:7392
   --images auto|kitty|iterm2|none
                             terminal-graphics protocol for the cover art:
                             auto probes the terminal, none is text-only
@@ -89,7 +88,6 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--connect" => args.endpoint = Some(value("--connect", &mut it)?),
             "--images" => {
                 let v = value("--images", &mut it)?;
                 args.images = match v.as_str() {
@@ -103,6 +101,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--password" => args.password = Some(value("--password", &mut it)?),
             "--version" => return Ok(Action::Version),
             "-h" | "--help" => return Ok(Action::Help),
+            // The one positional argument: the endpoint to watch.
+            other if !other.starts_with('-') && args.endpoint.is_none() => {
+                args.endpoint = Some(other.to_string());
+            }
+            other if !other.starts_with('-') => {
+                return Err(format!("unexpected extra argument: {other}"));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -189,9 +194,9 @@ async fn main() -> ExitCode {
         }
     }
 
-    // The endpoints to try: an explicit --connect alone, or the local
-    // candidates a zero-config receiver serves by default. The label is
-    // what the screen shows until (and about) a connection.
+    // The endpoints to try: an explicit endpoint argument alone, or the
+    // local candidates a zero-config receiver serves by default. The label
+    // is what the screen shows until (and about) a connection.
     let endpoints = match &args.endpoint {
         Some(value) => vec![Endpoint::parse(value)],
         None => client::default_endpoints(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()),
@@ -269,7 +274,6 @@ mod tests {
     #[test]
     fn every_flag_parses() {
         let args = run_args(&[
-            "--connect",
             "ws://10.0.0.5:7392",
             "--images",
             "kitty",
@@ -282,13 +286,27 @@ mod tests {
     }
 
     #[test]
-    fn connect_takes_a_socket_path_too() {
+    fn the_endpoint_is_positional() {
+        // A URL or a socket path, anywhere among the flags.
         assert_eq!(
-            run_args(&["--connect", "/run/openairplay2/tui.sock"])
+            run_args(&["/run/openairplay2/tui.sock"])
                 .endpoint
                 .as_deref(),
             Some("/run/openairplay2/tui.sock")
         );
+        assert_eq!(
+            run_args(&["--images", "none", "ws://10.0.0.5:7392"])
+                .endpoint
+                .as_deref(),
+            Some("ws://10.0.0.5:7392")
+        );
+        // A second positional is a mistake, named in the error.
+        let err = parse_strs(&["a.sock", "b.sock"]).unwrap_err();
+        assert!(err.contains("b.sock"), "{err}");
+        // The retired flag is gone: it reads as an unknown argument.
+        assert!(parse_strs(&["--connect", "x"])
+            .unwrap_err()
+            .contains("--connect"));
     }
 
     #[test]
@@ -313,9 +331,7 @@ mod tests {
 
     #[test]
     fn mistakes_name_the_flag() {
-        assert!(parse_strs(&["--connect"])
-            .unwrap_err()
-            .contains("--connect"));
+        assert!(parse_strs(&["--images"]).unwrap_err().contains("--images"));
         assert!(parse_strs(&["--frobnicate"])
             .unwrap_err()
             .contains("--frobnicate"));
@@ -326,7 +342,6 @@ mod tests {
     #[test]
     fn help_describes_every_flag() {
         let flags: &[&[&str]] = &[
-            &["--connect", "x"],
             &["--images", "none"],
             &["--log-file", "x"],
             &["--password", "x"],
