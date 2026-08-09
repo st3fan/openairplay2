@@ -55,8 +55,10 @@ a follow-up issue.
 
 ## Scope
 
-Library-only. One new piece of shared state — the play lock — and the
-takeover path:
+Two halves that interlock: **who is playing** (library) and **what they play
+through** (receiver binary).
+
+**Library — the play lock and the takeover path:**
 
 - A connection acquires the **active-session slot** at **SETUP phase 1**
   (`setup_timing`, [session.rs](../openairplay2/src/session.rs)) — the same
@@ -76,17 +78,63 @@ takeover path:
   "allow interruption" knob is Classic-AirPlay-only in shairport-sync and
   is declined here (recorded so it isn't re-proposed).
 
+**Receiver binary — one ALSA device for the life of the process:**
+
+Ordered handover fixes the receiver racing *itself*, but not the failure
+seen in the wild:
+
+```
+WARN openairplay2_receiver::player] player: cannot open ALSA
+     (snd_pcm_open: Device or resource busy); decode-only
+```
+
+Any moment the receiver closes the device — session end, or the gap inside
+a takeover — an external contender (PipeWire with queued desktop streams,
+on a box where the card is also the desktop sink) can seize it, and the
+next stream start is `EBUSY` → silent decode-only (#110). So the receiver
+stops closing it: **`AlsaOutput` becomes global — opened once, kept for the
+whole process, shared by every stream including taken-over ones.** The
+track-tick fix already built exactly the right object: the PCM stream is
+configured never to stop (`stop_threshold = boundary`, silence-fill,
+`snd_pcm_rewind` for flush), so between streams the card simply plays
+silence. The per-stream `AudioSink` the sink factory hands the library
+becomes a cheap handle onto the one persistent output — flush rewinds it,
+the gain and fade-in work as today — and dropping a sink no longer closes
+the device. Purely host-side; the library's sink seam is untouched.
+
+Consequences worth naming:
+
+- The takeover gap disappears as a *device* event entirely: nothing closes,
+  nothing reopens, nobody else can get in between. This closes #110's
+  external-contention half for a running receiver — only the very first
+  open can fail, which the startup probe already surfaces.
+- A card that is held open playing silence never enters standby — the
+  roadmap's "DAC standby prevention" item falls out as a side effect
+  (to be confirmed on hardware and, if borne out, retired from the
+  roadmap).
+- Today every stream is 44.1 kHz stereo (`aac_params()` hard-codes it), so
+  one persistent configuration fits all streams; if format negotiation
+  ever lands, the output reopens on a rate change — noted here so that
+  future work knows this assumption lives in the binary.
+- `--no-audio` and a failed startup open behave as today (`NullSink`,
+  decode-only); the persistent output is lazily opened at first use if the
+  startup probe warned rather than failed.
+
 ### Out of scope
 
 - **Busy/gid TXT advertising while active** (status bit 11 + sender
   `groupUUID` mirroring, mDNS re-announce) — follow-up issue.
-- **Retry-on-EBUSY for external device contention** — that is #110's
-  remaining half (PipeWire and friends), unrelated to sender arbitration.
+- **Retry-on-EBUSY at the very first open** — the persistent output narrows
+  #110 to exactly one moment: process start on a box where something else
+  briefly holds the card. The startup probe already warns there; a retry
+  loop for it stays out of scope (and #110 gets updated to say so).
 - **Multi-room, relaying, or any second *simultaneous* stream.** The design
   stays one sender → one stream → one output; this plan is about *which*
   sender that is.
 
 ## Design
+
+**Library side:**
 
 - `Context` gains the slot: conceptually
   `active: Mutex<Option<ActiveSession>>`, where `ActiveSession` carries a
@@ -111,6 +159,19 @@ takeover path:
 - The slot is released on connection teardown (whoever holds it), so a
   sender that stops normally leaves the receiver free without any takeover.
 
+**Receiver-binary side:**
+
+- `AlsaOutput` moves out of `AlsaSink` into a process-lifetime holder
+  (opened at startup when the probe succeeds, else lazily at first use).
+  `AlsaSink` keeps its whole per-stream role — gain, fade-in, scratch
+  buffer — but borrows the shared output for writes and rewinds it on
+  flush; its `Drop` rewinds instead of closing, so a session ending leaves
+  the card open, playing silence.
+- The ordering guarantee still matters and still holds: the library's
+  takeover path drops the old sink (ending its player thread's writes)
+  before the new sink exists, so two streams never interleave writes into
+  the shared output.
+
 ## Test strategy
 
 - **Integration (`openairplay2/tests/`, real sockets, synthetic senders):**
@@ -123,12 +184,20 @@ takeover path:
     `GET /info`, completes pair-setup — and A's stream is undisturbed.
 - **Unit:** the slot's three acquire cases (free / held-by-self /
   held-by-other) and the timeout path.
+- **Receiver binary:** the shared-output handover against the ALSA `null`
+  device (open once → stream A writes → A drops → stream B writes, same
+  output, no reopen — extending the existing FFI round-trip test); a
+  sink drop leaves the output open.
 - **Hardware acceptance (the milestone convention):** the HomePod
   reference is already recorded above; against this receiver the same
   sequence must match it — iPhone streams, Mac starts, the Mac plays
   within a couple of seconds and the iPhone's player shows paused; then
   the reverse direction; the now-playing display follows the handover;
-  and a same-device quick stop/restart still reconnects cleanly.
+  and a same-device quick stop/restart still reconnects cleanly. All of it
+  on the exclusive `plughw:` device on the desktop where the `EBUSY` →
+  decode-only failure was observed, with the desktop session active: the
+  warn line must not appear across takeovers and session ends, and desktop
+  audio must not capture the card between streams.
 
 ## Acceptance criteria
 
@@ -136,13 +205,20 @@ takeover path:
   connection closes, and the new stream plays — on hardware, both
   directions, matching the HomePod-observed behavior.
 - Probing connections never interrupt playback.
-- Sink lifetimes never overlap (asserted in the integration test), so
-  exclusive ALSA devices hand over cleanly.
+- Sink lifetimes never overlap (asserted in the integration test), and the
+  receiver binary opens its ALSA device once for the whole process — no
+  close/reopen on session end or takeover, so nothing external can capture
+  the card and the `EBUSY` → decode-only failure cannot recur while the
+  receiver runs.
 - No public API change beyond behavior; no new configuration; macOS library
   tests stay green.
 
 ## Phases
 
 1. **This plan** (bottom of the stack), including the HomePod observation.
-2. **Implementation** — the slot, cooperative shutdown, ordered handover,
-   tests. One PR; library-only.
+2. **Library: the takeover** — the slot, cooperative shutdown, ordered
+   handover, integration tests.
+3. **Receiver: the persistent output** — the process-lifetime `AlsaOutput`,
+   sinks as handles onto it, tests; update #110 to its narrowed scope, and
+   note the DAC-standby side effect on the roadmap item once confirmed on
+   hardware.
