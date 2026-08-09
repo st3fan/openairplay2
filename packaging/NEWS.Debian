@@ -10,6 +10,12 @@ openairplay2-receiver (0.5.0-1) unstable; urgency=medium
   (OPENAIRPLAY2_TUI_LISTEN, for a display on another machine) is
   unchanged.
 
+  The pairing pincode is now called the password — Apple's own word: iOS
+  and macOS show a password dialog for it, and it may be alphanumeric,
+  not just digits. Set OPENAIRPLAY2_PASSWORD in the options file;
+  OPENAIRPLAY2_PINCODE (and --pincode) from 0.4 are still honored, with
+  a reminder in the log to rename.
+
  -- Stefan Arentz <stefan.arentz@gmail.com>  Sat, 08 Aug 2026 22:00:00 -0400
 
 openairplay2-receiver (0.4.0-1) unstable; urgency=medium

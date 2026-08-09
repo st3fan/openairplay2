@@ -24,12 +24,12 @@ impl AudioSink for TestSink {
 }
 
 async fn start() -> SocketAddr {
-    start_with_pincode(0x4, None).await
+    start_with_password(0x4, None).await
 }
 
 /// Start a server with an explicit status bit 7 (password required) and a
-/// pincode, to exercise the pair-pin-start + SRP-with-pincode flow.
-async fn start_with_pincode(status_extra: u32, pincode: Option<&str>) -> SocketAddr {
+/// password, to exercise the pair-pin-start + SRP-with-password flow.
+async fn start_with_password(status_extra: u32, password: Option<&str>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let sink_factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
@@ -43,7 +43,7 @@ async fn start_with_pincode(status_extra: u32, pincode: Option<&str>) -> SocketA
             source_version: "366.0".into(),
             features: 0x0001_8340_405F_CA00,
             status_flags: 0x4 | status_extra,
-            pincode: pincode.map(str::to_string),
+            password: password.map(str::to_string),
         },
         identity: Identity::generate(),
         sink_factory,
@@ -358,29 +358,31 @@ async fn pair_setup(addr: SocketAddr, pin: &str) -> (SrpClient, Tlv) {
     (client, Tlv::decode(&body).unwrap())
 }
 
-/// A pincode-protected receiver answers `pair-pin-start` with an empty 200 and
-/// pairs with the correct SRP pincode; the standard transient 3939 is refused.
+/// A password-protected receiver answers `pair-pin-start` with an empty 200
+/// and pairs with the correct SRP password; the standard transient 3939 is
+/// refused. The password is alphanumeric — Apple's dialog is free-text, not
+/// a digit pad.
 #[tokio::test]
-async fn pincode_pin_start_and_srp() {
-    let addr = start_with_pincode(1 << 7, Some("1212")).await;
+async fn password_pin_start_and_srp() {
+    let addr = start_with_password(1 << 7, Some("open sesame")).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
-    // The sender that sees "password required" asks for the pincode first.
+    // The sender that sees "password required" asks for the password first.
     let (status, body) =
         plain_request(&mut stream, "POST /pair-pin-start RTSP/1.0\r\nCSeq: 0", &[]).await;
     assert_eq!(status, "RTSP/1.0 200 OK");
     assert!(body.is_empty(), "pair-pin-start returns an empty body");
 
-    // The correct pincode pairs (M4 Done, HAMK verifies); the transient 3939
-    // is refused because the receiver's SRP password is the pincode.
-    let (_, m4) = pair_setup(addr, "1212").await;
+    // The correct password pairs (M4 Done, HAMK verifies); the transient
+    // 3939 is refused because the receiver's SRP password is the password.
+    let (_, m4) = pair_setup(addr, "open sesame").await;
     assert_eq!(m4.get_u8(ty::STATE), Some(4));
-    assert_eq!(m4.get_u8(ty::ERROR), None, "correct pincode accepted");
+    assert_eq!(m4.get_u8(ty::ERROR), None, "correct password accepted");
 
     let (_, m4) = pair_setup(addr, "3939").await;
     assert_eq!(m4.get_u8(ty::ERROR), Some(0x02), "transient 3939 refused");
 
-    // With no pincode configured, the standard 3939 still works (drop-in).
+    // With no password configured, the standard 3939 still works (drop-in).
     let addr = start().await;
     let (_, m4) = pair_setup(addr, "3939").await;
     assert_eq!(m4.get_u8(ty::ERROR), None);

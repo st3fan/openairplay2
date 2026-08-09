@@ -30,15 +30,15 @@ const DEFAULT_SOURCE_VERSION: &str = "366.0";
 const DEFAULT_FEATURES: u64 = 0x0001_8340_405F_CA00;
 const DEFAULT_STATUS_FLAGS: u32 = 0x4;
 /// Status-flag bit 7 ("Password required"), which makes Apple senders prompt
-/// for a pincode and pair with it instead of silently using transient `3939`
-/// (proven on iOS 26). Shairport-sync sets the same bit when a password is
-/// configured.
+/// for the password and pair with it instead of silently using transient
+/// `3939` (proven on iOS 26). Shairport-sync sets the same bit when a
+/// password is configured.
 const PASSWORD_REQUIRED_FLAG: u32 = 1 << 7;
 
 /// Advertised status flags: audio-attached, plus "password required" when a
-/// pincode is configured.
-fn status_flags(pincode: bool) -> u32 {
-    if pincode {
+/// password is configured.
+fn status_flags(password: bool) -> u32 {
+    if password {
         DEFAULT_STATUS_FLAGS | PASSWORD_REQUIRED_FLAG
     } else {
         DEFAULT_STATUS_FLAGS
@@ -61,7 +61,7 @@ pub struct ReceiverBuilder {
     identity: Option<Identity>,
     identity_path: Option<PathBuf>,
     advertise: bool,
-    pincode: Option<String>,
+    password: Option<String>,
 }
 
 impl ReceiverBuilder {
@@ -73,7 +73,7 @@ impl ReceiverBuilder {
             identity: None,
             identity_path: None,
             advertise: true,
-            pincode: None,
+            password: None,
         }
     }
 
@@ -120,13 +120,21 @@ impl ReceiverBuilder {
         self
     }
 
-    /// Require this pincode to pair: a sender must enter it (AirPlay 2's
-    /// analog of openairplay1's `--password`); the receiver advertises
-    /// "password required" (status-flag bit 7). Unset → transient `3939`.
-    /// Never logged.
-    pub fn pincode(mut self, pincode: impl Into<String>) -> Self {
-        self.pincode = Some(pincode.into());
+    /// Require this password to pair: a sender must enter it. "Password" is
+    /// Apple's word — iOS and macOS show a password dialog and accept
+    /// alphanumerics, not just digits — and the receiver advertises
+    /// "password required" (status-flag bit 7). Unset → the standard
+    /// transient code `3939`. Never logged.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
         self
+    }
+
+    /// Renamed to [`password`](Self::password) — iOS and macOS call it the
+    /// password, and accept more than digits.
+    #[deprecated(since = "0.5.0", note = "renamed to `password`")]
+    pub fn pincode(self, pincode: impl Into<String>) -> Self {
+        self.password(pincode)
     }
 
     /// Resolve the identity and MAC and produce a runnable [`Receiver`].
@@ -160,8 +168,8 @@ impl ReceiverBuilder {
                 model: DEFAULT_MODEL.to_string(),
                 source_version: DEFAULT_SOURCE_VERSION.to_string(),
                 features: DEFAULT_FEATURES,
-                status_flags: status_flags(self.pincode.is_some()),
-                pincode: self.pincode,
+                status_flags: status_flags(self.password.is_some()),
+                password: self.password,
             },
             identity,
             advertise: self.advertise,
@@ -259,23 +267,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pincode_sets_password_required_status_flag() {
-        // No pincode: just audio attached.
+    fn password_sets_password_required_status_flag() {
+        // No password: just audio attached.
         assert_eq!(status_flags(false), 0x4);
-        // Pincode set: also advertise "password required" (status bit 7),
+        // Password set: also advertise "password required" (status bit 7),
         // which is what makes iOS prompt for it.
         assert_eq!(status_flags(true), 0x4 | 1 << 7);
     }
 
     #[test]
-    fn build_applies_the_pincode() {
+    fn build_applies_the_password() {
+        let receiver = Receiver::builder()
+            .identity(Identity::generate())
+            .password("sekrit1")
+            .build()
+            .unwrap();
+        assert_eq!(receiver.config().password.as_deref(), Some("sekrit1"));
+        assert_eq!(receiver.config().status_flags, 0x4 | 1 << 7);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_pincode_spelling_still_builds() {
         let receiver = Receiver::builder()
             .identity(Identity::generate())
             .pincode("1212")
             .build()
             .unwrap();
-        assert_eq!(receiver.config().pincode.as_deref(), Some("1212"));
-        assert_eq!(receiver.config().status_flags, 0x4 | 1 << 7);
+        assert_eq!(receiver.config().password.as_deref(), Some("1212"));
     }
 
     #[test]
