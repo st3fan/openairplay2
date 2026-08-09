@@ -336,6 +336,14 @@ impl SharedOutput {
         Ok(())
     }
 
+    /// Catch the application pointer up with the hardware pointer if the
+    /// stream ran on without us (see [`AlsaOutput::resync`]). Returns whether
+    /// it had to — the caller treats that as audio resuming from silence.
+    fn resync(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        state.output.as_mut().is_some_and(AlsaOutput::resync)
+    }
+
     /// Write samples, blocking to pace playback. Nothing happens if the
     /// device never opened.
     fn write(&self, samples: &[i16]) {
@@ -406,6 +414,13 @@ impl AudioSink for AlsaSink {
     fn write(&mut self, pcm: &[i16]) {
         if !self.playable {
             return;
+        }
+        // The stream never stops, so while nothing was written — a pause, a
+        // stall — the hardware pointer kept going and ours did not. Catch up
+        // before writing, or these samples land *behind* the play position
+        // and are never properly heard.
+        if self.output.resync() {
+            self.fade_pos = 0; // audio after silence: ramp it, don't click
         }
         self.scratch.clear();
         self.scratch.extend_from_slice(pcm);
@@ -501,6 +516,14 @@ struct Pointers {
 /// given a playback `avail` and the ring size: the amount `avail` overshoots
 /// the buffer. Zero for any healthy reading (including a negative `avail`,
 /// which is an error code, not a measurement).
+/// A frame count as ALSA wants it. `snd_pcm_uframes_t` is `c_ulong`: the same
+/// width as this `u64` here, but 32 bits on armhf (which this project ships a
+/// .deb for), so the conversion is only a no-op on some targets.
+#[allow(clippy::unnecessary_cast)]
+fn uframes(frames: u64) -> alsa_sys::snd_pcm_uframes_t {
+    frames as alsa_sys::snd_pcm_uframes_t
+}
+
 fn frames_behind(avail: i64, buffer_size: u64) -> u64 {
     if avail <= 0 {
         return 0;
@@ -657,6 +680,15 @@ impl AlsaOutput {
         }
     }
 
+    /// Whether the stream is started and playing — the only state in which
+    /// the hardware pointer moves on its own.
+    fn is_running(&self) -> bool {
+        unsafe {
+            alsa_sys::snd_pcm_state(self.pcm)
+                == alsa_sys::SND_PCM_STATE_RUNNING as alsa_sys::snd_pcm_state_t
+        }
+    }
+
     /// The PCM state (`RUNNING`, `XRUN`, …) as ALSA names it.
     fn state_name(&self) -> String {
         unsafe {
@@ -684,6 +716,60 @@ impl AlsaOutput {
             self.buffer_size,
             p.behind,
         );
+    }
+
+    /// Put the application pointer back where the hardware pointer is, if it
+    /// has fallen behind. Returns whether it had to.
+    ///
+    /// This is the price of a stream that never stops. Pause rewinds the
+    /// application pointer and then nothing is written for as long as the
+    /// pause lasts, while the hardware pointer advances in real time through
+    /// the silence fill. After a pause of minutes the two are minutes apart,
+    /// and every subsequent write lands in the ring *behind* the play
+    /// position: consumed instantly rather than played, so the blocking write
+    /// stops pacing anything, only stray fragments are audible, and — because
+    /// both pointers then advance at the same real-time rate — the gap never
+    /// closes on its own. That is the garbled-then-silent-then-garbled resume
+    /// of plans/20260809-01.
+    ///
+    /// Moving the application pointer forward to meet the hardware pointer
+    /// leaves the ring empty at the play position, which is exactly the state
+    /// a healthy stream writes into: pacing, backpressure and the ~0.5 s
+    /// cushion all come back by themselves as the held audio refills it. The
+    /// stream is never stopped, so this costs no pop (plans/20260808-01).
+    ///
+    /// Any stall long enough to empty the ring — not just a pause — ends in
+    /// the same state, so this runs before every write rather than only after
+    /// a pause, and heals whatever caused it.
+    fn resync(&mut self) -> bool {
+        use alsa_sys as a;
+        // Only a *running* stream can leave us behind. Before it starts
+        // (`PREPARED`, which is where the very first audio of a session is
+        // written) there is no play position to be behind, and `avail` need
+        // not even be meaningful — ALSA's `null` device reports twice the
+        // buffer there. Forwarding then would skip the opening audio.
+        if !self.is_running() {
+            return false;
+        }
+        // `avail` alone, not a full [`Pointers`] reading: this runs before
+        // every write (a few hundred times a second), and the common answer
+        // is "nothing to do".
+        let avail = unsafe { a::snd_pcm_avail(self.pcm) } as i64;
+        #[allow(clippy::useless_conversion)] // 32-bit uframes on armhf
+        let behind = frames_behind(avail, u64::from(self.buffer_size));
+        if behind == 0 {
+            return false; // the healthy case, and the common one
+        }
+        let moved = unsafe { a::snd_pcm_forward(self.pcm, uframes(behind)) };
+        debug!(
+            "player: ALSA application pointer was {behind} frames ({:.1}s) behind the \
+             hardware pointer; forwarded {moved}",
+            behind as f32 / self.rate.max(1) as f32,
+        );
+        if moved < 0 {
+            warn!("player: could not resynchronize the ALSA pointers ({moved})");
+        }
+        true
     }
 
     /// Write all interleaved samples, blocking to pace playback. The stream is
@@ -842,6 +928,12 @@ mod tests {
         // a real device must answer without erroring the stream.
         let _ = out.pointers();
         assert!(!out.state_name().is_empty());
+        // A healthy stream is never behind, so the resync must be a no-op —
+        // forwarding a stream that is keeping up would skip real audio. (The
+        // divergence itself needs a real card and real time, so it is checked
+        // on hardware, not here.)
+        assert!(!out.resync(), "a healthy stream must not be forwarded");
+        out.write(&vec![0i16; 4096]);
     }
 
     #[test]
