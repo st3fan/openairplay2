@@ -39,9 +39,15 @@
 # Device id in the advertisement (default: from a real network interface).
 #OPENAIRPLAY2_MAC=
 
-# Serve the now-playing WebSocket that openairplay2-tui renders, e.g.
-# 127.0.0.1:7392. It carries track metadata and cover art, so keep it on
-# loopback unless you mean otherwise.
+# The local now-playing socket that openairplay2-tui connects to by default.
+# Served at /run/openairplay2/tui.sock unless this names another path; "off"
+# serves none. Any local user may connect — the socket file's permissions
+# are the access control.
+#OPENAIRPLAY2_TUI_SOCKET=/run/openairplay2/tui.sock
+
+# Also serve the now-playing WebSocket over TCP, for a display on another
+# machine, e.g. 127.0.0.1:7392. It carries track metadata and cover art, so
+# keep it on loopback unless you mean otherwise.
 #OPENAIRPLAY2_TUI_LISTEN=
 
 # Require this password on the now-playing WebSocket; openairplay2-tui

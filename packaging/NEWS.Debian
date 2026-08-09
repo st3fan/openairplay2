@@ -1,3 +1,17 @@
+openairplay2-receiver (0.5.0-1) unstable; urgency=medium
+
+  The now-playing display works on-device with no configuration: the
+  daemon now serves its WebSocket on a local Unix socket,
+  /run/openairplay2/tui.sock, by default. Any local user can run
+  openairplay2-tui with no arguments on the same machine and see what is
+  playing — the socket file's permissions are the access control, so
+  there is no port and no password. OPENAIRPLAY2_TUI_SOCKET names
+  another path, or "off" to not serve it. The TCP endpoint
+  (OPENAIRPLAY2_TUI_LISTEN, for a display on another machine) is
+  unchanged.
+
+ -- Stefan Arentz <stefan.arentz@gmail.com>  Sat, 08 Aug 2026 22:00:00 -0400
+
 openairplay2-receiver (0.4.0-1) unstable; urgency=medium
 
   The options file /etc/default/openairplay2-receiver no longer uses

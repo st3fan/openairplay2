@@ -48,6 +48,9 @@ struct Args {
     mixer_device: Option<String>,
     /// Require this pincode to pair; `None` → transient `3939`.
     pincode: Option<String>,
+    /// The local now-playing Unix socket: a path, `off`, or `None` for the
+    /// default path (see [`tui_socket_path`]).
+    tui_socket: Option<String>,
     /// Address to serve the now-playing WebSocket on; off when `None`.
     tui_listen: Option<String>,
     /// Require this password on the now-playing WebSocket; `None` → open.
@@ -102,6 +105,31 @@ fn default_mixer_device(alsa_device: Option<&str>) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
+/// Where the now-playing Unix socket goes. `--tui-socket`: a path is bound
+/// exactly there (failing to is a config error, like a bad `--alsa-device`),
+/// `off` serves none, and unset means the default — the per-user runtime
+/// directory when there is one (a manual run), the system one otherwise
+/// (what `RuntimeDirectory=` gives the service) — where failing to bind
+/// only warns: it is a default, not a request, and a receiver that plays
+/// but has no local display socket beats one that refuses to start. The
+/// bool carries that explicit/default distinction to the caller.
+fn tui_socket_path(
+    configured: Option<&str>,
+    xdg_runtime_dir: Option<&str>,
+) -> Option<(PathBuf, bool)> {
+    match configured {
+        Some("off") => None,
+        Some(path) => Some((PathBuf::from(path), true)),
+        None => {
+            let base = match xdg_runtime_dir {
+                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+                _ => PathBuf::from("/run"),
+            };
+            Some((base.join("openairplay2").join("tui.sock"), false))
+        }
+    }
+}
+
 /// What the command line asks for; everything but `Run` prints and exits.
 /// `Args` is boxed only to keep the variants comparable in size (clippy's
 /// `large_enum_variant`).
@@ -146,6 +174,12 @@ options:
                             --list-mixers for this machine's controls
   --mixer-device DEV        mixer device holding that control (default: the
                             card of --alsa-device, else \"default\")
+  --tui-socket PATH|off     where to serve the local now-playing socket
+                            that openairplay2-tui connects to by default
+                            (default $XDG_RUNTIME_DIR/openairplay2/tui.sock,
+                            else /run/openairplay2/tui.sock); off serves
+                            none. Any local user may connect — the socket
+                            file's permissions are the access control
   --tui-listen ADDR         serve the now-playing WebSocket that
                             openairplay2-tui renders, e.g. 127.0.0.1:7392; it
                             carries track metadata and cover art, so keep it
@@ -170,8 +204,8 @@ options:
 
 Each option can also come from the environment — OPENAIRPLAY2_NAME, _PORT,
 _MAC, _IDENTITY_FILE, _PINCODE, _AVAHI (on/off), _AUDIO (on/off),
-_ALSA_DEVICE, _MIXER, _MIXER_DEVICE, _TUI_LISTEN, _TUI_PASSWORD,
-_LOG_LEVEL — which is how
+_ALSA_DEVICE, _MIXER, _MIXER_DEVICE, _TUI_SOCKET, _TUI_LISTEN,
+_TUI_PASSWORD, _LOG_LEVEL — which is how
 /etc/default/openairplay2-receiver configures the service. A flag wins over its
 variable; an empty variable is unset. %h in the name becomes this machine's
 hostname.
@@ -204,6 +238,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
         mixer: None,
         mixer_device: None,
         pincode: None,
+        tui_socket: None,
         tui_listen: None,
         tui_password: None,
         log_level: None,
@@ -236,6 +271,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--mixer" => args.mixer = Some(value("--mixer", &mut it)?),
             "--mixer-device" => args.mixer_device = Some(value("--mixer-device", &mut it)?),
             "--pincode" => args.pincode = Some(value("--pincode", &mut it)?),
+            "--tui-socket" => args.tui_socket = Some(value("--tui-socket", &mut it)?),
             "--tui-listen" => args.tui_listen = Some(value("--tui-listen", &mut it)?),
             "--tui-password" => args.tui_password = Some(value("--tui-password", &mut it)?),
             "--log-level" => {
@@ -331,6 +367,9 @@ fn resolve(mut args: Args, env: impl Fn(&str) -> Option<String>) -> Result<Args,
     }
     if args.pincode.is_none() {
         args.pincode = get("OPENAIRPLAY2_PINCODE");
+    }
+    if args.tui_socket.is_none() {
+        args.tui_socket = get("OPENAIRPLAY2_TUI_SOCKET");
     }
     if args.tui_listen.is_none() {
         args.tui_listen = get("OPENAIRPLAY2_TUI_LISTEN");
@@ -615,32 +654,60 @@ async fn main() -> ExitCode {
             None => Box::new(NullSink),
         }
     };
-    // The now-playing endpoint, if asked for. Bound before streaming starts so
-    // a bad address fails at startup rather than mid-session.
-    let publisher = match &args.tui_listen {
-        Some(addr) => {
-            let listener = match tokio::net::TcpListener::bind(addr).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    eprintln!("cannot listen for displays on {addr}: {e}");
-                    return ExitCode::from(EXIT_CONFIG);
-                }
-            };
-            // The password is a secret: name the state, never the value.
-            match &args.tui_password {
-                Some(_) => info!("now-playing endpoint: ws://{addr} (password required)"),
-                None => info!("now-playing endpoint: ws://{addr} (no password)"),
-            }
-            let publisher = tui::Publisher::new(receiver.config().name.clone());
-            tokio::spawn(tui::serve(
-                listener,
-                publisher.clone(),
-                args.tui_password.clone(),
-            ));
-            Some(publisher)
-        }
-        None => None,
+    // The now-playing endpoints: the local Unix socket (on by default, so an
+    // on-device display works with zero configuration) and TCP when asked
+    // for. Bound before streaming starts so a bad address fails at startup
+    // rather than mid-session; both serve the one publisher.
+    let socket_path = tui_socket_path(
+        args.tui_socket.as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    );
+    let publisher = if socket_path.is_some() || args.tui_listen.is_some() {
+        Some(tui::Publisher::new(receiver.config().name.clone()))
+    } else {
+        None
     };
+    let mut bound_socket = None;
+    if let (Some((path, explicit)), Some(publisher)) = (&socket_path, &publisher) {
+        match tui::bind_socket(path) {
+            Ok(listener) => {
+                info!("now-playing socket: {}", path.display());
+                bound_socket = Some(path.clone());
+                tokio::spawn(tui::serve_unix(listener, publisher.clone()));
+            }
+            // An explicit path that cannot be bound is a config mistake; the
+            // built-in default failing (no runtime directory to bind in)
+            // only costs the local display, not the receiver.
+            Err(e) if *explicit => {
+                eprintln!("cannot bind now-playing socket {}: {e}", path.display());
+                return ExitCode::from(EXIT_CONFIG);
+            }
+            Err(e) => warn!(
+                "no now-playing socket at {} ({e}); a local openairplay2-tui \
+                 will not find this receiver automatically",
+                path.display()
+            ),
+        }
+    }
+    if let (Some(addr), Some(publisher)) = (&args.tui_listen, &publisher) {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                eprintln!("cannot listen for displays on {addr}: {e}");
+                return ExitCode::from(EXIT_CONFIG);
+            }
+        };
+        // The password is a secret: name the state, never the value.
+        match &args.tui_password {
+            Some(_) => info!("now-playing endpoint: ws://{addr} (password required)"),
+            None => info!("now-playing endpoint: ws://{addr} (no password)"),
+        }
+        tokio::spawn(tui::serve(
+            listener,
+            publisher.clone(),
+            args.tui_password.clone(),
+        ));
+    }
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -696,34 +763,40 @@ async fn main() -> ExitCode {
         }
     });
 
-    tokio::select! {
+    let code = tokio::select! {
         result = receiver.run(sink_factory, event_tx) => {
-            if let Err(e) = result {
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
                 // A bind that fails deterministically (port taken, or below
                 // 1024 without privileges) is a config mistake, not a crash —
                 // exit EX_CONFIG so systemd doesn't restart-loop it. Anything
                 // else is unexpected and should restart.
-                match e.kind() {
+                Err(e) => match e.kind() {
                     std::io::ErrorKind::AddrInUse => {
                         eprintln!("error: {e} — is another receiver already running?");
-                        return ExitCode::from(EXIT_CONFIG);
+                        ExitCode::from(EXIT_CONFIG)
                     }
                     std::io::ErrorKind::PermissionDenied => {
                         eprintln!("error: {e} — a port below 1024 needs privileges the service does not have");
-                        return ExitCode::from(EXIT_CONFIG);
+                        ExitCode::from(EXIT_CONFIG)
                     }
                     _ => {
                         eprintln!("error: {e}");
-                        return ExitCode::FAILURE;
+                        ExitCode::FAILURE
                     }
                 }
             }
         }
         _ = shutdown_signal() => {
             info!("shutting down");
+            ExitCode::SUCCESS
         }
+    };
+    // Best-effort: the next start replaces a leftover file anyway.
+    if let Some(path) = bound_socket {
+        let _ = std::fs::remove_file(path);
     }
-    ExitCode::SUCCESS
+    code
 }
 
 #[cfg(test)]
@@ -791,6 +864,8 @@ mod tests {
             "hw:CARD=S2",
             "--pincode",
             "4821",
+            "--tui-socket",
+            "/run/x/tui.sock",
             "--tui-listen",
             "127.0.0.1:7392",
             "--log-level",
@@ -808,6 +883,7 @@ mod tests {
         assert_eq!(args.mixer.as_deref(), Some("PCM"));
         assert_eq!(args.mixer_device.as_deref(), Some("hw:CARD=S2"));
         assert_eq!(args.pincode.as_deref(), Some("4821"));
+        assert_eq!(args.tui_socket.as_deref(), Some("/run/x/tui.sock"));
         assert_eq!(args.tui_listen.as_deref(), Some("127.0.0.1:7392"));
         // Normalized to lowercase.
         assert_eq!(args.log_level.as_deref(), Some("debug"));
@@ -858,6 +934,7 @@ mod tests {
             ("OPENAIRPLAY2_ALSA_DEVICE", "hw:1"),
             ("OPENAIRPLAY2_MIXER", "Master"),
             ("OPENAIRPLAY2_MIXER_DEVICE", "default"),
+            ("OPENAIRPLAY2_TUI_SOCKET", "off"),
             ("OPENAIRPLAY2_TUI_LISTEN", "0.0.0.0:7392"),
             ("OPENAIRPLAY2_TUI_PASSWORD", "sekrit"),
             ("OPENAIRPLAY2_LOG_LEVEL", "Debug"),
@@ -874,6 +951,7 @@ mod tests {
         assert_eq!(args.avahi, Some(false));
         assert_eq!(args.mixer.as_deref(), Some("Master"));
         assert_eq!(args.mixer_device.as_deref(), Some("default"));
+        assert_eq!(args.tui_socket.as_deref(), Some("off"));
         assert_eq!(args.tui_listen.as_deref(), Some("0.0.0.0:7392"));
         assert_eq!(args.tui_password.as_deref(), Some("sekrit"));
         assert_eq!(args.log_level.as_deref(), Some("debug")); // normalized
@@ -928,6 +1006,33 @@ mod tests {
         assert!(legacy_args_notice(env_of(&[("OPENAIRPLAY2_ARGS", " ")])).is_none());
         let msg = legacy_args_notice(env_of(&[("OPENAIRPLAY2_ARGS", "--name X")])).unwrap();
         assert!(msg.contains("no longer read"), "{msg}");
+    }
+
+    #[test]
+    fn tui_socket_path_resolution() {
+        // Unset → the per-user runtime dir when there is one…
+        assert_eq!(
+            tui_socket_path(None, Some("/run/user/1000")),
+            Some((PathBuf::from("/run/user/1000/openairplay2/tui.sock"), false))
+        );
+        // …the system runtime dir otherwise (a service has no XDG, and an
+        // empty variable means unset).
+        assert_eq!(
+            tui_socket_path(None, None),
+            Some((PathBuf::from("/run/openairplay2/tui.sock"), false))
+        );
+        assert_eq!(
+            tui_socket_path(None, Some("")),
+            Some((PathBuf::from("/run/openairplay2/tui.sock"), false))
+        );
+        // An explicit path is used verbatim and marked explicit — its bind
+        // failures are config errors where the default's only warn.
+        assert_eq!(
+            tui_socket_path(Some("/tmp/x.sock"), Some("/run/user/1000")),
+            Some((PathBuf::from("/tmp/x.sock"), true))
+        );
+        // And off is off.
+        assert_eq!(tui_socket_path(Some("off"), Some("/run/user/1000")), None);
     }
 
     #[test]
@@ -1044,6 +1149,7 @@ mod tests {
             &["--mixer", "x"],
             &["--mixer-device", "x"],
             &["--list-mixers"],
+            &["--tui-socket", "x"],
             &["--tui-listen", "x"],
             &["--tui-password", "x"],
             &["--log-level", "info"],
