@@ -328,7 +328,7 @@ and an event channel, run it on your tokio runtime.
 
 ```toml
 [dependencies]
-openairplay2 = "0.3"
+openairplay2 = "0.5"
 ```
 
 ```rust,no_run

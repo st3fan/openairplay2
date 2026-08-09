@@ -8,12 +8,14 @@ not scheduled is a [GitHub issue](https://github.com/st3fan/openairplay2/issues)
 The through-line from here: **0.4 makes the project safe to hand to a stranger,
 0.5 tells that stranger it exists and how to install it.** Everything else waits.
 
-## 0.4.0 — installable by someone who isn't us (feature-complete, unreleased)
+## 0.4.0 — installable by someone who isn't us (shipped in 0.5.0)
 
 The first release aimed at people other than its author. The bar is not new
 protocol features; it is that someone who has never seen the source can install
-the package, start it, and understand what happened. **Everything below has
-landed on `main`; 0.4 is feature-complete and awaiting a release.**
+the package, start it, and understand what happened. **Everything below landed
+on `main`, but no final 0.4.0 was ever published — the 0.4.0 version number was
+spent on crates.io by the `v0.4.0-rc1` release candidate (crates.io versions
+are immutable), so all of it ships as part of 0.5.0.**
 
 ### The now-playing display
 
@@ -98,9 +100,9 @@ landed on `main`; 0.4 is feature-complete and awaiting a release.**
   [#89](https://github.com/st3fan/openairplay2/issues/89)) was deferred as not
   blocking, and `cargo audit` was added to CI. (#86, #90)
 
-## 0.5.0 — telling people it exists
+## 0.6.0 — telling people it exists
 
-0.4 makes the software ready; 0.5 makes it findable and installable without a
+0.5 makes the software ready; 0.6 makes it findable and installable without a
 GitHub releases page and a `dpkg` incantation.
 
 - **End-user documentation on the project wiki**, so the README can go back to
@@ -112,6 +114,31 @@ GitHub releases page and a `dpkg` incantation.
   it, for someone who arrived from a link rather than from the source tree.
 
 ## Released
+
+### 0.5.0 — everything since 0.3.0, plus a day of listening to it (2026-08-08)
+
+Carries the entire 0.4 block above (the display, the packaging revamp, the
+security fixes, the CLI) — see that section — plus what a day of actually
+using it on real hardware produced:
+
+- **Hardware mixer volume.** `--mixer CONTROL` drives the sound card's own
+  mixer control from the sender's slider instead of scaling PCM samples in
+  software — full sample resolution at low volume, and a DAC or amp with its
+  own volume control follows the slider. `--list-mixers` lists the controls;
+  the mixer device defaults to the card of `--alsa-device`. (#107, #108)
+- **The tick fix.** The ALSA stream is kept running for the whole session
+  (never dropped/restarted), which removed the audible pop on every pause,
+  resume and track switch. (#104, #105)
+- **The on-device display just works.** The receiver serves the now-playing
+  WebSocket on a local Unix socket by default (`/run/openairplay2/tui.sock`,
+  file permissions as the access control) and `openairplay2-tui` with no
+  arguments finds it on its own; `--tui-listen` TCP remains for remote
+  displays. The display's endpoint is now a positional argument, not
+  `--connect`. (#111–#113, #115)
+- **The pairing pincode is now the password** — Apple's own word: iOS and
+  macOS show a password dialog and accept alphanumerics. `--password` /
+  `OPENAIRPLAY2_PASSWORD`; the 0.4 spellings are still honored so an upgraded
+  box keeps its protection. (#116)
 
 ### 0.3.0 — Pairing and Debian Packages (2026-08-05)
 
@@ -193,7 +220,7 @@ Milestones 1–7: a working single-stream receiver, end to end.
   [`notes/licensing.md`](licensing.md), which is required reading before
   touching the FairPlay path.
 
-## 0.6 and later
+## 0.7 and later
 
 Everything here has been deliberately postponed rather than forgotten.
 
@@ -204,10 +231,6 @@ Weighed against
 kept; the rest of that list was considered and declined, which is recorded below
 so it does not get re-proposed.
 
-- **Hardware mixer volume.** Drive the sound card's own mixer control instead of
-  multiplying PCM by a gain. Software gain throws away bits at low volume, and a
-  real amp or DAC expects to be told its own volume. The seam for it already
-  exists: the library reports dB and the host decides what to do with it.
 - **DAC standby prevention.** Keep the device open, or feed it silence, so a DAC
   does not fall asleep between tracks and swallow the first fraction of a
   second of the next one.
