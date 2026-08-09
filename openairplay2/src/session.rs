@@ -31,6 +31,11 @@ const TYPE_BUFFERED: u64 = 103;
 /// `SET_PARAMETER` content type carrying DMAP track metadata.
 const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
 
+/// The AirPlay volume range: `0` is full scale and `-144` is the mute
+/// sentinel, so anything outside this says nothing a volume can mean.
+const MUTE_DB: f32 = -144.0;
+const FULL_DB: f32 = 0.0;
+
 pub struct Session {
     /// The address the control connection arrived on — what we bind to and
     /// report back so the sender can reach our channels.
@@ -371,10 +376,14 @@ impl Session {
         for line in text.lines() {
             let line = line.trim();
             if let Some(v) = line.strip_prefix("volume:") {
-                if let Ok(db) = v.trim().parse::<f32>() {
-                    self.volume = db;
-                    debug!("SET_PARAMETER volume {db} dB");
-                    self.send_event(Event::Volume { db });
+                match v.trim().parse::<f32>().ok().and_then(sanitize_volume) {
+                    Some(db) => {
+                        self.volume = db;
+                        debug!("SET_PARAMETER volume {db} dB");
+                        self.send_event(Event::Volume { db });
+                    }
+                    // Unparseable or non-finite: the knob does not move.
+                    None => debug!("SET_PARAMETER unusable volume {:?}", v.trim()),
                 }
             } else if let Some(v) = line.strip_prefix("progress:") {
                 self.set_progress(v.trim());
@@ -542,6 +551,18 @@ async fn audio_channel(socket: UdpSocket, label: &'static str) {
             }
         }
     }
+}
+
+/// Make a parsed `volume:` value safe to hand to a host's gain path, or reject
+/// it. `f32::parse` accepts `nan`, `inf` and overflowing literals like `1e40`,
+/// and none of the arithmetic downstream expects them: NaN survives a
+/// `min(0.0)` (that returns the *other* operand) and comes out as full scale,
+/// which is the loudest possible reading of a value that means nothing. So a
+/// non-finite volume is refused outright — the knob keeps its old position —
+/// and a finite one is clamped into the range AirPlay actually uses, which only
+/// rewrites values that were already nonsense.
+fn sanitize_volume(db: f32) -> Option<f32> {
+    db.is_finite().then(|| db.clamp(MUTE_DB, FULL_DB))
 }
 
 /// Decode parameters for the buffered stream. AirPlay 2 buffered audio is
@@ -807,6 +828,50 @@ mod tests {
         assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
         // Unknown parameters yield an empty body rather than a bad one.
         assert!(session.get_parameter(b"progress\r\n").is_empty());
+    }
+
+    #[test]
+    fn non_finite_volume_is_refused() {
+        let (mut session, mut events) = session();
+        session.set_parameter(Some("text/parameters"), b"volume: -12.5\r\n");
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
+        // `f32::parse` takes all of these; the knob must not move for any of
+        // them, least of all to full scale.
+        for value in ["nan", "NaN", "inf", "-inf", "1e40", "-1e40", "banana", ""] {
+            session.set_parameter(
+                Some("text/parameters"),
+                format!("volume: {value}\r\n").as_bytes(),
+            );
+            assert!(
+                events.try_recv().is_err(),
+                "volume: {value:?} emitted an event"
+            );
+            // And the answer a sender gets back stays a well-formed float —
+            // a malformed one makes it abort before SETUP phase 2.
+            assert_eq!(
+                session.get_parameter(b"volume\r\n"),
+                b"volume: -12.500000\r\n",
+                "volume: {value:?} changed the current volume"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_volume_is_clamped() {
+        let (mut session, mut events) = session();
+        // Above full scale, and far below the mute sentinel.
+        for (sent, expected) in [("6.0", 0.0), ("-500", -144.0), ("-144", -144.0)] {
+            session.set_parameter(
+                Some("text/parameters"),
+                format!("volume: {sent}\r\n").as_bytes(),
+            );
+            assert_eq!(events.try_recv(), Ok(Event::Volume { db: expected }));
+        }
+        // The echo carries the clamped value, not what was sent.
+        assert_eq!(
+            session.get_parameter(b"volume\r\n"),
+            b"volume: -144.000000\r\n"
+        );
     }
 
     /// One DMAP entry: 4-byte tag + big-endian u32 length + payload.

@@ -30,6 +30,11 @@ pub enum Event {
     /// model.
     Volume {
         /// AirPlay volume in dB: 0 = full scale, −30 ≈ minimum, −144 = mute.
+        ///
+        /// Always finite and always within `[-144.0, 0.0]`: a sender may write
+        /// anything on that wire, so the library refuses a non-finite volume
+        /// (no event is emitted, the previous volume stands) and clamps the
+        /// rest. A host can map this straight onto a gain without guarding.
         db: f32,
     },
     /// `SET_PARAMETER` track metadata (DMAP). A complete statement about
