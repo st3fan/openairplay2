@@ -54,6 +54,7 @@ mod player;
 mod receiver;
 mod session;
 mod sink;
+mod takeover;
 
 // Sender-side pieces the integration tests (and a future test-sender) drive
 // the real server with. Public so the tests can reach them, but not part of

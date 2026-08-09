@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use log::{debug, warn};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
 /// Ceiling on concurrent control connections. The design is one sender → one
 /// stream, so this is generous headroom (a sender plus a handful of probes),
@@ -37,6 +37,7 @@ use crate::info::info_plist;
 use crate::pairing::{Outcome, PairSetup};
 use crate::session::Session;
 use crate::sink::SinkFactory;
+use crate::takeover::{next_connection_id, ActiveSlot};
 use crate::Config;
 
 pub const SERVER_ID: &str = "AirTunes/366.0";
@@ -51,6 +52,10 @@ pub struct Context {
     pub sink_factory: SinkFactory,
     /// Where sessions report their milestones to the host.
     pub events: EventSender,
+    /// Which connection is allowed to play: AirPlay 2 is last-stream-wins, so
+    /// a new sender's `SETUP` takes this from whoever holds it (see
+    /// [`crate::takeover`]).
+    pub active: Arc<ActiveSlot>,
 }
 
 pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<()> {
@@ -77,6 +82,39 @@ pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<(
     }
 }
 
+/// What one read from the control connection produced.
+enum Incoming {
+    Request(Request),
+    /// The sender hung up.
+    Closed,
+    /// Nothing arrived within [`HANDSHAKE_TIMEOUT`] while still in the clear.
+    HandshakeTimeout,
+}
+
+/// Read the next request, applying the handshake timeout while the channel is
+/// still in the clear. Cancel-safe only in the sense the caller needs: if the
+/// connection is being taken over the whole connection is closed, so an
+/// abandoned partial read costs nothing.
+async fn next_request<R, W>(conn: &mut ControlConnection<R, W>) -> io::Result<Incoming>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if conn.is_encrypted() {
+        return Ok(match conn.read_request().await? {
+            Some(request) => Incoming::Request(request),
+            None => Incoming::Closed,
+        });
+    }
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.read_request()).await {
+        Ok(result) => Ok(match result? {
+            Some(request) => Incoming::Request(request),
+            None => Incoming::Closed,
+        }),
+        Err(_) => Ok(Incoming::HandshakeTimeout),
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -93,25 +131,36 @@ async fn handle_connection(
         context.sink_factory.clone(),
         context.events.clone(),
     );
+    // This connection's identity in the active-session slot, and how it is
+    // told that another sender has taken over.
+    let conn_id = next_connection_id();
+    let evicted = Arc::new(Notify::new());
 
     loop {
         // While still in the clear (discovery + pairing), bound how long a
         // request may take to arrive: an unpaired peer that stops sending is a
         // resource leak, not a paused session. Once encrypted, a session may
         // idle indefinitely between requests, so the timeout is lifted.
-        let next = if conn.is_encrypted() {
-            conn.read_request().await?
-        } else {
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn.read_request()).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    debug!("[{peer}] handshake timed out");
-                    return Ok(());
-                }
+        //
+        // Either wait is abandoned the moment another sender takes the
+        // session over: closing the connection is the whole signal an
+        // interrupted sender needs — it pauses itself and drops the route
+        // (verified against a HomePod, see plans/20260808-04).
+        let next = tokio::select! {
+            biased;
+            _ = evicted.notified() => {
+                debug!("[{peer}] taken over by another sender; closing");
+                return Ok(());
             }
+            outcome = next_request(&mut conn) => outcome?,
         };
-        let Some(request) = next else {
-            break;
+        let request = match next {
+            Incoming::Request(request) => request,
+            Incoming::Closed => break,
+            Incoming::HandshakeTimeout => {
+                debug!("[{peer}] handshake timed out");
+                return Ok(());
+            }
         };
         log_request(&peer, &request, conn.is_encrypted());
 
@@ -150,6 +199,19 @@ async fn handle_connection(
             let response = finalize(Response::ok(&request.protocol), &request);
             conn.write_response(&response).await?;
             continue;
+        }
+
+        // A `SETUP` is a sender saying it intends to play, and AirPlay 2 is
+        // last-stream-wins: take the session from whoever holds it. This is
+        // the first SETUP (phase 1, ports only) in the normal sequence, so
+        // the interrupted stream is already gone by the time phase 2 asks the
+        // host for a sink — the two never hold the audio device at once.
+        // Probing connections (`GET /info`, pairing) never reach here, so
+        // browsing senders don't disturb playback.
+        if request.method == "SETUP" {
+            if let Some(guard) = context.active.claim(conn_id, evicted.clone()).await {
+                session.set_active_guard(guard);
+            }
         }
 
         let response = match dispatch_session(&mut session, &request).await {

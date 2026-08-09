@@ -38,6 +38,7 @@ async fn start() -> SocketAddr {
         identity: Identity::generate(),
         sink_factory,
         events,
+        active: std::sync::Arc::default(),
     });
     tokio::spawn(serve(listener, context));
     addr
