@@ -239,13 +239,21 @@ user:
 openairplay2-tui
 ```
 
-For a display on **another machine**, start the receiver with the TCP
-endpoint on and point the display at it:
+For a display on **another machine**, put the receiver's TCP endpoint on the
+network. The receiver advertises it over mDNS, and a display that finds no
+local receiver browses for advertised ones and offers a picker — no address
+to know on either end:
 
 ```sh
-openairplay2-receiver --tui-listen 127.0.0.1:7392
-openairplay2-tui ws://127.0.0.1:7392
+openairplay2-receiver --tui-listen 0.0.0.0:7392   # on the receiver's machine
+openairplay2-tui                                  # anywhere on the network
 ```
+
+`openairplay2-tui --discover` skips the local receiver and goes straight to
+the picker. Naming the endpoint (`openairplay2-tui ws://10.0.0.5:7392`)
+skips discovery entirely — for scripted setups, or an endpoint deliberately
+kept on loopback behind an SSH tunnel (loopback endpoints are not
+advertised).
 
 ```
                       ┌──────────────┐
@@ -277,10 +285,16 @@ it.
 The endpoint to watch is the one optional positional argument — a
 `ws://HOST:PORT` URL or a socket path, e.g. `openairplay2-tui
 ws://10.0.0.5:7392`. Without it, the receiver's default sockets are tried,
-then `ws://127.0.0.1:7392`.
+then `ws://127.0.0.1:7392`; when none of those answers, receivers advertised
+on the network are offered to pick from (`↑`/`↓` and `Enter`; a `🔒` marks
+one that wants `--password`). A local receiver appearing still connects on
+its own — only a *picked* receiver is a deliberate choice. Discovery browses
+via the Avahi daemon, so on macOS the picker reports it unavailable; explicit
+endpoints work everywhere.
 
 | Option | Description | Default |
 | --- | --- | --- |
+| `--discover` | Skip the local receiver and go straight to the network picker | off |
 | `--images auto\|kitty\|iterm2\|none` | Terminal graphics protocol; `auto` probes, `none` is text-only | `auto` |
 | `--log-file PATH` | Where logs go — the display owns the screen, so they are dropped otherwise | dropped |
 | `--password PASS` | Password for a receiver whose endpoint requires one; falls back to `OPENAIRPLAY2_TUI_PASSWORD`, which unlike a flag is not visible in `ps` | none |

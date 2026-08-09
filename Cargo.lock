@@ -1213,6 +1213,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "zbus",
 ]
 
 [[package]]

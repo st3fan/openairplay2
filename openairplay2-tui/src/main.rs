@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use log::{info, warn};
 
 mod client;
+mod discover;
 mod images;
 mod tui;
 
@@ -29,6 +30,8 @@ struct Args {
     /// The positional endpoint: a `ws://` URL or a socket path. `None`
     /// means look for a local receiver (see [`client::default_endpoints`]).
     endpoint: Option<String>,
+    /// Go straight to the network picker, skipping the local candidates.
+    discover: bool,
     /// Forced terminal-graphics protocol, or `None` to detect one.
     images: Option<Protocol>,
     /// Where log output goes. The display owns the screen, so logs are
@@ -57,9 +60,12 @@ The endpoint is the receiver's now-playing endpoint: a ws://HOST:PORT URL
 (the receiver's --tui-listen) or the path of its local socket (its
 --tui-socket). Without one, a local receiver is found on its own:
 $XDG_RUNTIME_DIR/openairplay2/tui.sock, then /run/openairplay2/tui.sock,
-then ws://127.0.0.1:7392.
+then ws://127.0.0.1:7392 — and when none of those answers, receivers
+advertising themselves on the network are offered to pick from.
 
 options:
+  --discover                skip the local receiver and go straight to the
+                            network picker
   --images auto|kitty|iterm2|none
                             terminal-graphics protocol for the cover art:
                             auto probes the terminal, none is text-only
@@ -79,6 +85,7 @@ options:
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     let mut args = Args {
         endpoint: None,
+        discover: false,
         images: None,
         log_file: None,
         password: None,
@@ -88,6 +95,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--discover" => args.discover = true,
             "--images" => {
                 let v = value("--images", &mut it)?;
                 args.images = match v.as_str() {
@@ -110,6 +118,13 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
             }
             other => return Err(format!("unknown argument: {other}")),
         }
+    }
+    if args.discover && args.endpoint.is_some() {
+        return Err(
+            "--discover and an endpoint are mutually exclusive — the endpoint already \
+             says which receiver to watch"
+                .to_string(),
+        );
     }
     Ok(Action::Run(args))
 }
@@ -194,27 +209,6 @@ async fn main() -> ExitCode {
         }
     }
 
-    // The endpoints to try: an explicit endpoint argument alone, or the
-    // local candidates a zero-config receiver serves by default. The label
-    // is what the screen shows until (and about) a connection.
-    let endpoints = match &args.endpoint {
-        Some(value) => vec![Endpoint::parse(value)],
-        None => client::default_endpoints(std::env::var("XDG_RUNTIME_DIR").ok().as_deref()),
-    };
-    let label = match &args.endpoint {
-        Some(value) => value.clone(),
-        None => "local receiver".to_string(),
-    };
-
-    info!(
-        "connecting to {}, terminal graphics: {images}",
-        endpoints
-            .iter()
-            .map(Endpoint::label)
-            .collect::<Vec<_>>()
-            .join(" or ")
-    );
-
     // The flag wins; the variable is the ps-safe way to hand it over.
     let password = args.password.clone().or_else(|| {
         std::env::var("OPENAIRPLAY2_TUI_PASSWORD")
@@ -235,10 +229,55 @@ async fn main() -> ExitCode {
         }
     }
 
+    // Three ways to a receiver: an explicit endpoint argument; --discover
+    // straight to the network picker; or the default — local candidates
+    // first, the picker only when none answers. The label is what the
+    // screen shows until (and about) a connection; the selections channel
+    // carries a picker choice back to the client.
     let (updates_tx, updates_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(client::run(endpoints, password, updates_tx));
+    let (selections_tx, selections_rx) = tokio::sync::mpsc::unbounded_channel();
+    let label = match (&args.endpoint, args.discover) {
+        (Some(value), _) => value.clone(),
+        (None, true) => "receivers on the network".to_string(),
+        (None, false) => "local receiver".to_string(),
+    };
+    match (&args.endpoint, args.discover) {
+        (Some(value), _) => {
+            info!("connecting to {value}, terminal graphics: {images}");
+            tokio::spawn(client::run(
+                vec![Endpoint::parse(value)],
+                password,
+                updates_tx,
+            ));
+        }
+        (None, discover) => {
+            // --discover empties the local list: nothing to probe, so the
+            // client reports "no local receiver" at once and waits for the
+            // picker's choice.
+            let local = if discover {
+                Vec::new()
+            } else {
+                client::default_endpoints(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+            };
+            info!(
+                "looking for receivers ({}), terminal graphics: {images}",
+                if discover {
+                    "network only"
+                } else {
+                    "local first"
+                }
+            );
+            tokio::spawn(client::run_local_or_selected(
+                local,
+                password,
+                updates_tx.clone(),
+                selections_rx,
+            ));
+            tokio::spawn(discover::run(updates_tx));
+        }
+    }
 
-    match tui::run(updates_rx, label, images).await {
+    match tui::run(updates_rx, label, images, selections_tx, args.discover).await {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("display error: {e}");
@@ -267,8 +306,23 @@ mod tests {
         let args = run_args(&[]);
         // No endpoint: the client searches the local candidates.
         assert_eq!(args.endpoint, None);
+        assert!(!args.discover);
         assert_eq!(args.images, None);
         assert_eq!(args.log_file, None);
+    }
+
+    #[test]
+    fn discover_skips_local_but_not_with_an_endpoint() {
+        assert!(run_args(&["--discover"]).discover);
+        // An endpoint already names the receiver; the picker for one of
+        // each would be a contradiction, whichever order they came in.
+        for invocation in [
+            &["--discover", "ws://10.0.0.5:7392"][..],
+            &["ws://10.0.0.5:7392", "--discover"][..],
+        ] {
+            let err = parse_strs(invocation).unwrap_err();
+            assert!(err.contains("--discover"), "{err}");
+        }
     }
 
     #[test]
@@ -342,6 +396,7 @@ mod tests {
     #[test]
     fn help_describes_every_flag() {
         let flags: &[&[&str]] = &[
+            &["--discover"],
             &["--images", "none"],
             &["--log-file", "x"],
             &["--password", "x"],
