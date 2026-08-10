@@ -201,6 +201,31 @@ async fn handle_connection(
             continue;
         }
 
+        // Until the channel is encrypted, a peer may do only discovery and
+        // pairing: `GET /info` and any `/pair-*` request (`/pair-setup` and
+        // `/pair-pin-start` are handled above; `/pair-verify` and the like fall
+        // through to their normal `501` so a sender falls back to transient
+        // pairing). Everything else — SETUP and the control verbs, `/fp-setup`,
+        // the keep-alives — requires the authenticated channel. Refusing here,
+        // *before* the SETUP slot-claim below, is what stops an unpaired LAN
+        // peer from evicting the playing sender, injecting audio with an
+        // attacker-chosen `shk`, or setting volume / pausing / flushing /
+        // tearing down (#141).
+        //
+        // `is_encrypted()` becomes true only once `pair-setup` reaches M4, so
+        // with a `--password` configured this is also what makes the password
+        // gate the session rather than only the SRP exchange. It cannot gate
+        // the open default (transient `3939`, #156) — a peer that pairs still
+        // gets in — but a peer that skips pairing no longer can.
+        let allowed_in_clear = (request.method == "GET" && request.target == "/info")
+            || request.target.starts_with("/pair-");
+        if !conn.is_encrypted() && !allowed_in_clear {
+            debug!("[{peer}] refusing {} before pairing", request.method);
+            let response = finalize(Response::new(&request.protocol, 403, "Forbidden"), &request);
+            conn.write_response(&response).await?;
+            continue;
+        }
+
         // A `SETUP` is a sender saying it intends to play, and AirPlay 2 is
         // last-stream-wins: take the session from whoever holds it. This is
         // the first SETUP (phase 1, ports only) in the normal sequence, so
