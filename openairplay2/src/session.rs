@@ -43,7 +43,14 @@ pub struct Session {
     /// The address the sender connected *from*, reported to the host with
     /// `SessionStarted` (a display shows it; nothing else uses it).
     peer_ip: IpAddr,
-    tasks: Vec<JoinHandle<()>>,
+    /// The phase-1 event channel, one per connection. A repeated phase 1
+    /// replaces it rather than binding another listener (#145).
+    event_task: Option<JoinHandle<()>>,
+    /// The phase-2 stream channels (control, plus data or buffered audio).
+    /// There is only ever one stream, so a re-`SETUP` replaces these and
+    /// `TEARDOWN` releases them — otherwise each `SETUP` would leak a socket
+    /// and a task for the life of the connection (#145).
+    stream_tasks: Vec<JoinHandle<()>>,
     /// Captured at SETUP phase 2, for audio decrypt/decode.
     stream_key: Option<Vec<u8>>,
     audio_format: Option<u64>,
@@ -91,7 +98,8 @@ impl Session {
         Session {
             local_ip,
             peer_ip,
-            tasks: Vec::new(),
+            event_task: None,
+            stream_tasks: Vec::new(),
             stream_key: None,
             audio_format: None,
             stream_type: None,
@@ -149,8 +157,14 @@ impl Session {
         let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let event_port = listener.local_addr()?.port();
         debug!("SETUP phase 1: event port {event_port}");
-        self.tasks
-            .push(tokio::spawn(event_channel(listener, self.peer_ip)));
+        // One event channel per connection: a sender that runs phase 1 again
+        // gets this new listener, and the old one is closed rather than left
+        // bound for the life of the connection (#145).
+        let task = tokio::spawn(event_channel(listener, self.peer_ip));
+        if let Some(previous) = self.event_task.replace(task) {
+            debug!("SETUP phase 1: replacing the previous event channel");
+            previous.abort();
+        }
 
         let self_ip = self.local_ip.to_string();
         let mut peer_info = Dictionary::new();
@@ -194,9 +208,17 @@ impl Session {
             self.stream_key.as_ref().map_or(0, Vec::len)
         );
 
+        // This connection plays one stream at a time, and a sender does
+        // legitimately re-`SETUP` (with a fresh `shk` on resume, for one). The
+        // previous stream's channels are finished the moment a new one is
+        // named, so close them before binding their replacements — otherwise
+        // every SETUP leaks two sockets and two tasks (#145). Done after the
+        // body parsed, so a malformed SETUP cannot tear down a live stream.
+        self.stop_stream_tasks();
+
         let control = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let control_port = control.local_addr()?.port();
-        self.tasks
+        self.stream_tasks
             .push(tokio::spawn(audio_channel(control, "control")));
 
         // Buffered audio (type 103) uses a TCP data channel we decrypt, decode
@@ -206,7 +228,8 @@ impl Session {
         } else {
             let data = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
             let port = data.local_addr()?.port();
-            self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
+            self.stream_tasks
+                .push(tokio::spawn(audio_channel(data, "audio")));
             port
         };
         debug!("SETUP phase 2: data port {data_port}, control port {control_port}");
@@ -277,7 +300,7 @@ impl Session {
                 self.player_control = Some(player.sender());
                 self.player = Some(player);
                 let max_queued = crate::player::max_queued_samples(rate, channels);
-                self.tasks.push(tokio::spawn(buffered_audio(
+                self.stream_tasks.push(tokio::spawn(buffered_audio(
                     listener,
                     self.peer_ip,
                     decryptor,
@@ -290,12 +313,12 @@ impl Session {
             }
             (None, _) => {
                 warn!("buffered audio: missing/invalid shk; draining without decode");
-                self.tasks
+                self.stream_tasks
                     .push(tokio::spawn(drain_tcp(listener, self.peer_ip)));
             }
             (_, Err(e)) => {
                 warn!("buffered audio: decoder init failed ({e}); draining");
-                self.tasks
+                self.stream_tasks
                     .push(tokio::spawn(drain_tcp(listener, self.peer_ip)));
             }
         }
@@ -480,9 +503,22 @@ impl Session {
         debug!("ack {method}");
     }
 
+    /// Close the phase-2 stream channels, freeing their sockets. Aborting each
+    /// task drops the socket it owns, so the file descriptor goes with it.
+    fn stop_stream_tasks(&mut self) {
+        for task in self.stream_tasks.drain(..) {
+            task.abort();
+        }
+    }
+
     /// Handle `TEARDOWN`: the sender is done with the stream.
     pub fn teardown(&mut self) {
         debug!("ack TEARDOWN");
+        // The stream is over, so its channels are too — don't hold their
+        // sockets until the connection closes (#145). The event channel is a
+        // connection-level channel from phase 1 and stays up; the player is
+        // left to drain what it already has, as before.
+        self.stop_stream_tasks();
         self.end_session();
     }
 
@@ -498,7 +534,8 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.end_session();
-        for task in self.tasks.drain(..) {
+        self.stop_stream_tasks();
+        if let Some(task) = self.event_task.take() {
             task.abort();
         }
         // Order matters when a sender is taking this session over: dropping
@@ -762,6 +799,143 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
         (Session::new(local(), peer(), factory, tx), rx)
+    }
+
+    /// A minimal phase-1 (timing) SETUP body.
+    fn phase1_body() -> Vec<u8> {
+        let mut dict = Dictionary::new();
+        dict.insert("timingProtocol".into(), Value::String("PTP".into()));
+        encode_plist(&dict).unwrap()
+    }
+
+    /// A minimal phase-2 (buffered stream) SETUP body.
+    fn phase2_body() -> Vec<u8> {
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
+        stream.insert("audioFormat".into(), Value::Integer(0x400000u64.into()));
+        stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        encode_plist(&dict).unwrap()
+    }
+
+    fn dict_of(response: &[u8]) -> Dictionary {
+        Value::from_reader(io::Cursor::new(response))
+            .unwrap()
+            .as_dictionary()
+            .unwrap()
+            .clone()
+    }
+
+    fn event_port_of(response: &[u8]) -> u16 {
+        dict_of(response)
+            .get("eventPort")
+            .unwrap()
+            .as_unsigned_integer()
+            .unwrap() as u16
+    }
+
+    fn data_port_of(response: &[u8]) -> u16 {
+        dict_of(response)
+            .get("streams")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .as_dictionary()
+            .unwrap()
+            .get("dataPort")
+            .unwrap()
+            .as_unsigned_integer()
+            .unwrap() as u16
+    }
+
+    /// Is a TCP listener still bound to `port`? (Only tests that something is
+    /// listening — `accept_from` may then reject the peer.)
+    async fn port_listening(port: u16) -> bool {
+        TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .is_ok()
+    }
+
+    /// Wait briefly for a port to stop listening: aborting a task is
+    /// asynchronous, so its socket closes a moment after the abort is asked for.
+    async fn wait_until_closed(port: u16) {
+        for _ in 0..200 {
+            if !port_listening(port).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("port {port} still listening; its task was not aborted");
+    }
+
+    /// #145: repeated SETUPs on one connection must not pile up sockets and
+    /// tasks. Each phase replaces its own channels instead of adding more.
+    #[tokio::test]
+    async fn repeated_setup_does_not_accumulate_tasks() {
+        let (mut session, _events) = session();
+        for _ in 0..5 {
+            session.handle_setup(&phase1_body()).await.unwrap();
+            session.handle_setup(&phase2_body()).await.unwrap();
+        }
+        // One event channel, and one stream's worth of channels (control +
+        // buffered data) — not five of each.
+        assert!(session.event_task.is_some());
+        assert_eq!(
+            session.stream_tasks.len(),
+            2,
+            "each SETUP must replace the previous stream's channels, not add to them"
+        );
+    }
+
+    /// The replaced channels are really closed, not just forgotten.
+    #[tokio::test]
+    async fn re_setup_closes_the_previous_data_port() {
+        let (mut session, _events) = session();
+        let first = data_port_of(&session.handle_setup(&phase2_body()).await.unwrap());
+        let second = data_port_of(&session.handle_setup(&phase2_body()).await.unwrap());
+
+        assert_ne!(first, second, "the new stream binds a fresh port");
+        wait_until_closed(first).await;
+        assert!(
+            port_listening(second).await,
+            "the current stream's data port must stay open"
+        );
+    }
+
+    /// The event channel belongs to the connection (phase 1), so setting up a
+    /// stream must not take it down — the sender is still using it.
+    #[tokio::test]
+    async fn phase2_setup_keeps_the_event_channel() {
+        let (mut session, _events) = session();
+        let event = event_port_of(&session.handle_setup(&phase1_body()).await.unwrap());
+        session.handle_setup(&phase2_body()).await.unwrap();
+
+        assert!(
+            port_listening(event).await,
+            "SETUP phase 2 must not close the phase-1 event channel"
+        );
+    }
+
+    /// #145: `TEARDOWN` releases the stream's sockets rather than holding them
+    /// until the connection closes. The event channel stays up.
+    #[tokio::test]
+    async fn teardown_releases_the_stream_channels() {
+        let (mut session, _events) = session();
+        let event = event_port_of(&session.handle_setup(&phase1_body()).await.unwrap());
+        let data = data_port_of(&session.handle_setup(&phase2_body()).await.unwrap());
+
+        session.teardown();
+
+        assert!(session.stream_tasks.is_empty());
+        wait_until_closed(data).await;
+        assert!(
+            port_listening(event).await,
+            "TEARDOWN ends the stream, not the connection's event channel"
+        );
     }
 
     #[tokio::test]
