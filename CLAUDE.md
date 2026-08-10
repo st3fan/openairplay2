@@ -211,6 +211,13 @@ work back to it:
 - If the work reveals mid-way that the plan needs adjusting, edit the issue (or comment on it)
   so the plan matches what was actually built.
 
+**Work that starts from an existing issue stays there.** When you are fixing a bug (or building
+an enhancement) that already has a GitHub issue, do not open a separate `plan` issue — leave the
+plan or notes as a **comment on that issue** for Stefan to review, and keep working against it
+(the PR does `Fixes #NN`). That keeps the finding, the plan, and the discussion together.
+Escalate to a dedicated `plan`-labeled issue only when the work turns out to be large enough to
+warrant its own tracking.
+
 **Plans are GitHub issues now, not markdown files** — do not add new files under `plans/`. The
 existing `plans/*.md` stay as historical record, like `notes/`.
 
