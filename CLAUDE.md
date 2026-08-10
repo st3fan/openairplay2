@@ -194,38 +194,39 @@ real Mac; that hardware check is part of each milestone's acceptance criteria.
 
 ## Working conventions
 
-New features and changes start with a **plan** in `plans/YYYYMMDD-NN-slug.md` (`NN` is a
-per-day sequence number, e.g. `plans/20260805-01-pincode.md`). A plan holds the high-level
-implementation details for one change: background, scope with explicit out-of-scope, module
-layout, test strategy, acceptance criteria — the shape the `notes/milestone-*.md` files already
-use.
+New features and changes start with a **plan filed as a GitHub issue**, labeled `plan`
+(`gh issue create --label plan …`). The plan issue holds the high-level implementation details
+for one change: background, scope with explicit out-of-scope, module layout, test strategy,
+acceptance criteria — the shape the `notes/milestone-*.md` files already use. **Wait for Stefan
+to approve the plan** (a comment on the issue) before writing the implementation.
 
-**A plan and its implementation live together in one stack** (managed with the `gh-stack`
-skill). The plan document is the bottom PR of a fresh stack; the implementation follows in one
-or more **phases**, each phase one PR stacked on top, one branch per phase, each based on the
-one below it:
+Implementation lands in pull requests that **reference the plan issue**, so GitHub links the
+work back to it:
 
-- Open the stack with the plan PR alone, and **wait for Stefan to approve the plan** (review
-  feedback on the open PR — not a merge) before stacking implementation PRs onto it.
-- The plan PR **stays open for the whole task** — that is the point of stacking it: if the work
-  reveals mid-way that the plan needs adjusting, or decisions worth recording, commit them to
-  the plan document on its still-open branch (then `gh stack rebase --upstack`), so the plan
-  that eventually merges matches what was actually built.
-- At the end Stefan reviews and merges the whole stack himself. (The earlier convention —
-  merge the plan PR first, then implement — is retired; plan `20260801-01` and older predate
-  the stack workflow.)
+- A change that is **one PR** is just that PR, referencing the issue (`Fixes #NN` when the PR
+  completes the plan).
+- A change that is **several PRs** is a **stack** (managed with the `gh-stack` skill): one PR
+  per **phase**, one branch per phase, each based on the one below it, every PR referencing the
+  issue. At the end Stefan reviews and merges the whole stack himself.
+- If the work reveals mid-way that the plan needs adjusting, edit the issue (or comment on it)
+  so the plan matches what was actually built.
+
+**Plans are GitHub issues now, not markdown files** — do not add new files under `plans/`. The
+existing `plans/*.md` stay as historical record, like `notes/`.
 
 **All changes land through pull requests. Never commit directly to `main`** — always branch first.
 
-**Anything not being done now goes in a GitHub issue.** Work deliberately skipped, an
-out-of-scope item that still deserves to exist, a limitation found while testing, a proposed
-enhancement, an idea worth keeping — file it (`gh issue create`) rather than leaving it in a PR
-description or a conversation. Write it so it stands alone: what was observed, why it happens if
-that is known, and the shape of a fix.
+**Everything worth tracking is a GitHub issue — prefer issues over markdown files.** A plan, a
+bug, an enhancement, a finding from a review, work deliberately skipped, an out-of-scope item
+that still deserves to exist, a limitation found while testing, an idea worth keeping: file it
+(`gh issue create`) rather than leaving it in a PR description, a markdown file, or a
+conversation. Write it so it stands alone: what was observed, why it happens if that is known,
+and the shape of a fix.
 
-**Every issue gets exactly one of `bug` or `enhancement`.** `bug` = something does not work as
-documented or intended; `enhancement` = something that never existed. Add `documentation` as a
-second label when the fix is only prose. Set it at creation: `gh issue create --label bug …`.
+**Every issue gets exactly one of `bug`, `enhancement`, or `plan`.** `bug` = something does not
+work as documented or intended; `enhancement` = something that never existed; `plan` = the
+implementation plan for a change (its PRs reference it). Add `documentation` as a second label
+when the fix is only prose. Set it at creation: `gh issue create --label bug …`.
 
 **Never assume the status of a pull request.** Whether a PR is open, merged, closed, approved, or
 green in CI is only knowable by asking: run `gh pr view <n>` / `gh pr status` / `gh pr checks <n>`
