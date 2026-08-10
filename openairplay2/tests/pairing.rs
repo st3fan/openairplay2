@@ -359,6 +359,113 @@ async fn pair_setup(addr: SocketAddr, pin: &str) -> (SrpClient, Tlv) {
     (client, Tlv::decode(&body).unwrap())
 }
 
+/// Complete transient `pair-setup` (M1→M4) over a fresh connection and return
+/// the still-open stream together with its encrypted channel, ready to send
+/// encrypted requests.
+async fn pair_and_encrypt(
+    addr: SocketAddr,
+) -> (
+    TcpStream,
+    openairplay2::cipher::Encryptor,
+    openairplay2::cipher::Decryptor,
+) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut m1 = Tlv::new();
+    m1.put_u8(ty::STATE, 1)
+        .put_u8(ty::METHOD, 0)
+        .put_u8(ty::FLAGS, 0x10);
+    let (_, body) = plain_request(
+        &mut stream,
+        "POST /pair-setup RTSP/1.0\r\nCSeq: 0",
+        &m1.encode(),
+    )
+    .await;
+    let m2 = Tlv::decode(&body).unwrap();
+    let mut client = SrpClient::new("3939");
+    let proof = client.process(m2.get(ty::SALT).unwrap(), m2.get(ty::PUBLIC_KEY).unwrap());
+    let mut m3 = Tlv::new();
+    m3.put_u8(ty::STATE, 3)
+        .put(ty::PUBLIC_KEY, client.public_a())
+        .put(ty::PROOF, proof.to_vec());
+    plain_request(
+        &mut stream,
+        "POST /pair-setup RTSP/1.0\r\nCSeq: 1",
+        &m3.encode(),
+    )
+    .await;
+    let (enc, dec) = sender_control_channel(client.session_key().unwrap());
+    (stream, enc, dec)
+}
+
+/// Security #141: every session verb is refused on an unencrypted (never-paired)
+/// connection; only discovery (`GET /info`) is allowed in the clear.
+#[tokio::test]
+async fn plaintext_session_verbs_are_refused() {
+    let addr = start().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Discovery is allowed before pairing.
+    let (status, _) = plain_request(&mut stream, "GET /info HTTP/1.1\r\nCSeq: 0", &[]).await;
+    assert_eq!(
+        status, "HTTP/1.1 200 OK",
+        "GET /info must work in the clear"
+    );
+
+    // The session verbs, fp-setup, and the keep-alives are not. The connection
+    // survives each refusal, so they can be tried in sequence on one stream.
+    for (line, proto) in [
+        ("SETUP rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("SET_PARAMETER rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("GET_PARAMETER rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("SETRATEANCHORTIME rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("FLUSHBUFFERED rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("TEARDOWN rtsp://x/1 RTSP/1.0", "RTSP/1.0"),
+        ("POST /fp-setup HTTP/1.1", "HTTP/1.1"),
+        ("POST /feedback HTTP/1.1", "HTTP/1.1"),
+    ] {
+        let (status, body) = plain_request(&mut stream, &format!("{line}\r\nCSeq: 1"), &[]).await;
+        assert_eq!(
+            status,
+            format!("{proto} 403 Forbidden"),
+            "{line} must be refused before pairing"
+        );
+        assert!(body.is_empty(), "a refusal carries no body");
+    }
+}
+
+/// Security #141: an unpaired peer's plaintext `SETUP` must not claim the active
+/// slot, so it cannot evict the sender that legitimately holds it (a takeover
+/// denial of service). The refused connection is dropped; the paired one lives.
+#[tokio::test]
+async fn plaintext_setup_cannot_evict_a_paired_sender() {
+    let addr = start().await;
+    let (mut a, mut enc, mut dec) = pair_and_encrypt(addr).await;
+
+    // A pairs and claims the slot with SETUP phase 1 (timingProtocol only).
+    let mut d = plist::Dictionary::new();
+    d.insert("timingProtocol".into(), plist::Value::String("PTP".into()));
+    let (status, _) = encrypted_request(&mut a, &mut enc, &mut dec, "SETUP", &plist_bytes(d)).await;
+    assert_eq!(
+        status, "RTSP/1.0 200 OK",
+        "the paired sender claims the slot"
+    );
+
+    // An unpaired peer sends a plaintext SETUP: refused, and it must not touch
+    // the slot A holds.
+    let mut b = TcpStream::connect(addr).await.unwrap();
+    let (status, _) = plain_request(&mut b, "SETUP rtsp://x/1 RTSP/1.0\r\nCSeq: 0", &[]).await;
+    assert_eq!(status, "RTSP/1.0 403 Forbidden");
+
+    // A is still alive: another encrypted request succeeds. Had the plaintext
+    // SETUP evicted A, its connection would have been closed.
+    let (status, _) =
+        encrypted_request(&mut a, &mut enc, &mut dec, "GET_PARAMETER", b"volume\r\n").await;
+    assert_eq!(
+        status, "HTTP/1.1 200 OK",
+        "the paired sender must not have been evicted"
+    );
+}
+
 /// A password-protected receiver answers `pair-pin-start` with an empty 200
 /// and pairs with the correct SRP password; the standard transient 3939 is
 /// refused. The password is alphanumeric — Apple's dialog is free-text, not
