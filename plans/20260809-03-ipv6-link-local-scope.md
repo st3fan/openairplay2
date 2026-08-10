@@ -93,8 +93,11 @@ that makes it bindable.
    resolves the scope on its own side. It stays `local_addr.ip().to_string()` —
    the two uses of the address are now deliberately different, and the code
    should say so.
-4. **Log the bind address** at `debug!` alongside the port already logged, so the
-   next address-family failure names the address that failed.
+4. **Name the address in the failure.** `SETUP failed: Invalid argument (os error
+   22)` says nothing about *what* could not be bound — the diagnosis took a
+   packet-level read of the log. Each bind annotates its error with the address
+   it tried, and the `debug!` lines report the address actually bound (scope
+   included) next to the port they already report.
 
 **Out of scope**
 
@@ -114,10 +117,13 @@ that makes it bindable.
   a v4 address keeps its IP and gets port 0; a v6 address keeps its IP,
   `flowinfo` and `scope_id` and gets port 0. Pure, so it runs in the
   macOS-portable library and CI covers it on both platforms.
-- **A bind test that actually proves the fix**: construct a `SocketAddrV6` for a
-  link-local address discovered from the running host and bind it — skipped when
-  the host has no link-local address, so CI stays green either way. This is the
-  test that would have caught the bug; the pure test alone would not.
+- **A bind test that actually proves the fix**: discover a link-local address on
+  the running host, bind the address the helper derives from it, and assert that
+  the same address *without* its scope is rejected — which pins the reason, not
+  just the symptom. `std` cannot enumerate interfaces, so discovery reads
+  `/proc/net/if_inet6`: the test is `#[cfg(target_os = "linux")]` (it simply
+  isn't compiled on macOS) and returns early on a host with no link-local
+  address, so CI stays green either way.
 - The existing session unit tests move to the new `Session::new` signature (the
   `local()` helper in the test module).
 - **Hardware check — the acceptance test.** From a Mac to a host advertising a
