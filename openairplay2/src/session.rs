@@ -13,7 +13,7 @@ use std::time::Duration;
 use log::{debug, warn};
 use plist::{Dictionary, Value};
 use tokio::io::AsyncReadExt;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 
 use crate::buffered::{packet_seq, split_blocks, AudioDecryptor};
@@ -149,7 +149,8 @@ impl Session {
         let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
         let event_port = listener.local_addr()?.port();
         debug!("SETUP phase 1: event port {event_port}");
-        self.tasks.push(tokio::spawn(event_channel(listener)));
+        self.tasks
+            .push(tokio::spawn(event_channel(listener, self.peer_ip)));
 
         let self_ip = self.local_ip.to_string();
         let mut peer_info = Dictionary::new();
@@ -278,6 +279,7 @@ impl Session {
                 let max_queued = crate::player::max_queued_samples(rate, channels);
                 self.tasks.push(tokio::spawn(buffered_audio(
                     listener,
+                    self.peer_ip,
                     decryptor,
                     decoder,
                     sender,
@@ -288,11 +290,13 @@ impl Session {
             }
             (None, _) => {
                 warn!("buffered audio: missing/invalid shk; draining without decode");
-                self.tasks.push(tokio::spawn(drain_tcp(listener)));
+                self.tasks
+                    .push(tokio::spawn(drain_tcp(listener, self.peer_ip)));
             }
             (_, Err(e)) => {
                 warn!("buffered audio: decoder init failed ({e}); draining");
-                self.tasks.push(tokio::spawn(drain_tcp(listener)));
+                self.tasks
+                    .push(tokio::spawn(drain_tcp(listener, self.peer_ip)));
             }
         }
         Ok(port)
@@ -516,10 +520,35 @@ fn encode_plist(dict: &Dictionary) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Accept the first TCP connection whose peer IP matches `expected`, closing any
+/// connection from another address and continuing to listen.
+///
+/// The event and data ports are ephemeral but scannable, and only the control
+/// connection's peer is a legitimate client. Without this check a LAN peer that
+/// wins the connect race (or scans the port) would occupy the single accepted
+/// connection and starve the real stream — and, absent the pairing gate, could
+/// push its own audio into it (#146). Returns `None` only if the listener
+/// itself fails; a mismatched peer is dropped and the accept loop continues, so
+/// the legitimate sender still gets in behind an attacker's connection.
+async fn accept_from(
+    listener: &TcpListener,
+    expected: IpAddr,
+    label: &str,
+) -> Option<(TcpStream, SocketAddr)> {
+    loop {
+        let (stream, peer) = listener.accept().await.ok()?;
+        if peer.ip() == expected {
+            return Some((stream, peer));
+        }
+        // Dropping `stream` at the end of the iteration closes it.
+        debug!("{label}: rejecting connection from {peer} (expected peer {expected})");
+    }
+}
+
 /// Accept the sender's event channel and drain it (we don't emit events for
 /// basic playback). Keeps the AirPlay session healthy.
-async fn event_channel(listener: TcpListener) {
-    let Ok((mut stream, peer)) = listener.accept().await else {
+async fn event_channel(listener: TcpListener, expected: IpAddr) {
+    let Some((mut stream, peer)) = accept_from(&listener, expected, "event channel").await else {
         return;
     };
     debug!("event channel connected from {peer}");
@@ -603,13 +632,14 @@ fn parse_flush_until_seq(body: &[u8]) -> Option<u64> {
 /// player.
 async fn buffered_audio(
     listener: TcpListener,
+    expected: IpAddr,
     decryptor: AudioDecryptor,
     mut decoder: AacDecoder,
     player: PlayerSender,
     max_queued: usize,
     flush_until_seq: Arc<AtomicU64>,
 ) {
-    let Ok((mut stream, peer)) = listener.accept().await else {
+    let Some((mut stream, peer)) = accept_from(&listener, expected, "buffered audio").await else {
         return;
     };
     debug!("buffered audio connected from {peer}");
@@ -692,8 +722,9 @@ fn skip_before_boundary(flush_until_seq: &AtomicU64, seq: u32) -> bool {
 
 /// Accept and drain a buffered-audio connection we can't decode (missing key
 /// or unsupported format), so the sender isn't left hanging.
-async fn drain_tcp(listener: TcpListener) {
-    let Ok((mut stream, _)) = listener.accept().await else {
+async fn drain_tcp(listener: TcpListener, expected: IpAddr) {
+    let Some((mut stream, _)) = accept_from(&listener, expected, "buffered audio (drain)").await
+    else {
         return;
     };
     let mut buf = vec![0u8; 64 * 1024];
@@ -731,6 +762,51 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
         (Session::new(local(), peer(), factory, tx), rx)
+    }
+
+    #[tokio::test]
+    async fn accept_from_accepts_the_matching_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The client connects from loopback; the expected peer is that same IP.
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let (_stream, peer) = accept_from(&listener, IpAddr::V4(Ipv4Addr::LOCALHOST), "test")
+            .await
+            .expect("a peer from the expected address is accepted");
+        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn accept_from_rejects_a_mismatched_peer_and_keeps_waiting() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Expect a peer the loopback client cannot be, so its connection is
+        // refused. 203.0.113.0/24 (TEST-NET-3) never matches a real client.
+        let expected = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let mut accepting =
+            tokio::spawn(async move { accept_from(&listener, expected, "test").await });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        // The mismatched connection is dropped by the server: the client's read
+        // returns EOF rather than hanging.
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .expect("a rejected connection is closed promptly")
+            .unwrap();
+        assert_eq!(n, 0, "a mismatched peer's connection is closed");
+
+        // accept_from has not returned — it keeps waiting for the right peer
+        // rather than accepting the attacker or giving up.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut accepting)
+                .await
+                .is_err(),
+            "accept_from must keep waiting after rejecting a mismatched peer"
+        );
+        accepting.abort();
     }
 
     #[tokio::test]
