@@ -121,12 +121,14 @@ async fn handle_connection(
     context: Arc<Context>,
 ) -> io::Result<()> {
     stream.set_nodelay(true).ok();
-    let local_ip = stream.local_addr()?.ip();
+    // The whole address, not just its IP: the session channels bind it, and an
+    // IPv6 link-local address needs the scope id that `.ip()` would drop.
+    let local_addr = stream.local_addr()?;
     let (read_half, write_half) = stream.into_split();
     let mut conn = ControlConnection::new(read_half, write_half);
     let mut pair = PairSetup::new(context.config.password.as_deref());
     let mut session = Session::new(
-        local_ip,
+        local_addr,
         peer.ip(),
         context.sink_factory.clone(),
         context.events.clone(),

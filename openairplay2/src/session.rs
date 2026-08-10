@@ -5,7 +5,7 @@
 //! milestones reported as [`Event`]s.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,8 +38,10 @@ const FULL_DB: f32 = 0.0;
 
 pub struct Session {
     /// The address the control connection arrived on — what we bind to and
-    /// report back so the sender can reach our channels.
-    local_ip: IpAddr,
+    /// report back so the sender can reach our channels. Kept whole rather
+    /// than as an `IpAddr`, because an IPv6 link-local address is only
+    /// bindable together with its scope id (see [`ephemeral`]).
+    local_addr: SocketAddr,
     /// The address the sender connected *from*, reported to the host with
     /// `SessionStarted` (a display shows it; nothing else uses it).
     peer_ip: IpAddr,
@@ -83,13 +85,13 @@ pub struct Session {
 
 impl Session {
     pub fn new(
-        local_ip: IpAddr,
+        local_addr: SocketAddr,
         peer_ip: IpAddr,
         sink_factory: SinkFactory,
         events: EventSender,
     ) -> Session {
         Session {
-            local_ip,
+            local_addr,
             peer_ip,
             tasks: Vec::new(),
             stream_key: None,
@@ -146,12 +148,18 @@ impl Session {
             .unwrap_or("(none)");
         debug!("SETUP phase 1: timingProtocol={timing}");
 
-        let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let event_port = listener.local_addr()?.port();
-        debug!("SETUP phase 1: event port {event_port}");
+        let bind = ephemeral(self.local_addr);
+        let listener = TcpListener::bind(bind)
+            .await
+            .map_err(|e| bind_error(bind, e))?;
+        let bound = listener.local_addr()?;
+        let event_port = bound.port();
+        debug!("SETUP phase 1: event channel on {bound}");
         self.tasks.push(tokio::spawn(event_channel(listener)));
 
-        let self_ip = self.local_ip.to_string();
+        // The scope-less form on purpose: this string goes to the sender,
+        // which scopes our address to its own interface, not ours.
+        let self_ip = self.local_addr.ip().to_string();
         let mut peer_info = Dictionary::new();
         peer_info.insert(
             "Addresses".into(),
@@ -193,8 +201,12 @@ impl Session {
             self.stream_key.as_ref().map_or(0, Vec::len)
         );
 
-        let control = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
-        let control_port = control.local_addr()?.port();
+        let bind = ephemeral(self.local_addr);
+        let control = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| bind_error(bind, e))?;
+        let control_bound = control.local_addr()?;
+        let control_port = control_bound.port();
         self.tasks
             .push(tokio::spawn(audio_channel(control, "control")));
 
@@ -203,12 +215,14 @@ impl Session {
         let data_port = if stream_type == Some(TYPE_BUFFERED) {
             self.start_buffered_audio().await?
         } else {
-            let data = UdpSocket::bind(SocketAddr::new(self.local_ip, 0)).await?;
+            let data = UdpSocket::bind(bind)
+                .await
+                .map_err(|e| bind_error(bind, e))?;
             let port = data.local_addr()?.port();
             self.tasks.push(tokio::spawn(audio_channel(data, "audio")));
             port
         };
-        debug!("SETUP phase 2: data port {data_port}, control port {control_port}");
+        debug!("SETUP phase 2: data port {data_port}, control channel on {control_bound}");
 
         let mut stream_response = Dictionary::new();
         stream_response.insert(
@@ -242,7 +256,10 @@ impl Session {
     /// Bind the buffered-audio TCP data channel and start the
     /// receive → decrypt → decode → play pipeline. Returns the bound port.
     async fn start_buffered_audio(&mut self) -> io::Result<u16> {
-        let listener = TcpListener::bind(SocketAddr::new(self.local_ip, 0)).await?;
+        let bind = ephemeral(self.local_addr);
+        let listener = TcpListener::bind(bind)
+            .await
+            .map_err(|e| bind_error(bind, e))?;
         let port = listener.local_addr()?.port();
 
         let decryptor = self.stream_key.as_deref().and_then(AudioDecryptor::new);
@@ -508,6 +525,29 @@ impl Drop for Session {
     }
 }
 
+/// The control connection's local address on an ephemeral port: what every
+/// session channel binds, so the sender reaches them where it reached us.
+///
+/// The whole point of going through the original [`SocketAddr`] is IPv6. An
+/// address in `fe80::/10` is meaningful only alongside the interface it is
+/// scoped to, and the kernel rejects a bind that omits the scope with
+/// `EINVAL` — which is precisely the address a sender picks when the host has
+/// no routable IPv6 address (#168). `SocketAddr::new(addr.ip(), 0)` would
+/// build exactly that unbindable address.
+fn ephemeral(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(a) => SocketAddr::new(IpAddr::V4(*a.ip()), 0),
+        SocketAddr::V6(a) => SocketAddrV6::new(*a.ip(), 0, a.flowinfo(), a.scope_id()).into(),
+    }
+}
+
+/// Name the address in a bind failure. A bare `Invalid argument (os error 22)`
+/// says nothing about which address the kernel refused, which is most of what
+/// there is to know.
+fn bind_error(addr: SocketAddr, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("bind session channel on {addr}: {e}"))
+}
+
 fn encode_plist(dict: &Dictionary) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     Value::Dictionary(dict.clone())
@@ -707,11 +747,12 @@ async fn drain_tcp(listener: TcpListener) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::sync::mpsc::UnboundedReceiver;
 
-    fn local() -> IpAddr {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    /// The address a test "sender" reached us on.
+    fn local() -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 7000))
     }
 
     /// The address a test "sender" connects from.
@@ -728,9 +769,163 @@ mod tests {
 
     /// A session wired to a discarding sink, plus the host's event receiver.
     fn session() -> (Session, UnboundedReceiver<Event>) {
+        session_on(local())
+    }
+
+    /// The same, for a session that reached us on a particular local address.
+    fn session_on(local: SocketAddr) -> (Session, UnboundedReceiver<Event>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let factory: SinkFactory = Arc::new(|_, _| Box::new(TestSink));
-        (Session::new(local(), peer(), factory, tx), rx)
+        (Session::new(local, peer(), factory, tx), rx)
+    }
+
+    #[test]
+    fn ephemeral_keeps_the_ipv4_address() {
+        let addr = SocketAddr::from((Ipv4Addr::new(192, 168, 86, 133), 7000));
+        assert_eq!(
+            ephemeral(addr),
+            SocketAddr::from((Ipv4Addr::new(192, 168, 86, 133), 0))
+        );
+    }
+
+    #[test]
+    fn ephemeral_carries_the_ipv6_scope_through() {
+        let ip: Ipv6Addr = "fe80::6e9e:e2b5:e9bb:5959".parse().unwrap();
+        let addr = SocketAddr::V6(SocketAddrV6::new(ip, 7000, 0x1234, 2));
+        let SocketAddr::V6(bind) = ephemeral(addr) else {
+            panic!("an IPv6 address must stay IPv6");
+        };
+        assert_eq!(*bind.ip(), ip);
+        assert_eq!(bind.port(), 0);
+        // The two fields the old `SocketAddr::new(addr.ip(), 0)` dropped.
+        assert_eq!(bind.scope_id(), 2);
+        assert_eq!(bind.flowinfo(), 0x1234);
+    }
+
+    /// A link-local address of the running host and the interface index it is
+    /// scoped to, read from `/proc/net/if_inet6` — `std` cannot enumerate
+    /// interfaces. Columns are `<32 hex address> <ifindex> <prefixlen> <scope>
+    /// <flags> <name>`, and scope `20` is link-local. `None` on a host that has
+    /// no link-local address (a loopback-only container), which skips the test.
+    #[cfg(target_os = "linux")]
+    fn host_link_local() -> Option<(Ipv6Addr, u32)> {
+        let table = std::fs::read_to_string("/proc/net/if_inet6").ok()?;
+        table.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (address, index, _prefix, scope) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            if scope != "20" {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            for (i, octet) in octets.iter_mut().enumerate() {
+                *octet = u8::from_str_radix(address.get(i * 2..i * 2 + 2)?, 16).ok()?;
+            }
+            Some((Ipv6Addr::from(octets), u32::from_str_radix(index, 16).ok()?))
+        })
+    }
+
+    /// The regression itself, against the kernel rather than against our own
+    /// arithmetic: the address a session channel derives is bindable, and the
+    /// same address with the scope dropped — what the code used to build — is
+    /// not. Skipped on a host with no link-local address; not built on macOS.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_link_local_address_binds_only_with_its_scope() {
+        let Some((ip, scope)) = host_link_local() else {
+            return;
+        };
+        let local = SocketAddr::V6(SocketAddrV6::new(ip, 7000, 0, scope));
+
+        TcpListener::bind(ephemeral(local))
+            .await
+            .expect("a scoped link-local address binds");
+
+        let unscoped = SocketAddr::new(local.ip(), 0);
+        let error = TcpListener::bind(unscoped)
+            .await
+            .expect_err("an unscoped link-local address must not bind");
+        assert_eq!(error.raw_os_error(), Some(22), "EINVAL");
+    }
+
+    /// Phase 1 over the address a real sender picks on an IPv6-link-local-only
+    /// host — the failing case in #168 — and the other half of the fix: the
+    /// address we report back stays scope-less, because the sender scopes it to
+    /// its own interface, not ours.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn phase1_over_link_local_reports_an_unscoped_address() {
+        let Some((ip, scope)) = host_link_local() else {
+            return;
+        };
+        let local = SocketAddr::V6(SocketAddrV6::new(ip, 7000, 0, scope));
+        let (mut session, _events) = session_on(local);
+        let mut dict = Dictionary::new();
+        dict.insert("timingProtocol".into(), Value::String("PTP".into()));
+        let body = encode_plist(&dict).unwrap();
+
+        let response = session
+            .handle_setup(&body)
+            .await
+            .expect("phase 1 on a link-local address");
+
+        let value = Value::from_reader(io::Cursor::new(response)).unwrap();
+        let peer_info = value
+            .as_dictionary()
+            .unwrap()
+            .get("timingPeerInfo")
+            .unwrap()
+            .as_dictionary()
+            .unwrap();
+        let addresses = peer_info.get("Addresses").unwrap().as_array().unwrap();
+        assert_eq!(addresses[0].as_string(), Some(ip.to_string().as_str()));
+        assert_eq!(
+            peer_info.get("ID").unwrap().as_string(),
+            addresses[0].as_string()
+        );
+    }
+
+    /// The other three binds #168 reaches: phase 2's control socket and the
+    /// buffered-audio data channel come up on a link-local address as well.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn phase2_binds_its_channels_over_link_local() {
+        let Some((ip, scope)) = host_link_local() else {
+            return;
+        };
+        let (mut session, _events) =
+            session_on(SocketAddr::V6(SocketAddrV6::new(ip, 7000, 0, scope)));
+        let mut stream = Dictionary::new();
+        stream.insert("type".into(), Value::Integer(TYPE_BUFFERED.into()));
+        stream.insert("audioFormat".into(), Value::Integer(0x400000u64.into()));
+        stream.insert("shk".into(), Value::Data(vec![7u8; 32]));
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "streams".into(),
+            Value::Array(vec![Value::Dictionary(stream)]),
+        );
+        let body = encode_plist(&dict).unwrap();
+
+        let response = session
+            .handle_setup(&body)
+            .await
+            .expect("phase 2 on a link-local address");
+
+        let value = Value::from_reader(io::Cursor::new(response)).unwrap();
+        let streams = value
+            .as_dictionary()
+            .unwrap()
+            .get("streams")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let s = streams[0].as_dictionary().unwrap();
+        assert!(s.get("dataPort").unwrap().as_unsigned_integer().unwrap() > 0);
+        assert!(s.get("controlPort").unwrap().as_unsigned_integer().unwrap() > 0);
     }
 
     #[tokio::test]
